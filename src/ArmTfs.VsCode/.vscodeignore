@@ -1,0 +1,6 @@
+src/**
+tsconfig.json
+README.md
+.vscodeignore
+node_modules/typescript/**
+node_modules/@types/**

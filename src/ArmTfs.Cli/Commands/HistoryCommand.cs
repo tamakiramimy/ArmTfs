@@ -51,14 +51,27 @@ public static class HistoryCommand
 
                 if (format == "json")
                 {
-                    var json = System.Text.Json.JsonSerializer.Serialize(changesets.Select(c => new
+                    JsonOutput.Write(new
                     {
-                        c.ChangesetId,
-                        Author = c.Author?.DisplayName,
-                        Date = c.CreatedDate,
-                        c.Comment,
-                    }), new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
-                    Console.WriteLine(json);
+                        schemaVersion = 1,
+                        command = "history",
+                        query = new
+                        {
+                            inputPath = path,
+                            serverPath,
+                            author,
+                            top,
+                        },
+                        items = changesets.Select(c => new
+                        {
+                            changesetId = c.ChangesetId,
+                            createdAt = c.CreatedDate,
+                            comment = c.Comment,
+                            commentTruncated = c.CommentTruncated,
+                            author = JsonOutput.Identity(c.Author),
+                            checkedInBy = JsonOutput.Identity(c.CheckedInBy),
+                        }),
+                    });
                     return;
                 }
 

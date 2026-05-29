@@ -231,6 +231,36 @@ public class WorkspaceManagerTests : IDisposable
     }
 
     [Fact]
+    public void SaveBaseFile_AndGetCachedBaseFilePath_RoundTrips()
+    {
+        var localFile = Path.Combine(_tempDir, "tracked.cs");
+        _ws.SaveBaseFile(localFile, "base content"u8.ToArray());
+
+        var cachedPath = _ws.GetCachedBaseFilePath(localFile);
+
+        Assert.NotNull(cachedPath);
+        Assert.True(File.Exists(cachedPath));
+        Assert.Equal("base content", File.ReadAllText(cachedPath!));
+    }
+
+    [Fact]
+    public void SaveBaseFileFromDisk_AndRemoveBaseFile_WorkCorrectly()
+    {
+        var localFile = Path.Combine(_tempDir, "folder", "tracked.cs");
+        Directory.CreateDirectory(Path.GetDirectoryName(localFile)!);
+        File.WriteAllText(localFile, "disk content");
+
+        _ws.SaveBaseFileFromDisk(localFile);
+        var cachedPath = _ws.GetCachedBaseFilePath(localFile);
+
+        Assert.NotNull(cachedPath);
+        Assert.Equal("disk content", File.ReadAllText(cachedPath!));
+
+        _ws.RemoveBaseFile(localFile);
+        Assert.Null(_ws.GetCachedBaseFilePath(localFile));
+    }
+
+    [Fact]
     public void ComputeFileHash_IsDeterministic()
     {
         var file = Path.Combine(_tempDir, "hash_test.txt");

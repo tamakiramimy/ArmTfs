@@ -14,6 +14,7 @@ namespace ArmTfs.Core.Workspace;
 ///     .tf/
 ///       workspace.json   - 工作区定义（名称、服务器URL、路径映射）
 ///       pending.json     - 挂起变更列表
+///       base/            - 已下载/提交后的基线文件内容缓存
 ///       versions/        - 已追踪文件的版本信息（每文件一个 JSON）
 /// </summary>
 public sealed class WorkspaceManager
@@ -21,6 +22,7 @@ public sealed class WorkspaceManager
     private const string TfDir = ".tf";
     private const string WorkspaceFile = "workspace.json";
     private const string PendingFile = "pending.json";
+    private const string BaseDir = "base";
     private const string VersionsDir = "versions";
 
     private static readonly JsonSerializerOptions _jsonOptions = new()
@@ -42,6 +44,7 @@ public sealed class WorkspaceManager
     private string TfPath => Path.Combine(_rootPath, TfDir);
     private string WorkspacePath => Path.Combine(TfPath, WorkspaceFile);
     private string PendingPath => Path.Combine(TfPath, PendingFile);
+    private string BaseFilesPath => Path.Combine(TfPath, BaseDir);
     private string VersionsPath => Path.Combine(TfPath, VersionsDir);
 
     // ─── 工作区搜索 ────────────────────────────────────────────────────────────
@@ -155,6 +158,35 @@ public sealed class WorkspaceManager
         if (File.Exists(file)) File.Delete(file);
     }
 
+    /// <summary>获取对应本地文件的基线缓存文件路径；不存在时返回 <c>null</c>。</summary>
+    public string? GetCachedBaseFilePath(string localPath)
+    {
+        var file = GetBaseFilePath(localPath);
+        return File.Exists(file) ? file : null;
+    }
+
+    /// <summary>将指定字节内容保存为本地文件的基线缓存。</summary>
+    public void SaveBaseFile(string localPath, byte[] content)
+    {
+        Directory.CreateDirectory(BaseFilesPath);
+        File.WriteAllBytes(GetBaseFilePath(localPath), content);
+    }
+
+    /// <summary>使用当前磁盘文件内容刷新其基线缓存。</summary>
+    public void SaveBaseFileFromDisk(string localPath)
+    {
+        var normalizedPath = NormalizeLocalPath(localPath);
+        Directory.CreateDirectory(BaseFilesPath);
+        File.Copy(normalizedPath, GetBaseFilePath(normalizedPath), overwrite: true);
+    }
+
+    /// <summary>删除对应本地文件的基线缓存。</summary>
+    public void RemoveBaseFile(string localPath)
+    {
+        var file = GetBaseFilePath(localPath);
+        if (File.Exists(file)) File.Delete(file);
+    }
+
     // ─── 映射辅助 ──────────────────────────────────────────────────────────────
 
     /// <summary>将本地路径转换为服务器路径（按工作区映射规则）</summary>
@@ -220,6 +252,14 @@ public sealed class WorkspaceManager
         var key = NormalizeLocalPath(localPath).ToLowerInvariant();
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key)))[..16];
         return Path.Combine(VersionsPath, $"{hash}.json");
+    }
+
+    private string GetBaseFilePath(string localPath)
+    {
+        var key = NormalizeLocalPath(localPath).ToLowerInvariant();
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key)))[..16];
+        var extension = Path.GetExtension(key);
+        return Path.Combine(BaseFilesPath, $"{hash}{extension}");
     }
 
     private static string NormalizeLocalPath(string path)

@@ -14,11 +14,13 @@ public static class StatusCommand
 
         var pathArg = new Argument<string>("path", () => ".", "Directory or file to check");
         var allOpt = new Option<bool>("--all", "-a") { Description = "Also show tracked files that are locally modified (not yet checked out)" };
+        var formatOpt = new Option<string>("--format", () => "table") { Description = "Output format: table | json" };
 
         cmd.AddArgument(pathArg);
         cmd.AddOption(allOpt);
+        cmd.AddOption(formatOpt);
 
-        cmd.SetHandler((path, all) =>
+        cmd.SetHandler((path, all, format) =>
         {
             var ws = WorkspaceManager.FindWorkspace(Directory.GetCurrentDirectory());
             if (ws is null) { Console.Error.WriteLine("No workspace found."); Environment.ExitCode = 1; return; }
@@ -31,6 +33,66 @@ public static class StatusCommand
             var filtered = pending.Where(p =>
                 p.LocalPath.StartsWith(absPath, StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(p.LocalPath, absPath, StringComparison.OrdinalIgnoreCase)).ToList();
+
+            var modifiedItems = new List<object>();
+            if (all)
+            {
+                var checkedOut = filtered.Select(p => p.LocalPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var file in EnumerateTrackedFiles(absPath))
+                {
+                    if (checkedOut.Contains(file)) continue;
+                    var tracked = ws.GetTrackedVersion(file);
+                    if (tracked is null) continue;
+                    if (!File.Exists(file)) continue;
+
+                    var currentHash = WorkspaceManager.ComputeFileHash(file);
+                    if (!string.Equals(currentHash, tracked.ContentHash, StringComparison.OrdinalIgnoreCase))
+                    {
+                        modifiedItems.Add(new
+                        {
+                            state = "modifiedNotCheckedOut",
+                            serverPath = tracked.ServerPath,
+                            localPath = tracked.LocalPath,
+                            trackedChangesetId = tracked.ChangesetId,
+                            downloadedAt = tracked.DownloadedAt,
+                        });
+                    }
+                }
+            }
+
+            if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+            {
+                var pendingItems = filtered.OrderBy(p => p.LocalPath).Select(pc =>
+                {
+                    var tracked = ws.GetTrackedVersion(pc.LocalPath);
+                    return (object)new
+                    {
+                        state = "pending",
+                        changeType = JsonOutput.EnumValue(pc.ChangeType),
+                        serverPath = pc.ServerPath,
+                        localPath = pc.LocalPath,
+                        addedAt = pc.AddedAt,
+                        sourceServerPath = pc.SourceServerPath,
+                        baselineChangesetId = tracked?.ChangesetId,
+                        downloadedAt = tracked?.DownloadedAt,
+                    };
+                });
+
+                JsonOutput.Write(new
+                {
+                    schemaVersion = 1,
+                    command = "status",
+                    workspace = JsonOutput.Workspace(meta),
+                    scope = new
+                    {
+                        inputPath = path,
+                        resolvedLocalPath = absPath,
+                    },
+                    items = pendingItems.Concat(modifiedItems),
+                });
+                return;
+            }
 
             if (filtered.Count == 0 && !all)
             {
@@ -58,28 +120,17 @@ public static class StatusCommand
                 Console.WriteLine();
                 Console.WriteLine("Locally modified (not checked out):");
                 bool found = false;
-                var checkedOut = filtered.Select(p => p.LocalPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-                foreach (var file in EnumerateTrackedFiles(absPath))
+                foreach (var item in modifiedItems.Cast<dynamic>())
                 {
-                    if (checkedOut.Contains(file)) continue;
-                    var tracked = ws.GetTrackedVersion(file);
-                    if (tracked is null) continue;
-                    if (!File.Exists(file)) continue;
-
-                    var currentHash = WorkspaceManager.ComputeFileHash(file);
-                    if (!string.Equals(currentHash, tracked.ContentHash, StringComparison.OrdinalIgnoreCase))
-                    {
-                        var rel = Path.GetRelativePath(Directory.GetCurrentDirectory(), file);
-                        Console.WriteLine($"  [MODIFIED] {rel}");
-                        found = true;
-                    }
+                    var rel = Path.GetRelativePath(Directory.GetCurrentDirectory(), (string)item.localPath);
+                    Console.WriteLine($"  [MODIFIED] {rel}");
+                    found = true;
                 }
 
                 if (!found)
                     Console.WriteLine("  (none)");
             }
-        }, pathArg, allOpt);
+        }, pathArg, allOpt, formatOpt);
 
         return cmd;
     }

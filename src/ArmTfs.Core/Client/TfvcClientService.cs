@@ -97,19 +97,25 @@ public sealed class TfvcClientService
         string? serverPath = null,
         string? author = null,
         int top = 20,
+        int skip = 0,
+        string orderby = "id desc",
+        DateTime? fromDate = null,
+        DateTime? toDate = null,
         CancellationToken ct = default)
     {
         var client = _connection.GetTfvcClient();
         var results = await client.GetChangesetsAsync(
             project: null,
             maxCommentLength: 200,
-            skip: 0,
+            skip: skip,
             top: top,
-            orderby: "id desc",
+            orderby: orderby,
             searchCriteria: new TfvcChangesetSearchCriteria
             {
                 ItemPath = serverPath,
                 Author = author,
+                FromDate = fromDate?.ToString("O"),
+                ToDate = toDate?.ToString("O"),
             },
             cancellationToken: ct).ConfigureAwait(false);
 
@@ -122,11 +128,84 @@ public sealed class TfvcClientService
     public async Task<TfvcChangeset> GetChangesetAsync(int changesetId, CancellationToken ct = default)
     {
         var client = _connection.GetTfvcClient();
-        return await client.GetChangesetAsync(
+        var changeset = await client.GetChangesetAsync(
             id: changesetId,
+            maxChangeCount: 100,
             includeDetails: true,
             includeWorkItems: true,
             includeSourceRename: true,
+            cancellationToken: ct).ConfigureAwait(false);
+
+        if (changeset.HasMoreChanges || changeset.Changes is null)
+        {
+            const int pageSize = 100;
+            var changes = new List<TfvcChange>();
+            var skip = 0;
+
+            while (true)
+            {
+                var page = await client.GetChangesetChangesAsync(
+                    id: changesetId,
+                    skip: skip,
+                    top: pageSize,
+                    cancellationToken: ct).ConfigureAwait(false);
+
+                if (page.Count == 0)
+                    break;
+
+                changes.AddRange(page);
+                if (page.Count < pageSize)
+                    break;
+
+                skip += page.Count;
+            }
+
+            changeset.Changes = changes;
+            changeset.HasMoreChanges = false;
+        }
+
+        return changeset;
+    }
+
+    /// <summary>查询 TFVC Label 列表。</summary>
+    public async Task<IReadOnlyList<TfvcLabelRef>> GetLabelsAsync(
+        string? owner = null,
+        string? name = null,
+        string? labelScope = null,
+        int? maxItemCount = null,
+        int top = 20,
+        int skip = 0,
+        CancellationToken ct = default)
+    {
+        var client = _connection.GetTfvcClient();
+        return await client.GetLabelsAsync(
+            requestData: new TfvcLabelRequestData
+            {
+                Owner = owner,
+                Name = name,
+                LabelScope = labelScope,
+                MaxItemCount = maxItemCount,
+                IncludeLinks = false,
+            },
+            top: top,
+            skip: skip,
+            cancellationToken: ct).ConfigureAwait(false);
+    }
+
+    /// <summary>获取单个 TFVC Label 详情。</summary>
+    public async Task<TfvcLabel> GetLabelAsync(
+        string labelId,
+        int? maxItemCount = null,
+        CancellationToken ct = default)
+    {
+        var client = _connection.GetTfvcClient();
+        return await client.GetLabelAsync(
+            labelId: labelId,
+            requestData: new TfvcLabelRequestData
+            {
+                MaxItemCount = maxItemCount,
+                IncludeLinks = false,
+            },
             cancellationToken: ct).ConfigureAwait(false);
     }
 
@@ -168,6 +247,313 @@ public sealed class TfvcClientService
         return await client.GetShelvesetChangesAsync(
             shelvesetId: id,
             cancellationToken: ct).ConfigureAwait(false);
+    }
+
+    // ─── Branch ───────────────────────────────────────────────────────────────
+
+    /// <summary>查询 TFVC 分支引用列表。</summary>
+    /// <param name="scopePath">作用域路径；默认为 $/</param>
+    /// <param name="includeDeleted">是否包含已删除分支</param>
+    /// <param name="ct">取消令牌</param>
+    public async Task<IReadOnlyList<TfvcBranchRef>> GetBranchRefsAsync(
+        string scopePath = "$/",
+        bool includeDeleted = false,
+        CancellationToken ct = default)
+    {
+        var client = _connection.GetTfvcClient();
+        return await client.GetBranchRefsAsync(
+            scopePath: scopePath,
+            includeDeleted: includeDeleted,
+            includeLinks: false,
+            cancellationToken: ct).ConfigureAwait(false);
+    }
+
+    /// <summary>获取单个分支详情。</summary>
+    /// <param name="path">TFVC 分支路径</param>
+    /// <param name="includeChildren">是否包含子分支</param>
+    /// <param name="ct">取消令牌</param>
+    public async Task<TfvcBranch> GetBranchAsync(
+        string path,
+        bool includeChildren = true,
+        CancellationToken ct = default)
+    {
+        var client = _connection.GetTfvcClient();
+        return await client.GetBranchAsync(
+            path: path,
+            includeParent: true,
+            includeChildren: includeChildren,
+            cancellationToken: ct).ConfigureAwait(false);
+    }
+
+    // ─── Merge Query ──────────────────────────────────────────────────────────
+
+    public async Task<MergeBaseInfo> ResolveMergeBaseAsync(
+        string sourcePath,
+        string targetPath,
+        CancellationToken ct = default)
+    {
+        var notes = new List<string>();
+
+        var sourceBranch = await TryResolveBranchAsync(sourcePath, ct).ConfigureAwait(false);
+        var targetBranch = await TryResolveBranchAsync(targetPath, ct).ConfigureAwait(false);
+
+        if (sourceBranch is null)
+            notes.Add("Unable to resolve source path to a TFVC branch root.");
+        if (targetBranch is null)
+            notes.Add("Unable to resolve target path to a TFVC branch root.");
+
+        var sourceAncestry = sourceBranch is null
+            ? Array.Empty<string>()
+            : (await GetBranchAncestryAsync(sourceBranch, ct).ConfigureAwait(false)).Select(b => b.Path).ToArray();
+        var targetAncestry = targetBranch is null
+            ? Array.Empty<string>()
+            : (await GetBranchAncestryAsync(targetBranch, ct).ConfigureAwait(false)).Select(b => b.Path).ToArray();
+
+        var targetSet = targetAncestry.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var commonAncestor = sourceAncestry.FirstOrDefault(targetSet.Contains);
+
+        var relationship = "unresolved";
+        if (sourceBranch is not null && targetBranch is not null)
+        {
+            if (string.Equals(sourceBranch.Path, targetBranch.Path, StringComparison.OrdinalIgnoreCase))
+                relationship = "sameBranch";
+            else if (string.Equals(commonAncestor, sourceBranch.Path, StringComparison.OrdinalIgnoreCase))
+                relationship = "sourceAncestorOfTarget";
+            else if (string.Equals(commonAncestor, targetBranch.Path, StringComparison.OrdinalIgnoreCase))
+                relationship = "targetAncestorOfSource";
+            else if (!string.IsNullOrEmpty(commonAncestor))
+                relationship = "divergedSiblings";
+            else
+                relationship = "unrelated";
+        }
+
+        var sourceBranchPoint = sourceBranch is null
+            ? null
+            : await FindBranchPointChangesetAsync(sourceBranch, ct).ConfigureAwait(false);
+        var targetBranchPoint = targetBranch is null
+            ? null
+            : await FindBranchPointChangesetAsync(targetBranch, ct).ConfigureAwait(false);
+
+        if (sourceBranch is not null && !sourceBranchPoint.HasValue)
+            notes.Add("Could not confidently detect source branch creation changeset from history.");
+        if (targetBranch is not null && !targetBranchPoint.HasValue)
+            notes.Add("Could not confidently detect target branch creation changeset from history.");
+
+        var confidence = commonAncestor is not null
+            ? sourceBranchPoint.HasValue || targetBranchPoint.HasValue
+                ? "medium"
+                : "low"
+            : "low";
+
+        if (relationship is "sameBranch")
+        {
+            confidence = "high";
+            notes.Add("Source and target resolve to the same branch root.");
+        }
+        else if (relationship is not "unresolved" && relationship is not "unrelated")
+        {
+            notes.Add("Merge base is inferred from branch ancestry plus creation-time history, not from a server merge-base API.");
+        }
+
+        return new MergeBaseInfo
+        {
+            SourcePath = sourcePath,
+            TargetPath = targetPath,
+            SourceBranchPath = sourceBranch?.Path,
+            TargetBranchPath = targetBranch?.Path,
+            SourceAncestry = sourceAncestry,
+            TargetAncestry = targetAncestry,
+            CommonAncestorPath = commonAncestor,
+            Relationship = relationship,
+            SourceBranchCreatedAt = sourceBranch?.CreatedDate,
+            TargetBranchCreatedAt = targetBranch?.CreatedDate,
+            SourceBranchPointChangesetId = sourceBranchPoint,
+            TargetBranchPointChangesetId = targetBranchPoint,
+            Confidence = confidence,
+            Notes = notes,
+        };
+    }
+
+    public async Task<MergeCandidateQueryResult> GetMergeCandidatesAsync(
+        string sourcePath,
+        string targetPath,
+        int top = 20,
+        int scan = 80,
+        CancellationToken ct = default)
+    {
+        var baseInfo = await ResolveMergeBaseAsync(sourcePath, targetPath, ct).ConfigureAwait(false);
+        var sourceHistory = await GetChangesetsAsync(sourcePath, top: scan, ct: ct).ConfigureAwait(false);
+        var targetHistory = await GetChangesetsAsync(targetPath, top: scan, ct: ct).ConfigureAwait(false);
+
+        var mergedRanges = new List<MergeSourceRange>();
+        var sourceMatchPath = baseInfo.SourceBranchPath ?? sourcePath;
+
+        foreach (var targetChangeset in targetHistory)
+        {
+            var detail = await GetChangesetAsync(targetChangeset.ChangesetId, ct).ConfigureAwait(false);
+            if (detail.Changes is null)
+                continue;
+
+            foreach (var change in detail.Changes)
+            {
+                if (change.MergeSources is null)
+                    continue;
+
+                foreach (var mergeSource in change.MergeSources)
+                {
+                    if (string.IsNullOrEmpty(mergeSource.ServerItem) || !IsSameOrDescendantPath(mergeSource.ServerItem, sourceMatchPath))
+                        continue;
+
+                    mergedRanges.Add(new MergeSourceRange
+                    {
+                        ServerItem = mergeSource.ServerItem,
+                        VersionFrom = mergeSource.VersionFrom,
+                        VersionTo = mergeSource.VersionTo,
+                        IsRename = mergeSource.IsRename,
+                        TargetChangesetId = targetChangeset.ChangesetId,
+                    });
+                }
+            }
+        }
+
+        var uniqueFloor = GetSourceUniqueFloor(baseInfo);
+        var candidates = sourceHistory
+            .Select(changeset =>
+            {
+                var coveringRange = mergedRanges.FirstOrDefault(range => range.Covers(changeset.ChangesetId));
+                return new MergeCandidateInfo
+                {
+                    ChangesetId = changeset.ChangesetId,
+                    CreatedAt = changeset.CreatedDate,
+                    Comment = changeset.Comment,
+                    AuthorDisplayName = changeset.Author?.DisplayName,
+                    AuthorUniqueName = changeset.Author?.UniqueName,
+                    IsMergedToTarget = coveringRange is not null,
+                    CoveredByTargetChangesetId = coveringRange?.TargetChangesetId,
+                    CoveredByRange = coveringRange,
+                };
+            })
+            .Where(candidate => !uniqueFloor.HasValue || candidate.ChangesetId > uniqueFloor.Value)
+            .Where(candidate => !candidate.IsMergedToTarget)
+            .Take(top)
+            .ToList();
+
+        return new MergeCandidateQueryResult
+        {
+            BaseInfo = baseInfo,
+            SourceHistoryScanned = sourceHistory.Count,
+            TargetHistoryScanned = targetHistory.Count,
+            SourceUniqueFloorChangesetId = uniqueFloor,
+            MergedRanges = mergedRanges
+                .OrderByDescending(range => range.VersionTo ?? int.MinValue)
+                .ThenByDescending(range => range.TargetChangesetId)
+                .ToList(),
+            Candidates = candidates,
+        };
+    }
+
+    private async Task<TfvcBranch?> TryResolveBranchAsync(string path, CancellationToken ct)
+    {
+        foreach (var candidate in EnumerateServerPathCandidates(path))
+        {
+            try
+            {
+                return await GetBranchAsync(candidate, includeChildren: false, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Not a branch root or inaccessible; continue walking up the path.
+            }
+        }
+
+        return null;
+    }
+
+    private async Task<IReadOnlyList<TfvcBranch>> GetBranchAncestryAsync(TfvcBranch branch, CancellationToken ct)
+    {
+        var ancestry = new List<TfvcBranch>();
+        TfvcBranch? current = branch;
+
+        while (current is not null)
+        {
+            ancestry.Add(current);
+            var parentPath = current.Parent?.Path;
+            if (string.IsNullOrEmpty(parentPath))
+                break;
+
+            current = await GetBranchAsync(parentPath, includeChildren: false, ct).ConfigureAwait(false);
+        }
+
+        return ancestry;
+    }
+
+    private async Task<int?> FindBranchPointChangesetAsync(TfvcBranch branch, CancellationToken ct)
+    {
+        if (branch.CreatedDate == default)
+            return null;
+
+        var windowStart = branch.CreatedDate.AddMinutes(-15);
+        var windowEnd = branch.CreatedDate.AddMinutes(15);
+        var changesets = await GetChangesetsAsync(
+            branch.Path,
+            top: 20,
+            orderby: "id asc",
+            fromDate: windowStart,
+            toDate: windowEnd,
+            ct: ct).ConfigureAwait(false);
+
+        foreach (var changeset in changesets.OrderBy(c => c.CreatedDate))
+        {
+            var detail = await GetChangesetAsync(changeset.ChangesetId, ct).ConfigureAwait(false);
+            if (detail.Changes?.Any(change =>
+                    change.Item?.Path is not null &&
+                    IsSameOrDescendantPath(change.Item.Path, branch.Path) &&
+                    change.ChangeType.ToString().Contains("Branch", StringComparison.OrdinalIgnoreCase)) == true)
+            {
+                return changeset.ChangesetId;
+            }
+        }
+
+        return changesets.OrderBy(c => c.CreatedDate).Select(c => (int?)c.ChangesetId).FirstOrDefault();
+    }
+
+    private static IEnumerable<string> EnumerateServerPathCandidates(string serverPath)
+    {
+        if (!serverPath.StartsWith("$/", StringComparison.Ordinal))
+            yield break;
+
+        var trimmed = serverPath.TrimEnd('/');
+        while (trimmed.Length > 2)
+        {
+            yield return trimmed;
+
+            var idx = trimmed.LastIndexOf('/');
+            if (idx <= 1)
+                break;
+
+            trimmed = trimmed[..idx];
+        }
+    }
+
+    private static bool IsSameOrDescendantPath(string path, string candidateRoot)
+    {
+        if (string.Equals(path, candidateRoot, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var normalizedRoot = candidateRoot.EndsWith('/') ? candidateRoot : candidateRoot + "/";
+        return path.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int? GetSourceUniqueFloor(MergeBaseInfo baseInfo)
+    {
+        return baseInfo.Relationship switch
+        {
+            "sourceAncestorOfTarget" => baseInfo.TargetBranchPointChangesetId,
+            "targetAncestorOfSource" => baseInfo.SourceBranchPointChangesetId,
+            "divergedSiblings" => baseInfo.SourceBranchPointChangesetId,
+            "sameBranch" => int.MaxValue,
+            _ => baseInfo.SourceBranchPointChangesetId,
+        };
     }
 
     // ─── Checkin ───────────────────────────────────────────────────────────────

@@ -2,5 +2,7 @@
 publish/*
 src/*/bin/*
 src/*/obj/*
+src/ArmTfs.VsCode/node_modules/*
+src/ArmTfs.VsCode/out/*
 tests/*/bin/*
 tests/*/obj/*

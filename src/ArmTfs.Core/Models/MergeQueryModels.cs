@@ -1,0 +1,63 @@
+namespace ArmTfs.Core.Models;
+
+public sealed class MergeBaseInfo
+{
+    public string SourcePath { get; init; } = string.Empty;
+    public string TargetPath { get; init; } = string.Empty;
+    public string? SourceBranchPath { get; init; }
+    public string? TargetBranchPath { get; init; }
+    public IReadOnlyList<string> SourceAncestry { get; init; } = Array.Empty<string>();
+    public IReadOnlyList<string> TargetAncestry { get; init; } = Array.Empty<string>();
+    public string? CommonAncestorPath { get; init; }
+    public string Relationship { get; init; } = "unresolved";
+    public DateTime? SourceBranchCreatedAt { get; init; }
+    public DateTime? TargetBranchCreatedAt { get; init; }
+    public int? SourceBranchPointChangesetId { get; init; }
+    public int? TargetBranchPointChangesetId { get; init; }
+    public string Confidence { get; init; } = "low";
+    public IReadOnlyList<string> Notes { get; init; } = Array.Empty<string>();
+}
+
+public sealed class MergeSourceRange
+{
+    public string ServerItem { get; init; } = string.Empty;
+    public int? VersionFrom { get; init; }
+    public int? VersionTo { get; init; }
+    public bool IsRename { get; init; }
+    public int TargetChangesetId { get; init; }
+
+    public bool Covers(int changesetId)
+    {
+        if (!VersionTo.HasValue)
+            return false;
+
+        var from = VersionFrom ?? VersionTo.Value;
+        var to = VersionTo.Value;
+        if (from > to)
+            (from, to) = (to, from);
+
+        return changesetId >= from && changesetId <= to;
+    }
+}
+
+public sealed class MergeCandidateInfo
+{
+    public int ChangesetId { get; init; }
+    public DateTime CreatedAt { get; init; }
+    public string? Comment { get; init; }
+    public string? AuthorDisplayName { get; init; }
+    public string? AuthorUniqueName { get; init; }
+    public bool IsMergedToTarget { get; init; }
+    public int? CoveredByTargetChangesetId { get; init; }
+    public MergeSourceRange? CoveredByRange { get; init; }
+}
+
+public sealed class MergeCandidateQueryResult
+{
+    public MergeBaseInfo BaseInfo { get; init; } = new();
+    public int SourceHistoryScanned { get; init; }
+    public int TargetHistoryScanned { get; init; }
+    public int? SourceUniqueFloorChangesetId { get; init; }
+    public IReadOnlyList<MergeSourceRange> MergedRanges { get; init; } = Array.Empty<MergeSourceRange>();
+    public IReadOnlyList<MergeCandidateInfo> Candidates { get; init; } = Array.Empty<MergeCandidateInfo>();
+}

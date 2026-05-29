@@ -34,11 +34,16 @@ rootCommand.AddGlobalOption(verboseOption);
 rootCommand.AddCommand(ConfigureCommand.Build(config));
 rootCommand.AddCommand(WorkspaceCommand.Build(config));
 rootCommand.AddCommand(GetCommand.Build(config));
+rootCommand.AddCommand(DiffCommand.Build(config));
 rootCommand.AddCommand(StatusCommand.Build(config));
 rootCommand.AddCommand(CheckoutCommand.Build(config));
 rootCommand.AddCommand(AddCommand.Build(config));
 rootCommand.AddCommand(UndoCommand.Build(config));
 rootCommand.AddCommand(CheckinCommand.Build(config));
+rootCommand.AddCommand(BranchCommand.Build(config));
+rootCommand.AddCommand(MergeCommand.Build(config));
+rootCommand.AddCommand(ChangesetCommand.Build(config));
+rootCommand.AddCommand(LabelCommand.Build(config));
 rootCommand.AddCommand(HistoryCommand.Build(config));
 rootCommand.AddCommand(ShelvesetCommand.Build(config));
 

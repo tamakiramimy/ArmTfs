@@ -84,6 +84,8 @@ public static class GetCommand
                         tracked.ChangesetId == item.ChangesetId &&
                         tracked.ContentHash == WorkspaceManager.ComputeFileHash(localPath))
                     {
+                        if (ws.GetCachedBaseFilePath(localPath) is null)
+                            ws.SaveBaseFileFromDisk(localPath);
                         skipped++;
                         continue;
                     }
@@ -113,6 +115,7 @@ public static class GetCommand
                         ChangesetId = item.ChangesetId,
                         ContentHash = hash,
                     });
+                    ws.SaveBaseFileFromDisk(localPath);
 
                     Console.WriteLine($"  {localPath}  (cs#{item.ChangesetId})");
                     downloaded++;

@@ -268,6 +268,104 @@ arm-tfs shelveset show <name>
   (name can be "shelvesetname;owner" to specify an owner)
 ```
 
+### `diff`
+
+Compare a local file with the latest, tracked base, or a specific changeset.
+
+```
+arm-tfs diff <path> [options]
+
+Options:
+  --base                 Compare against the tracked base version
+  --version <n>          Compare against a specific changeset
+  --format <fmt>         Output format: text | json [default: text]
+```
+
+### `branch`
+
+Inspect TFVC branch topology.
+
+```
+arm-tfs branch list [scope] [options]
+arm-tfs branch show <path> [options]
+
+Options:
+  --format <fmt>         Output format: table | json [default: table]
+```
+
+### `changeset`
+
+Inspect a single changeset including file-level detail.
+
+```
+arm-tfs changeset show <id> [options]
+
+Options:
+  --format <fmt>         Output format: table | json [default: table]
+```
+
+### `label`
+
+List or inspect TFVC labels.
+
+```
+arm-tfs label list [options]
+arm-tfs label show <id> [options]
+
+Options:
+  --format <fmt>         Output format: table | json [default: table]
+```
+
+### `merge`
+
+Read-only merge analysis built from branch ancestry plus TFVC history.
+
+```
+arm-tfs merge base --source <path> --target <path> [options]
+arm-tfs merge candidate --source <path> --target <path> [options]
+
+Options:
+  --top <n>              Maximum candidate changesets to return [default: 20]
+  --scan <n>             Source/target history window to scan [default: 80]
+  --format <fmt>         Output format: table | json [default: table]
+```
+
+`merge` output is inferential: it uses branch ancestry, branch creation-time history, and merge source ranges found in target changesets. It does not call a server merge-execution API.
+
+## JSON Contracts
+
+The CLI now exposes stable JSON envelopes for thin clients and automation.
+
+- `arm-tfs status . --all --format json`
+- `arm-tfs history . --top 20 --format json`
+- `arm-tfs diff <path> --format json`
+- `arm-tfs branch list "$/' --format json`
+- `arm-tfs branch show <path> --format json`
+- `arm-tfs changeset show <id> --format json`
+- `arm-tfs label list --format json`
+- `arm-tfs label show <id> --format json`
+- `arm-tfs merge base --source <path> --target <path> --format json`
+- `arm-tfs merge candidate --source <path> --target <path> --format json`
+
+Each response contains `schemaVersion` and `command` as a stable outer envelope.
+
+## VS Code Thin Adapter
+
+A minimal VS Code extension now lives in [src/ArmTfs.VsCode](src/ArmTfs.VsCode). It does not reimplement TFVC logic; it only:
+
+- resolves an `arm-tfs` CLI invocation
+- executes CLI commands with `--format json`
+- parses the stable envelopes into typed TypeScript contracts
+- exposes commands and an exported client API for future views/webviews
+
+Build it with:
+
+```bash
+cd src/ArmTfs.VsCode
+npm install
+npm run compile
+```
+
 ## Local Workspace Model
 
 `arm-tfs` uses a **local workspace** model:
@@ -313,6 +411,7 @@ arm-tfs.sln
 │   │   │   └── TfsConfig.cs           # ~/.arm-tfs/config.json
 │   │   ├── Models/
 │   │   │   ├── PendingChange.cs
+│   │   │   ├── MergeQueryModels.cs
 │   │   │   ├── TfsServerItem.cs
 │   │   │   ├── TrackedFileVersion.cs
 │   │   │   └── WorkspaceMetadata.cs
@@ -321,6 +420,12 @@ arm-tfs.sln
 │   └── ArmTfs.Cli/           # CLI entry point (System.CommandLine)
 │       ├── Program.cs
 │       └── Commands/          # One file per command
+│   └── ArmTfs.VsCode/        # Thin VS Code adapter over CLI JSON contracts
+│       ├── package.json
+│       └── src/
+│           ├── armTfsCliClient.ts
+│           ├── contracts.ts
+│           └── extension.ts
 └── tests/
     └── ArmTfs.Core.Tests/    # xUnit tests for Core
 ```
@@ -328,7 +433,8 @@ arm-tfs.sln
 ## Known Limitations
 
 - **No merge conflict resolution** — `get` overwrites local files if `--force` is passed; conflicts must be resolved manually.
-- **No branch/label operations** — only TFVC mainline trunk workflows are supported.
+- **No merge execution** — current `merge` support is read-only analysis for merge base and candidate discovery.
+- **Merge candidate detection is inferential** — results are derived from branch ancestry plus scanned history windows, so old or atypical merge flows may require a larger `--scan` value.
 - **No workspace locking** — concurrent edits by multiple clients on the same workspace folder are not protected.
 - **PAT required for macOS** — Windows Integrated Auth (NTLM/Kerberos) is not supported cross-platform.
 

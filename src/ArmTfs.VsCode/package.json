@@ -1,0 +1,112 @@
+{
+  "name": "arm-tfs-vscode",
+  "displayName": "arm-tfs thin adapter",
+  "description": "Thin VS Code adapter for the arm-tfs CLI JSON contracts",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onCommand:armTfs.configureCliCommand",
+    "onCommand:armTfs.showStatus",
+    "onCommand:armTfs.showHistory",
+    "onCommand:armTfs.showDiff",
+    "onCommand:armTfs.showBranch",
+    "onCommand:armTfs.showChangeset",
+    "onCommand:armTfs.showLabel",
+    "onCommand:armTfs.showMergeBase",
+    "onCommand:armTfs.showMergeCandidates"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "armTfs.configureCliCommand",
+        "title": "Configure CLI Command",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.showStatus",
+        "title": "Show Status JSON",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.showHistory",
+        "title": "Show History JSON",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.showDiff",
+        "title": "Show Diff JSON",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.showBranch",
+        "title": "Show Branch JSON",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.showChangeset",
+        "title": "Show Changeset JSON",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.showLabel",
+        "title": "Show Label JSON",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.showMergeBase",
+        "title": "Show Merge Base JSON",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.showMergeCandidates",
+        "title": "Show Merge Candidates JSON",
+        "category": "arm-tfs"
+      }
+    ],
+    "configuration": {
+      "title": "arm-tfs",
+      "properties": {
+        "armTfs.cli.command": {
+          "type": "string",
+          "default": "",
+          "description": "Explicit CLI command to run. Leave empty to auto-discover a workspace build or fall back to arm-tfs on PATH."
+        },
+        "armTfs.cli.commandArgs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Arguments prepended before the arm-tfs subcommand. Example: [\"/path/to/arm-tfs.dll\"] when command is dotnet."
+        },
+        "armTfs.cli.cwd": {
+          "type": "string",
+          "default": "",
+          "description": "Working directory for CLI execution. Leave empty to use the first workspace folder."
+        },
+        "armTfs.cli.preferWorkspaceBuild": {
+          "type": "boolean",
+          "default": true,
+          "description": "Prefer a repo-local arm-tfs build before falling back to the arm-tfs command on PATH."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.57",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.8.3"
+  }
+}

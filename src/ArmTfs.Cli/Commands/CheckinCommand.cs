@@ -130,6 +130,7 @@ public static class CheckinCommand
                         if (change.ChangeType == ChangeType.Delete)
                         {
                             ws.RemoveTrackedVersion(change.LocalPath);
+                            ws.RemoveBaseFile(change.LocalPath);
                         }
                         else if (File.Exists(change.LocalPath))
                         {
@@ -140,6 +141,7 @@ public static class CheckinCommand
                                 ChangesetId = result.ChangesetId,
                                 ContentHash = WorkspaceManager.ComputeFileHash(change.LocalPath),
                             });
+                            ws.SaveBaseFileFromDisk(change.LocalPath);
                         }
                         ws.RemovePendingChange(change.LocalPath);
                     }
