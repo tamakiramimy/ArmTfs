@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ArmTfs.Cli/ArmTfs.Cli.csproj" />
+    <Project Path="src/ArmTfs.Core/ArmTfs.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ArmTfs.Core.Tests/ArmTfs.Core.Tests.csproj" />
+  </Folder>
+</Solution>

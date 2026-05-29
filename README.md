@@ -1,0 +1,337 @@
+# arm-tfs
+
+A cross-platform .NET 8 CLI tool for TFVC (Team Foundation Version Control) operations, designed to run natively on **ARM64 macOS** (Apple Silicon / M-series) and **Windows 11 ARM** — where the official `tf.exe` is unavailable.
+
+## Why
+
+### The `tf.exe` problem
+
+Microsoft's `tf.exe` is an x86/x64 binary only. It does not run on:
+
+- macOS (any architecture)
+- Windows 11 ARM (no Rosetta-style emulation for TFVC tooling)
+- Linux
+
+### Why TEE-CLC also doesn't work on ARM64
+
+[JetBrains TEE-CLC](https://github.com/microsoft/team-explorer-everywhere) is a Java-based cross-platform TF client that looks like a promising alternative — but it fails on ARM64 for a deeper reason:
+
+**The shell script (`tf`) has no `aarch64` mapping:**
+
+```bash
+# TEE-CLC tf script architecture detection (simplified)
+case "`uname -m`" in
+  i386|i686)  ARCH="x86"   ;;
+  x86_64)     ARCH="x86_64" ;;
+  ppc64)      ARCH="ppc"    ;;
+  ia64)       ARCH="ia64_32" ;;
+  # aarch64 → NOT HANDLED → JNI native library lookup fails
+esac
+```
+
+ARM64 Linux reports `aarch64` from `uname -m`, which has no mapping — the `ARCH` variable keeps the raw value and the JNI native library directory is not found. **macOS Apple Silicon is worse**: the Darwin branch hard-codes `ARCH=""` (written when macOS was Intel-only).
+
+**The real blocker: `com.microsoft.tfs.jni.jar` has no ARM64 native libraries.**
+
+TEE-CLC relies on JNI (Java Native Interface) for critical features: NTLM authentication, credential storage, and file locking. The bundled native `.so`/`.dylib`/`.dll` files only exist for x86/x86_64/PPC/IA64. No ARM64 build exists and the project is archived (no longer maintained).
+
+**Windows 11 ARM special case**: if you run an x64 JDK (via WoW64 emulation), the x64 JNI `.dll` may load. However:
+- Native ARM64 JDK → JNI load fails with `UnsatisfiedLinkError`
+- Even with x64 JDK, NTLM authentication via JNI may fail silently
+
+### The arm-tfs approach
+
+`arm-tfs` uses the **TFS/Azure DevOps REST API** exclusively — no JNI, no native TF client, no COM, no P/Invoke. It runs anywhere .NET 8 runs.
+
+## Requirements
+
+- .NET 8 SDK or Runtime
+- A TFS 2015+ or Azure DevOps Server with REST API enabled
+- A Personal Access Token (PAT) — strongly recommended
+
+## Installation
+
+### From source
+
+```bash
+git clone https://github.com/yourname/arm-tfs
+cd arm-tfs
+dotnet pack src/ArmTfs.Cli/ArmTfs.Cli.csproj -c Release
+dotnet tool install --global --add-source src/ArmTfs.Cli/bin/Release arm-tfs
+```
+
+### Run without installing
+
+```bash
+cd src/ArmTfs.Cli
+dotnet run -- <command> [options]
+```
+
+## Authentication
+
+PAT (Personal Access Token) is the recommended method and works on all platforms.
+
+```bash
+arm-tfs configure --url https://tfs.example.com/DefaultCollection --pat YOUR_TOKEN
+```
+
+Username/password (Basic Auth) also works if your server supports it:
+
+```bash
+arm-tfs configure --url https://tfs.example.com/DefaultCollection \
+                  --username DOMAIN\user --password yourpassword
+```
+
+Credentials are saved to `~/.arm-tfs/config.json`.  
+Environment variables override the saved config at runtime:
+
+| Variable         | Description           |
+|------------------|-----------------------|
+| `ARM_TFS_URL`    | Server collection URL |
+| `ARM_TFS_PAT`    | Personal Access Token |
+| `ARM_TFS_USER`   | Username              |
+| `ARM_TFS_PASSWORD` | Password            |
+
+## Quick Start
+
+```bash
+# 1. Configure server and credentials
+arm-tfs configure --url https://tfs.example.com/DefaultCollection --pat TOKEN
+
+# 2. Create a workspace and map a server folder to a local folder
+arm-tfs workspace new --name MyWorkspace
+arm-tfs workspace map --server "$/MyProject/Main" --local ~/code/myproject
+
+# 3. Get the latest files
+cd ~/code/myproject
+arm-tfs get
+
+# 4. Edit a file and mark it checked out
+arm-tfs checkout MyFile.cs
+
+# 5. Check in
+arm-tfs checkin -c "Fix bug in MyFile"
+```
+
+## Commands
+
+### `configure`
+
+Configure the TFS server connection.
+
+```
+arm-tfs configure [options]
+
+Options:
+  --url <url>            Server collection URL (e.g. https://tfs/DefaultCollection)
+  --pat <token>          Personal Access Token
+  --username <user>      Username (DOMAIN\user or user@domain)
+  --password <pass>      Password
+  --display-name <name>  Your display name (for commit attribution)
+  --show                 Print the current configuration (PAT is masked)
+```
+
+---
+
+### `workspace`
+
+Manage local workspaces. Workspace metadata is stored in `.tf/workspace.json`.
+
+```
+arm-tfs workspace new [options]
+  --name <name>          Workspace name (default: machine hostname)
+  --server <url>         Override server URL for this workspace
+
+arm-tfs workspace show
+  (prints workspace metadata from the nearest .tf/ directory)
+
+arm-tfs workspace map --server <serverPath> --local <localPath>
+  (adds a server→local path mapping)
+```
+
+---
+
+### `get`
+
+Download files from the server.
+
+```
+arm-tfs get [path] [options]
+
+Arguments:
+  path                   Local path or server path ($/...) [default: .]
+
+Options:
+  --version/-v <n>       Download a specific changeset version
+  --force/-f             Overwrite even if local file is up-to-date
+  --recursive/-r         Get files recursively [default: true]
+  --dry-run              Show what would be downloaded, without writing
+```
+
+---
+
+### `status`
+
+Show pending changes and locally modified tracked files.
+
+```
+arm-tfs status [path] [options]
+
+Options:
+  --all                  Show all tracked files, not just modified ones
+```
+
+---
+
+### `checkout` / `co` / `edit`
+
+Mark files as checked out (Edit). This is a **local-only** operation — no server lock is acquired.
+
+```
+arm-tfs checkout <paths...> [options]
+
+Options:
+  --recursive/-r         Include files in subdirectories
+```
+
+---
+
+### `add`
+
+Mark new files as pending Add.
+
+```
+arm-tfs add <paths...> [options]
+
+Options:
+  --recursive/-r         Include files in subdirectories
+```
+
+---
+
+### `undo`
+
+Undo pending changes and optionally restore file contents from the server.
+
+```
+arm-tfs undo <paths...> [options]
+
+Arguments:
+  paths                  Files to undo, or '.' to undo all pending changes
+
+Options:
+  --no-restore           Remove from pending list without restoring file
+```
+
+---
+
+### `checkin` / `ci`
+
+Check in pending changes to the server.
+
+```
+arm-tfs checkin [paths...] [options]
+
+Options:
+  -c, --comment <text>   Changeset comment (required)
+  --dry-run              Show what would be checked in without submitting
+  --keep-pending         Keep pending changes after a dry-run
+```
+
+---
+
+### `history` / `hist`
+
+Show changeset history for a path.
+
+```
+arm-tfs history [path] [options]
+
+Options:
+  --top/-n <n>           Maximum number of changesets [default: 20]
+  --author/-u <name>     Filter by author display name
+  --format <fmt>         Output format: table | json [default: table]
+```
+
+---
+
+### `shelveset` / `shelve`
+
+List or inspect shelvesets.
+
+```
+arm-tfs shelveset list [options]
+  --owner <name>         Filter by owner
+  --name <name>          Filter by shelveset name
+
+arm-tfs shelveset show <name>
+  (name can be "shelvesetname;owner" to specify an owner)
+```
+
+## Local Workspace Model
+
+`arm-tfs` uses a **local workspace** model:
+
+- No server-side locks are acquired on checkout.
+- Workspace metadata is stored in a `.tf/` directory at the workspace root:
+  - `.tf/workspace.json` — workspace definition and path mappings
+  - `.tf/pending.json` — pending changes (add / edit / delete / rename)
+  - `.tf/versions/<hash>.json` — per-file version tracking (changeset ID + content hash)
+- Files are identified as modified by comparing their SHA-256 hash against the stored hash at the time of last `get`.
+
+## Building from Source
+
+```bash
+git clone https://github.com/yourname/arm-tfs
+cd arm-tfs
+dotnet build
+dotnet test
+```
+
+To publish a self-contained single-file binary for ARM64 macOS:
+
+```bash
+dotnet publish src/ArmTfs.Cli -c Release -r osx-arm64 --self-contained true -p:PublishSingleFile=true -o publish/osx-arm64
+```
+
+For Windows ARM64:
+
+```bash
+dotnet publish src/ArmTfs.Cli -c Release -r win-arm64 --self-contained true -p:PublishSingleFile=true -o publish/win-arm64
+```
+
+## Architecture
+
+```
+arm-tfs.sln
+├── src/
+│   ├── ArmTfs.Core/          # REST client, workspace management, models
+│   │   ├── Client/
+│   │   │   ├── TfsConnection.cs       # VssConnection wrapper (PAT auth)
+│   │   │   └── TfvcClientService.cs   # TFVC operations via TfvcHttpClient
+│   │   ├── Config/
+│   │   │   └── TfsConfig.cs           # ~/.arm-tfs/config.json
+│   │   ├── Models/
+│   │   │   ├── PendingChange.cs
+│   │   │   ├── TfsServerItem.cs
+│   │   │   ├── TrackedFileVersion.cs
+│   │   │   └── WorkspaceMetadata.cs
+│   │   └── Workspace/
+│   │       └── WorkspaceManager.cs    # .tf/ metadata management
+│   └── ArmTfs.Cli/           # CLI entry point (System.CommandLine)
+│       ├── Program.cs
+│       └── Commands/          # One file per command
+└── tests/
+    └── ArmTfs.Core.Tests/    # xUnit tests for Core
+```
+
+## Known Limitations
+
+- **No merge conflict resolution** — `get` overwrites local files if `--force` is passed; conflicts must be resolved manually.
+- **No branch/label operations** — only TFVC mainline trunk workflows are supported.
+- **No workspace locking** — concurrent edits by multiple clients on the same workspace folder are not protected.
+- **PAT required for macOS** — Windows Integrated Auth (NTLM/Kerberos) is not supported cross-platform.
+
+## License
+
+MIT
