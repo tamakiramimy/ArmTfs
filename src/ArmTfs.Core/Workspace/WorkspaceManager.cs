@@ -36,7 +36,7 @@ public sealed class WorkspaceManager
     /// <param name="rootPath">工作区根目录（内部会转为绝对路径）</param>
     public WorkspaceManager(string rootPath)
     {
-        _rootPath = Path.GetFullPath(rootPath);
+        _rootPath = NormalizeLocalPath(rootPath);
     }
 
     private string TfPath => Path.Combine(_rootPath, TfDir);
@@ -51,7 +51,7 @@ public sealed class WorkspaceManager
     /// </summary>
     public static WorkspaceManager? FindWorkspace(string startPath)
     {
-        var dir = Path.GetFullPath(startPath);
+        var dir = NormalizeLocalPath(startPath);
         while (true)
         {
             var candidate = Path.Combine(dir, TfDir, WorkspaceFile);
@@ -160,10 +160,10 @@ public sealed class WorkspaceManager
     /// <summary>将本地路径转换为服务器路径（按工作区映射规则）</summary>
     public string? LocalToServerPath(string localPath, WorkspaceMetadata metadata)
     {
-        var absLocal = Path.GetFullPath(localPath);
+        var absLocal = NormalizeLocalPath(localPath);
         foreach (var mapping in metadata.Mappings.OrderByDescending(m => m.LocalPath.Length))
         {
-            var absMapping = Path.GetFullPath(mapping.LocalPath);
+            var absMapping = NormalizeLocalPath(mapping.LocalPath);
             if (absLocal.StartsWith(absMapping, StringComparison.OrdinalIgnoreCase))
             {
                 var relative = absLocal[absMapping.Length..].TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
@@ -186,8 +186,8 @@ public sealed class WorkspaceManager
                 var relative = serverPath[mapping.ServerPath.Length..].TrimStart('/');
                 var localRelative = relative.Replace('/', Path.DirectorySeparatorChar);
                 return string.IsNullOrEmpty(localRelative)
-                    ? mapping.LocalPath
-                    : Path.Combine(mapping.LocalPath, localRelative);
+                    ? NormalizeLocalPath(mapping.LocalPath)
+                    : NormalizeLocalPath(Path.Combine(mapping.LocalPath, localRelative));
             }
         }
         return null;
@@ -217,9 +217,22 @@ public sealed class WorkspaceManager
     private string GetVersionFilePath(string localPath)
     {
         // 用路径的哈希作为版本文件名，避免路径分隔符问题
-        var key = Path.GetFullPath(localPath).ToLowerInvariant();
+        var key = NormalizeLocalPath(localPath).ToLowerInvariant();
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key)))[..16];
         return Path.Combine(VersionsPath, $"{hash}.json");
+    }
+
+    private static string NormalizeLocalPath(string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+
+        if (OperatingSystem.IsMacOS() && fullPath.StartsWith("/private/tmp", StringComparison.Ordinal))
+        {
+            var suffix = fullPath["/private/tmp".Length..];
+            return "/tmp" + suffix;
+        }
+
+        return fullPath;
     }
 
     private void EnsureExists()

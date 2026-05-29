@@ -189,16 +189,18 @@ public sealed class TfvcClientService
     /// <returns>新创建的 Changeset 的引用信息</returns>
     public async Task<TfvcChangesetRef> CheckinAsync(
         string comment,
-        IEnumerable<(string serverPath, Models.ChangeType changeType, byte[]? content)> changes,
+        IEnumerable<(string serverPath, Models.ChangeType changeType, byte[]? content, int? baseChangesetId)> changes,
         CancellationToken ct = default)
     {
         var client = _connection.GetTfvcClient();
 
         var tfvcChanges = new List<TfvcChange>();
-        foreach (var (serverPath, changeType, content) in changes)
+        foreach (var (serverPath, changeType, content, baseChangesetId) in changes)
         {
             var tfvcChangeType = MapChangeType(changeType);
             var item = new TfvcItem { Path = serverPath };
+            if (baseChangesetId.HasValue)
+                item.ChangesetVersion = baseChangesetId.Value;
 
             var tfvcChange = new TfvcChange
             {
