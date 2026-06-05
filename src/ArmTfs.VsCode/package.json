@@ -12,21 +12,109 @@
   ],
   "main": "./out/extension.js",
   "activationEvents": [
+    "workspaceContains:**/.tf/workspace.json",
+    "onView:armTfs.serverExplorer",
+    "onView:armTfs.branches",
+    "onView:armTfs.historyGraph",
+    "onView:armTfs.merge",
+    "onCommand:armTfs.configurePat",
     "onCommand:armTfs.configureCliCommand",
-    "onCommand:armTfs.showStatus",
-    "onCommand:armTfs.showHistory",
-    "onCommand:armTfs.showDiff",
-    "onCommand:armTfs.showBranch",
-    "onCommand:armTfs.showChangeset",
-    "onCommand:armTfs.showLabel",
-    "onCommand:armTfs.showMergeBase",
-    "onCommand:armTfs.showMergeCandidates"
+    "onCommand:armTfs.switchLanguage"
   ],
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "armTfsHub",
+          "title": "TFS",
+          "icon": "media/tfs.svg"
+        }
+      ]
+    },
+    "views": {
+      "armTfsHub": [
+        {
+          "id": "armTfs.serverExplorer",
+          "name": "Server Explorer"
+        },
+        {
+          "id": "armTfs.branches",
+          "name": "Branches"
+        },
+        {
+          "id": "armTfs.historyGraph",
+          "name": "Changeset Graph"
+        },
+        {
+          "id": "armTfs.merge",
+          "name": "Merge"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "armTfs.configureCliCommand",
         "title": "Configure CLI Command",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.configurePat",
+        "title": "Configure PAT / Server URL",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.showConfig",
+        "title": "Show Configuration",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.switchLanguage",
+        "title": "Switch UI Language",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.createWorkspace",
+        "title": "Create Workspace",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.checkoutServerPathToFolder",
+        "title": "Checkout Server Path To Folder",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.showWorkspace",
+        "title": "Show Workspace",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.addWorkspaceMapping",
+        "title": "Add Workspace Mapping",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.runGet",
+        "title": "Get Latest",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.checkout",
+        "title": "Checkout",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.add",
+        "title": "Add Pending File",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.undo",
+        "title": "Undo Pending Change",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.checkin",
+        "title": "Check In",
         "category": "arm-tfs"
       },
       {
@@ -68,8 +156,358 @@
         "command": "armTfs.showMergeCandidates",
         "title": "Show Merge Candidates JSON",
         "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.refreshScm",
+        "title": "Refresh Source Control",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.openResourceDiff",
+        "title": "Open TFS Diff",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.checkoutResource",
+        "title": "Checkout Resource",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.addResource",
+        "title": "Add Resource",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.undoResource",
+        "title": "Undo Resource",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.checkinFromScm",
+        "title": "Check In from Source Control",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.sidebar.refresh",
+        "title": "Refresh TFS Views",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.serverExplorer.refresh",
+        "title": "Refresh Server Explorer",
+        "category": "arm-tfs",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "armTfs.serverExplorer.setRoot",
+        "title": "Set Root Path",
+        "category": "arm-tfs",
+        "icon": "$(root-folder)"
+      },
+      {
+        "command": "armTfs.serverExplorer.getLatest",
+        "title": "Get Latest",
+        "category": "arm-tfs",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "armTfs.serverExplorer.checkout",
+        "title": "Checkout",
+        "category": "arm-tfs",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "armTfs.serverExplorer.showHistory",
+        "title": "Show History",
+        "category": "arm-tfs",
+        "icon": "$(history)"
+      },
+      {
+        "command": "armTfs.serverExplorer.copyPath",
+        "title": "Copy Server Path",
+        "category": "arm-tfs",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "armTfs.sidebar.setBranchScope",
+        "title": "Set Branch Scope",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.sidebar.setMergeSource",
+        "title": "Set Merge Source",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.sidebar.setMergeTarget",
+        "title": "Set Merge Target",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.sidebar.copyTfvcPath",
+        "title": "Copy TFVC Path",
+        "category": "arm-tfs",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "armTfs.sidebar.pullBranch",
+        "title": "Pull Branch",
+        "category": "arm-tfs",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "armTfs.sidebar.checkoutBranch",
+        "title": "Checkout Branch",
+        "category": "arm-tfs",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "armTfs.sidebar.showBranchHistory",
+        "title": "Show Branch History",
+        "category": "arm-tfs",
+        "icon": "$(history)"
+      },
+      {
+        "command": "armTfs.sidebar.mergeFromBranch",
+        "title": "Merge From Branch",
+        "category": "arm-tfs",
+        "icon": "$(combine)"
+      },
+      {
+        "command": "armTfs.sidebar.swapMergePaths",
+        "title": "Swap Merge Source and Target",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.sidebar.executeMergeCandidate",
+        "title": "Execute Merge Candidate",
+        "category": "arm-tfs"
       }
     ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "armTfs.serverExplorer.refresh",
+          "when": "view == armTfs.serverExplorer",
+          "group": "navigation@1"
+        },
+        {
+          "command": "armTfs.serverExplorer.setRoot",
+          "when": "view == armTfs.serverExplorer",
+          "group": "navigation@2"
+        },
+        {
+          "command": "armTfs.configurePat",
+          "when": "view == armTfs.serverExplorer",
+          "group": "navigation@3"
+        },
+        {
+          "command": "armTfs.sidebar.refresh",
+          "when": "view == armTfs.branches",
+          "group": "navigation@1"
+        },
+        {
+          "command": "armTfs.sidebar.setBranchScope",
+          "when": "view == armTfs.branches",
+          "group": "navigation@2"
+        },
+        {
+          "command": "armTfs.checkoutServerPathToFolder",
+          "when": "view == armTfs.branches",
+          "group": "navigation@3"
+        },
+        {
+          "command": "armTfs.sidebar.refresh",
+          "when": "view == armTfs.historyGraph",
+          "group": "navigation@1"
+        },
+        {
+          "command": "armTfs.sidebar.refresh",
+          "when": "view == armTfs.merge",
+          "group": "navigation@1"
+        },
+        {
+          "command": "armTfs.sidebar.setMergeSource",
+          "when": "view == armTfs.merge",
+          "group": "navigation@2"
+        },
+        {
+          "command": "armTfs.sidebar.setMergeTarget",
+          "when": "view == armTfs.merge",
+          "group": "navigation@3"
+        },
+        {
+          "command": "armTfs.sidebar.swapMergePaths",
+          "when": "view == armTfs.merge",
+          "group": "navigation@4"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "armTfs.serverExplorer.getLatest",
+          "when": "view == armTfs.serverExplorer && viewItem =~ /armTfsServer(Folder|File)/",
+          "group": "inline@1"
+        },
+        {
+          "command": "armTfs.serverExplorer.checkout",
+          "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFile",
+          "group": "inline@2"
+        },
+        {
+          "command": "armTfs.serverExplorer.showHistory",
+          "when": "view == armTfs.serverExplorer && viewItem =~ /armTfsServer(Folder|File)/",
+          "group": "inline@3"
+        },
+        {
+          "command": "armTfs.serverExplorer.setRoot",
+          "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
+          "group": "context@1"
+        },
+        {
+          "command": "armTfs.serverExplorer.copyPath",
+          "when": "view == armTfs.serverExplorer && viewItem =~ /armTfsServer(Folder|File)/",
+          "group": "context@2"
+        },
+        {
+          "command": "armTfs.sidebar.setMergeSource",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "inline@1"
+        },
+        {
+          "command": "armTfs.sidebar.setMergeTarget",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "inline@2"
+        },
+        {
+          "command": "armTfs.sidebar.pullBranch",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "inline@3"
+        },
+        {
+          "command": "armTfs.sidebar.checkoutBranch",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "inline@4"
+        },
+        {
+          "command": "armTfs.sidebar.copyTfvcPath",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "context@1"
+        },
+        {
+          "command": "armTfs.sidebar.mergeFromBranch",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "context@2"
+        },
+        {
+          "command": "armTfs.sidebar.showBranchHistory",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "context@3"
+        },
+        {
+          "command": "armTfs.checkoutServerPathToFolder",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "context@4"
+        },
+        {
+          "command": "armTfs.sidebar.copyTfvcPath",
+          "when": "view == armTfs.merge && viewItem == armTfsMergeTargetOption",
+          "group": "context@1"
+        },
+        {
+          "command": "armTfs.sidebar.executeMergeCandidate",
+          "when": "view == armTfs.merge && viewItem == armTfsSidebarMergeCandidate",
+          "group": "inline@1"
+        }
+      ],
+      "scm/title": [
+        {
+          "command": "armTfs.refreshScm",
+          "when": "scmProvider == armTfs",
+          "group": "navigation@1"
+        },
+        {
+          "command": "armTfs.runGet",
+          "when": "scmProvider == armTfs",
+          "group": "navigation@2"
+        },
+        {
+          "command": "armTfs.checkinFromScm",
+          "when": "scmProvider == armTfs",
+          "group": "navigation@3"
+        }
+      ],
+      "scm/resourceState/context": [
+        {
+          "command": "armTfs.openResourceDiff",
+          "when": "scmProvider == armTfs",
+          "group": "inline@1"
+        },
+        {
+          "command": "armTfs.checkoutResource",
+          "when": "scmProvider == armTfs && scmResourceState == armTfsModifiedNotCheckedOut",
+          "group": "inline@2"
+        },
+        {
+          "command": "armTfs.addResource",
+          "when": "scmProvider == armTfs && scmResourceState == armTfsModifiedNotCheckedOut",
+          "group": "inline@3"
+        },
+        {
+          "command": "armTfs.undoResource",
+          "when": "scmProvider == armTfs && scmResourceState != armTfsModifiedNotCheckedOut",
+          "group": "inline@4"
+        },
+        {
+          "command": "armTfs.showHistory",
+          "when": "scmProvider == armTfs",
+          "group": "context@1"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "armTfs.checkout",
+          "when": "resourceScheme == file",
+          "group": "navigation@20"
+        },
+        {
+          "command": "armTfs.add",
+          "when": "resourceScheme == file",
+          "group": "navigation@21"
+        },
+        {
+          "command": "armTfs.undo",
+          "when": "resourceScheme == file",
+          "group": "navigation@22"
+        },
+        {
+          "command": "armTfs.showDiff",
+          "when": "resourceScheme == file",
+          "group": "navigation@23"
+        },
+        {
+          "command": "armTfs.showHistory",
+          "when": "resourceScheme == file",
+          "group": "navigation@24"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "armTfs.checkout",
+          "when": "resourceScheme == file",
+          "group": "navigation@20"
+        },
+        {
+          "command": "armTfs.showDiff",
+          "when": "resourceScheme == file",
+          "group": "navigation@21"
+        },
+        {
+          "command": "armTfs.showHistory",
+          "when": "resourceScheme == file",
+          "group": "navigation@22"
+        }
+      ]
+    },
     "configuration": {
       "title": "arm-tfs",
       "properties": {
@@ -77,6 +515,11 @@
           "type": "string",
           "default": "",
           "description": "Explicit CLI command to run. Leave empty to auto-discover a workspace build or fall back to arm-tfs on PATH."
+        },
+        "armTfs.serverExplorer.rootPath": {
+          "type": "string",
+          "default": "",
+          "description": "Root TFVC server path shown in the Server Explorer tree (e.g. $/ or $/MyProject). Leave empty to prompt on first open."
         },
         "armTfs.cli.commandArgs": {
           "type": "array",
@@ -95,6 +538,69 @@
           "type": "boolean",
           "default": true,
           "description": "Prefer a repo-local arm-tfs build before falling back to the arm-tfs command on PATH."
+        },
+        "armTfs.workspaceRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute path to the real arm-tfs workspace root when the VS Code folder itself is not the TFVC workspace root."
+        },
+        "armTfs.ui.language": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "zh-CN",
+            "en"
+          ],
+          "description": "arm-tfs runtime UI language. 'auto' follows the VS Code display language."
+        },
+        "armTfs.autoCheckout.mode": {
+          "type": "string",
+          "default": "firstEdit",
+          "enum": [
+            "off",
+            "firstEdit",
+            "onSave"
+          ],
+          "description": "Automatically checkout tracked TFVC files when they are first edited or when they are saved."
+        },
+        "armTfs.autoCheckout.confirm": {
+          "type": "boolean",
+          "default": false,
+          "description": "Prompt before automatic checkout is performed."
+        },
+        "armTfs.branch.scope": {
+          "type": "string",
+          "default": "",
+          "description": "Optional TFVC server path used as the default branch tree scope. Leave empty to use the workspace mapping root."
+        },
+        "armTfs.history.top": {
+          "type": "number",
+          "default": 30,
+          "minimum": 1,
+          "description": "Number of changesets to load in the Changeset Graph view."
+        },
+        "armTfs.merge.sourcePath": {
+          "type": "string",
+          "default": "",
+          "description": "Default TFVC source branch path shown in the Merge view."
+        },
+        "armTfs.merge.targetPath": {
+          "type": "string",
+          "default": "",
+          "description": "Default TFVC target branch path shown in the Merge view."
+        },
+        "armTfs.merge.candidateTop": {
+          "type": "number",
+          "default": 20,
+          "minimum": 1,
+          "description": "Maximum number of merge candidates shown in the Merge view."
+        },
+        "armTfs.merge.candidateScan": {
+          "type": "number",
+          "default": 80,
+          "minimum": 1,
+          "description": "How many history entries to scan when computing merge candidates."
         }
       }
     }

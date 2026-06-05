@@ -61,3 +61,29 @@ public sealed class MergeCandidateQueryResult
     public IReadOnlyList<MergeSourceRange> MergedRanges { get; init; } = Array.Empty<MergeSourceRange>();
     public IReadOnlyList<MergeCandidateInfo> Candidates { get; init; } = Array.Empty<MergeCandidateInfo>();
 }
+
+public sealed class MergeExecutionChange
+{
+    public string SourceServerPath { get; init; } = string.Empty;
+    public string TargetServerPath { get; init; } = string.Empty;
+    public int SourceChangesetId { get; init; }
+    public string SourceChangeType { get; init; } = string.Empty;
+    public string TargetChangeType { get; init; } = string.Empty;
+    public bool TargetExists { get; init; }
+    public bool HasContent { get; init; }
+    public string Status { get; init; } = "planned";
+    public string? Note { get; init; }
+}
+
+public sealed class MergeExecutionResult
+{
+    public string SourcePath { get; init; } = string.Empty;
+    public string TargetPath { get; init; } = string.Empty;
+    public int SourceChangesetId { get; init; }
+    public string Comment { get; init; } = string.Empty;
+    public bool DryRun { get; init; }
+    public int? CreatedChangesetId { get; init; }
+    public MergeBaseInfo BaseInfo { get; init; } = new();
+    public IReadOnlyList<MergeExecutionChange> Changes { get; init; } = Array.Empty<MergeExecutionChange>();
+    public IReadOnlyList<string> Warnings { get; init; } = Array.Empty<string>();
+}

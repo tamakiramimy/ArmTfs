@@ -261,3 +261,20 @@ export interface MergeCandidateResponse extends JsonEnvelope {
     };
   }>;
 }
+
+export interface ServerItemEntry {
+  serverPath: string;
+  isFolder: boolean;
+  changesetId: number;
+  contentLength?: number;
+  checkinDate?: string;
+}
+
+export interface ItemsListResponse extends JsonEnvelope {
+  command: 'items.list';
+  query: {
+    path: string;
+    recursive: boolean;
+  };
+  items: ServerItemEntry[];
+}

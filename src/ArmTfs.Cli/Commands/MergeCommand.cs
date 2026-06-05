@@ -14,6 +14,85 @@ public static class MergeCommand
         var cmd = new Command("merge", "Query TFVC merge candidates and merge base information.");
         cmd.AddCommand(BuildCandidate(config));
         cmd.AddCommand(BuildBase(config));
+        cmd.AddCommand(BuildExecute(config));
+        return cmd;
+    }
+
+    private static Command BuildExecute(TfsConfig config)
+    {
+        var cmd = new Command("execute", "Execute a single TFVC changeset merge from source to target.");
+        var sourceOpt = new Option<string>("--source") { Description = "Source branch or folder path ($/...)" };
+        var targetOpt = new Option<string>("--target") { Description = "Target branch or folder path ($/...)" };
+        var changesetOpt = new Option<int>("--changeset") { Description = "Source changeset ID to merge", IsRequired = true };
+        var commentOpt = new Option<string?>("--comment") { Description = "Comment for the created merge changeset" };
+        var dryRunOpt = new Option<bool>("--dry-run") { Description = "Show the merge plan without creating a TFVC changeset" };
+        var formatOpt = new Option<string>("--format", () => "table") { Description = "Output format: table | json" };
+
+        sourceOpt.IsRequired = true;
+        targetOpt.IsRequired = true;
+
+        cmd.AddOption(sourceOpt);
+        cmd.AddOption(targetOpt);
+        cmd.AddOption(changesetOpt);
+        cmd.AddOption(commentOpt);
+        cmd.AddOption(dryRunOpt);
+        cmd.AddOption(formatOpt);
+
+        cmd.SetHandler(async (source, target, changesetId, comment, dryRun, format) =>
+        {
+            using var conn = new TfsConnection(config);
+            var svc = new TfvcClientService(conn);
+
+            try
+            {
+                var resolvedSource = ResolveServerPath(source);
+                var resolvedTarget = ResolveServerPath(target);
+                var result = await svc.MergeChangesetAsync(resolvedSource, resolvedTarget, changesetId, comment, dryRun).ConfigureAwait(false);
+
+                if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+                {
+                    JsonOutput.Write(new
+                    {
+                        schemaVersion = 1,
+                        command = "merge.execute",
+                        result = ProjectExecutionResult(result),
+                    });
+                    return;
+                }
+
+                Console.WriteLine($"Source      : {result.SourcePath}");
+                Console.WriteLine($"Target      : {result.TargetPath}");
+                Console.WriteLine($"Changeset   : cs#{result.SourceChangesetId}");
+                Console.WriteLine($"Mode        : {(result.DryRun ? "dry-run" : "execute")}");
+                Console.WriteLine($"Comment     : {result.Comment}");
+                if (result.CreatedChangesetId.HasValue)
+                    Console.WriteLine($"Created     : cs#{result.CreatedChangesetId.Value}");
+
+                Console.WriteLine();
+                Console.WriteLine($"{"Target Change",-18}  {"Target Path",-80}  Source");
+                Console.WriteLine($"{new string('-', 18)}  {new string('-', 80)}  {new string('-', 40)}");
+                foreach (var change in result.Changes)
+                {
+                    Console.WriteLine($"{change.TargetChangeType,-18}  {change.TargetServerPath,-80}  {change.SourceServerPath}");
+                    if (!string.IsNullOrEmpty(change.Note))
+                        Console.WriteLine($"{string.Empty,-18}  note: {change.Note}");
+                }
+
+                if (result.Warnings.Count > 0)
+                {
+                    Console.WriteLine();
+                    Console.WriteLine("Warnings:");
+                    foreach (var warning in result.Warnings)
+                        Console.WriteLine($"  - {warning}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Error: {ex.Message}");
+                Environment.ExitCode = 1;
+            }
+        }, sourceOpt, targetOpt, changesetOpt, commentOpt, dryRunOpt, formatOpt);
+
         return cmd;
     }
 
@@ -252,5 +331,29 @@ public static class MergeCommand
             isRename = candidate.CoveredByRange.IsRename,
             targetChangesetId = candidate.CoveredByRange.TargetChangesetId,
         },
+    };
+
+    private static object ProjectExecutionResult(MergeExecutionResult result) => new
+    {
+        sourcePath = result.SourcePath,
+        targetPath = result.TargetPath,
+        sourceChangesetId = result.SourceChangesetId,
+        comment = result.Comment,
+        dryRun = result.DryRun,
+        createdChangesetId = result.CreatedChangesetId,
+        mergeBase = ProjectBaseInfo(result.BaseInfo),
+        changes = result.Changes.Select(change => new
+        {
+            sourceServerPath = change.SourceServerPath,
+            targetServerPath = change.TargetServerPath,
+            sourceChangesetId = change.SourceChangesetId,
+            sourceChangeType = change.SourceChangeType,
+            targetChangeType = change.TargetChangeType,
+            targetExists = change.TargetExists,
+            hasContent = change.HasContent,
+            status = change.Status,
+            note = change.Note,
+        }),
+        warnings = result.Warnings,
     };
 }

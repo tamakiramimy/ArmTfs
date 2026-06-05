@@ -34,10 +34,17 @@ public sealed class TfvcClientService
         string serverPath,
         bool recursive = true,
         int? atChangeset = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        bool oneLevelOnly = false)
     {
         var client = _connection.GetTfvcClient();
-        var recursion = recursive ? VersionControlRecursionType.Full : VersionControlRecursionType.None;
+        VersionControlRecursionType recursion;
+        if (oneLevelOnly)
+            recursion = VersionControlRecursionType.OneLevel;
+        else if (recursive)
+            recursion = VersionControlRecursionType.Full;
+        else
+            recursion = VersionControlRecursionType.None;
 
         TfvcVersionDescriptor? version = atChangeset.HasValue
             ? new TfvcVersionDescriptor { VersionType = TfvcVersionType.Changeset, Version = atChangeset.Value.ToString() }
@@ -452,6 +459,145 @@ public sealed class TfvcClientService
         };
     }
 
+    public async Task<MergeExecutionResult> MergeChangesetAsync(
+        string sourcePath,
+        string targetPath,
+        int sourceChangesetId,
+        string? comment = null,
+        bool dryRun = false,
+        CancellationToken ct = default)
+    {
+        var normalizedSource = NormalizeServerPath(sourcePath);
+        var normalizedTarget = NormalizeServerPath(targetPath);
+        var mergeBase = await ResolveMergeBaseAsync(normalizedSource, normalizedTarget, ct).ConfigureAwait(false);
+        var detail = await GetChangesetAsync(sourceChangesetId, ct).ConfigureAwait(false);
+        var effectiveComment = string.IsNullOrWhiteSpace(comment)
+            ? $"Merge cs#{sourceChangesetId} from {normalizedSource} to {normalizedTarget}"
+            : comment.Trim();
+
+        var warnings = new List<string>();
+        var plannedChanges = new List<MergeExecutionChange>();
+        var tfvcChanges = new List<TfvcChange>();
+
+        foreach (var change in detail.Changes ?? Array.Empty<TfvcChange>())
+        {
+            var sourceItemPath = change.Item?.Path;
+            if (string.IsNullOrEmpty(sourceItemPath) || !IsSameOrDescendantPath(sourceItemPath, normalizedSource))
+                continue;
+
+            if (change.Item?.IsFolder == true)
+                continue;
+
+            var targetServerPath = RemapServerPath(sourceItemPath, normalizedSource, normalizedTarget);
+            var targetExists = await TryGetItemVersionAsync(targetServerPath, ct).ConfigureAwait(false);
+            var targetChangeType = ResolveMergeChangeType(change.ChangeType, targetExists.HasValue, out var note);
+            if (targetChangeType == VersionControlChangeType.None)
+            {
+                warnings.Add(note ?? $"Skipped unsupported merge change for {sourceItemPath}.");
+                plannedChanges.Add(new MergeExecutionChange
+                {
+                    SourceServerPath = sourceItemPath,
+                    TargetServerPath = targetServerPath,
+                    SourceChangesetId = sourceChangesetId,
+                    SourceChangeType = change.ChangeType.ToString(),
+                    TargetChangeType = VersionControlChangeType.None.ToString(),
+                    TargetExists = targetExists.HasValue,
+                    HasContent = false,
+                    Status = "skipped",
+                    Note = note,
+                });
+                continue;
+            }
+
+            byte[]? content = null;
+            var requiresContent = targetChangeType.HasFlag(VersionControlChangeType.Add) || targetChangeType.HasFlag(VersionControlChangeType.Edit);
+            if (requiresContent)
+            {
+                content = await DownloadFileContentAsync(sourceItemPath, change.Item?.ChangesetVersion ?? sourceChangesetId, ct).ConfigureAwait(false);
+            }
+
+            plannedChanges.Add(new MergeExecutionChange
+            {
+                SourceServerPath = sourceItemPath,
+                TargetServerPath = targetServerPath,
+                SourceChangesetId = sourceChangesetId,
+                SourceChangeType = change.ChangeType.ToString(),
+                TargetChangeType = targetChangeType.ToString(),
+                TargetExists = targetExists.HasValue,
+                HasContent = content is not null,
+                Status = dryRun ? "planned" : "ready",
+                Note = note,
+            });
+
+            if (dryRun)
+                continue;
+
+            tfvcChanges.Add(BuildTfvcChange(
+                targetServerPath,
+                targetChangeType,
+                content,
+                targetExists,
+                new[]
+                {
+                    new TfvcMergeSource
+                    {
+                        ServerItem = sourceItemPath,
+                        VersionFrom = sourceChangesetId,
+                        VersionTo = sourceChangesetId,
+                        IsRename = change.ChangeType.HasFlag(VersionControlChangeType.SourceRename),
+                    }
+                }));
+        }
+
+        if (dryRun || tfvcChanges.Count == 0)
+        {
+            if (!dryRun && tfvcChanges.Count == 0)
+                warnings.Add("No executable merge changes were produced for the requested source changeset.");
+
+            return new MergeExecutionResult
+            {
+                SourcePath = normalizedSource,
+                TargetPath = normalizedTarget,
+                SourceChangesetId = sourceChangesetId,
+                Comment = effectiveComment,
+                DryRun = dryRun,
+                BaseInfo = mergeBase,
+                Changes = plannedChanges,
+                Warnings = warnings,
+            };
+        }
+
+        var created = await _connection.GetTfvcClient().CreateChangesetAsync(new TfvcChangeset
+        {
+            Comment = effectiveComment,
+            Changes = tfvcChanges,
+        }, cancellationToken: ct).ConfigureAwait(false);
+
+        return new MergeExecutionResult
+        {
+            SourcePath = normalizedSource,
+            TargetPath = normalizedTarget,
+            SourceChangesetId = sourceChangesetId,
+            Comment = effectiveComment,
+            DryRun = false,
+            CreatedChangesetId = created.ChangesetId,
+            BaseInfo = mergeBase,
+            Changes = plannedChanges.Select(change => new MergeExecutionChange
+            {
+                SourceServerPath = change.SourceServerPath,
+                TargetServerPath = change.TargetServerPath,
+                SourceChangesetId = change.SourceChangesetId,
+                SourceChangeType = change.SourceChangeType,
+                TargetChangeType = change.TargetChangeType,
+                TargetExists = change.TargetExists,
+                HasContent = change.HasContent,
+                Status = "created",
+                Note = change.Note,
+            }).ToList(),
+            Warnings = warnings,
+        };
+    }
+
     private async Task<TfvcBranch?> TryResolveBranchAsync(string path, CancellationToken ct)
     {
         foreach (var candidate in EnumerateServerPathCandidates(path))
@@ -556,6 +702,76 @@ public sealed class TfvcClientService
         };
     }
 
+    private async Task<int?> TryGetItemVersionAsync(string serverPath, CancellationToken ct)
+    {
+        try
+        {
+            var item = await _connection.GetTfvcClient().GetItemAsync(serverPath, cancellationToken: ct).ConfigureAwait(false);
+            return item?.ChangesetVersion;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private async Task<byte[]> DownloadFileContentAsync(string serverPath, int changesetId, CancellationToken ct)
+    {
+        await using var stream = new MemoryStream();
+        await DownloadFileAsync(serverPath, stream, changesetId, ct).ConfigureAwait(false);
+        return stream.ToArray();
+    }
+
+    private static string NormalizeServerPath(string serverPath) => serverPath.TrimEnd('/');
+
+    private static string RemapServerPath(string sourceServerPath, string sourceRoot, string targetRoot)
+    {
+        if (string.Equals(sourceServerPath, sourceRoot, StringComparison.OrdinalIgnoreCase))
+            return targetRoot;
+
+        var relative = sourceServerPath[sourceRoot.Length..].TrimStart('/');
+        return string.IsNullOrEmpty(relative)
+            ? targetRoot
+            : $"{targetRoot}/{relative}";
+    }
+
+    private static VersionControlChangeType ResolveMergeChangeType(VersionControlChangeType sourceChangeType, bool targetExists, out string? note)
+    {
+        note = null;
+
+        if (sourceChangeType.HasFlag(VersionControlChangeType.Rename) || sourceChangeType.HasFlag(VersionControlChangeType.SourceRename) || sourceChangeType.HasFlag(VersionControlChangeType.TargetRename))
+        {
+            note = "Rename-based merge is not supported in the first execute implementation.";
+            return VersionControlChangeType.None;
+        }
+
+        if (sourceChangeType.HasFlag(VersionControlChangeType.Branch))
+        {
+            note = "Branch-creation merge is not supported in the first execute implementation.";
+            return VersionControlChangeType.None;
+        }
+
+        if (sourceChangeType.HasFlag(VersionControlChangeType.Delete))
+        {
+            if (!targetExists)
+            {
+                note = "Target item does not exist, so the delete merge was skipped.";
+                return VersionControlChangeType.None;
+            }
+
+            return VersionControlChangeType.Merge | VersionControlChangeType.Delete;
+        }
+
+        if (sourceChangeType.HasFlag(VersionControlChangeType.Add))
+            return VersionControlChangeType.Merge | (targetExists ? VersionControlChangeType.Edit : VersionControlChangeType.Add);
+
+        if (sourceChangeType.HasFlag(VersionControlChangeType.Edit))
+            return VersionControlChangeType.Merge | (targetExists ? VersionControlChangeType.Edit : VersionControlChangeType.Add);
+
+        note = $"Unsupported TFVC change type: {sourceChangeType}.";
+        return VersionControlChangeType.None;
+    }
+
     // ─── Checkin ───────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -584,47 +800,7 @@ public sealed class TfvcClientService
         foreach (var (serverPath, changeType, content, baseChangesetId) in changes)
         {
             var tfvcChangeType = MapChangeType(changeType);
-            var item = new TfvcItem { Path = serverPath };
-            if (baseChangesetId.HasValue)
-                item.ChangesetVersion = baseChangesetId.Value;
-
-            var tfvcChange = new TfvcChange
-            {
-                Item = item,
-                ChangeType = tfvcChangeType,
-            };
-
-            if (content is not null && changeType is Models.ChangeType.Add or Models.ChangeType.Edit)
-            {
-                if (TryDecodeUtf8Text(content, out var textContent))
-                {
-                    item.ContentMetadata = new FileContentMetadata
-                    {
-                        Encoding = Encoding.UTF8.CodePage,
-                        ContentType = "text/plain",
-                    };
-                    tfvcChange.NewContent = new ItemContent
-                    {
-                        Content = textContent,
-                        ContentType = ItemContentType.RawText,
-                    };
-                }
-                else
-                {
-                    item.ContentMetadata = new FileContentMetadata
-                    {
-                        Encoding = -1,
-                        IsBinary = true,
-                    };
-                    tfvcChange.NewContent = new ItemContent
-                    {
-                        Content = Convert.ToBase64String(content),
-                        ContentType = ItemContentType.Base64Encoded,
-                    };
-                }
-            }
-
-            tfvcChanges.Add(tfvcChange);
+            tfvcChanges.Add(BuildTfvcChange(serverPath, tfvcChangeType, content, baseChangesetId));
         }
 
         var changeset = new TfvcChangeset
@@ -647,6 +823,56 @@ public sealed class TfvcClientService
             Models.ChangeType.Undelete => VersionControlChangeType.Undelete,
             _ => VersionControlChangeType.None,
         };
+
+    private static TfvcChange BuildTfvcChange(
+        string serverPath,
+        VersionControlChangeType changeType,
+        byte[]? content,
+        int? baseChangesetId,
+        IEnumerable<TfvcMergeSource>? mergeSources = null)
+    {
+        var item = new TfvcItem { Path = serverPath };
+        if (baseChangesetId.HasValue)
+            item.ChangesetVersion = baseChangesetId.Value;
+
+        var tfvcChange = new TfvcChange
+        {
+            Item = item,
+            ChangeType = changeType,
+            MergeSources = mergeSources,
+        };
+
+        if (content is null)
+            return tfvcChange;
+
+        if (TryDecodeUtf8Text(content, out var textContent))
+        {
+            item.ContentMetadata = new FileContentMetadata
+            {
+                Encoding = Encoding.UTF8.CodePage,
+                ContentType = "text/plain",
+            };
+            tfvcChange.NewContent = new ItemContent
+            {
+                Content = textContent,
+                ContentType = ItemContentType.RawText,
+            };
+            return tfvcChange;
+        }
+
+        item.ContentMetadata = new FileContentMetadata
+        {
+            Encoding = -1,
+            IsBinary = true,
+        };
+        tfvcChange.NewContent = new ItemContent
+        {
+            Content = Convert.ToBase64String(content),
+            ContentType = ItemContentType.Base64Encoded,
+        };
+
+        return tfvcChange;
+    }
 
     private static bool TryDecodeUtf8Text(byte[] content, out string text)
     {
