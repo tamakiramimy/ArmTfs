@@ -88,6 +88,9 @@ public sealed class TfsConfig
         var envPat = Environment.GetEnvironmentVariable("ARM_TFS_PAT");
         if (!string.IsNullOrEmpty(envPat)) PersonalAccessToken = envPat;
 
+        var envDisplayName = Environment.GetEnvironmentVariable("ARM_TFS_DISPLAY_NAME");
+        if (!string.IsNullOrEmpty(envDisplayName)) UserDisplayName = envDisplayName;
+
         var envUser = Environment.GetEnvironmentVariable("ARM_TFS_USER");
         if (!string.IsNullOrEmpty(envUser)) Username = envUser;
 

@@ -24,17 +24,49 @@ public static class DiffCommand
         var pathArg = new Argument<string>("path", "Local path or server path ($/...) to diff");
         var baseOpt = new Option<bool>("--base") { Description = "Compare against the tracked base version instead of the latest server version" };
         var versionOpt = new Option<int?>("--version") { Description = "Compare against a specific changeset version" };
+        var fromVersionOpt = new Option<int?>("--from-version") { Description = "Server-to-server comparison: older changeset version" };
+        var toVersionOpt = new Option<int?>("--to-version") { Description = "Server-to-server comparison: newer changeset version" };
+        var toPathOpt = new Option<string?>("--to-path") { Description = "Server-to-server comparison: target TFVC path when comparing branches" };
         var ignoreWhitespaceOpt = new Option<bool>("--ignore-whitespace") { Description = "Ignore whitespace-only differences for text files" };
         var formatOpt = new Option<string>("--format", () => "text") { Description = "Output format: text | json" };
 
         cmd.AddArgument(pathArg);
         cmd.AddOption(baseOpt);
         cmd.AddOption(versionOpt);
+        cmd.AddOption(fromVersionOpt);
+        cmd.AddOption(toVersionOpt);
+        cmd.AddOption(toPathOpt);
         cmd.AddOption(ignoreWhitespaceOpt);
         cmd.AddOption(formatOpt);
 
-        cmd.SetHandler(async (path, useBase, version, ignoreWhitespace, format) =>
+        cmd.SetHandler(async (path, useBase, version, fromVersion, toVersion, toPath, ignoreWhitespace, format) =>
         {
+            if (fromVersion.HasValue || toVersion.HasValue)
+            {
+                if (!fromVersion.HasValue || !toVersion.HasValue)
+                {
+                    Console.Error.WriteLine("Both '--from-version' and '--to-version' are required.");
+                    Environment.ExitCode = 1;
+                    return;
+                }
+                if (!path.StartsWith("$/", StringComparison.Ordinal))
+                {
+                    Console.Error.WriteLine("Server version comparison requires a TFVC server path starting with $/.");
+                    Environment.ExitCode = 1;
+                    return;
+                }
+
+                await CompareServerVersionsAsync(
+                    config,
+                    path,
+                    string.IsNullOrWhiteSpace(toPath) ? path : toPath,
+                    fromVersion.Value,
+                    toVersion.Value,
+                    ignoreWhitespace,
+                    format).ConfigureAwait(false);
+                return;
+            }
+
             if (useBase && version.HasValue)
             {
                 Console.Error.WriteLine("Choose either '--base' or '--version', not both.");
@@ -234,9 +266,92 @@ public static class DiffCommand
             }
 
             Console.WriteLine(patch);
-        }, pathArg, baseOpt, versionOpt, ignoreWhitespaceOpt, formatOpt);
+        }, pathArg, baseOpt, versionOpt, fromVersionOpt, toVersionOpt, toPathOpt, ignoreWhitespaceOpt, formatOpt);
 
         return cmd;
+    }
+
+    private static async Task CompareServerVersionsAsync(
+        TfsConfig config,
+        string fromServerPath,
+        string toServerPath,
+        int fromVersion,
+        int toVersion,
+        bool ignoreWhitespace,
+        string format)
+    {
+        using var conn = new TfsConnection(config);
+        var svc = new TfvcClientService(conn);
+        await using var fromStream = new MemoryStream();
+        await using var toStream = new MemoryStream();
+        await svc.DownloadFileAsync(fromServerPath, fromStream, fromVersion).ConfigureAwait(false);
+        await svc.DownloadFileAsync(toServerPath, toStream, toVersion).ConfigureAwait(false);
+
+        var fromBytes = fromStream.ToArray();
+        var toBytes = toStream.ToArray();
+        var same = fromBytes.AsSpan().SequenceEqual(toBytes);
+        var resultKind = "none";
+        string? patch = null;
+
+        if (!same)
+        {
+            if (!TryDecodeUtf8Text(fromBytes, out var fromText) || !TryDecodeUtf8Text(toBytes, out var toText))
+            {
+                resultKind = "binary";
+            }
+            else
+            {
+                patch = UnidiffRenderer.GenerateUnidiff(
+                    fromText,
+                    toText,
+                    $"{fromServerPath} (cs#{fromVersion})",
+                    $"{toServerPath} (cs#{toVersion})",
+                    ignoreWhitespace,
+                    ignoreCase: false,
+                    contextLines: 3).TrimEnd();
+                resultKind = string.IsNullOrWhiteSpace(patch) ? "none" : "text";
+                if (resultKind == "none")
+                    patch = null;
+            }
+        }
+
+        if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+        {
+            JsonOutput.Write(new
+            {
+                schemaVersion = 1,
+                command = "diff.versions",
+                target = new
+                {
+                    inputPath = fromServerPath,
+                    localPath = (string?)null,
+                    serverPath = fromServerPath,
+                    toServerPath,
+                },
+                compareTo = new
+                {
+                    mode = "changesetRange",
+                    fromChangesetId = fromVersion,
+                    toChangesetId = toVersion,
+                },
+                workspaceState = new { state = "serverComparison" },
+                result = new
+                {
+                    kind = resultKind,
+                    localSize = toBytes.Length,
+                    serverSize = fromBytes.Length,
+                    patch,
+                }
+            });
+            return;
+        }
+
+        Console.WriteLine(resultKind switch
+        {
+            "none" => "No differences.",
+            "binary" => "Binary files differ.",
+            _ => patch,
+        });
     }
 
     private static bool TryDecodeUtf8Text(byte[] content, out string text)

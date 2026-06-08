@@ -1,9 +1,11 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { ArmTfsCliClient, ArmTfsCliError } from './armTfsCliClient';
-import type { BranchRef, HistoryItem, MergeBaseResponse, MergeCandidateResponse, ServerItemEntry, StatusResponse } from './contracts';
-import { t } from './i18n';
-import { findTfvcWorkspaceRoot, findTfvcWorkspaceRootSync, getCommandCwd, isPathWithin } from './tfvcContext';
+import type { BranchRef, ChangesetShowResponse, DiffResponse, HistoryItem, MergeBaseResponse, MergeCandidateResponse, ServerItemEntry, StatusResponse } from './contracts';
+import type { ArmTfsHistoryBrowser } from './historyBrowser';
+import { t, translateCliMessage, translateCliText } from './i18n';
+import { checkoutServerPathToLocalFolder } from './serverPathCheckout';
+import { discoverTfvcMappingForPath, findTfvcWorkspaceRoot, findTfvcWorkspaceRootSync, getCommandCwd, isPathWithin } from './tfvcContext';
 
 const MERGE_SOURCE_KEY = 'armTfs.merge.sourcePath';
 const MERGE_TARGET_KEY = 'armTfs.merge.targetPath';
@@ -61,9 +63,9 @@ class HistoryNode extends ArmTfsTreeNode {
     this.iconPath = new vscode.ThemeIcon('history');
     this.contextValue = 'armTfsSidebarChangeset';
     this.command = {
-      command: 'armTfs.showChangeset',
+      command: 'armTfs.history.openChangeset',
       title: t('sidebar.showChangesetJson'),
-      arguments: [{ changesetId: item.changesetId }],
+      arguments: [this],
     };
   }
 }
@@ -83,7 +85,7 @@ class MergeTargetOptionNode extends ArmTfsTreeNode {
   constructor(public readonly targetPath: string, active: boolean) {
     super(path.posix.basename(targetPath), vscode.TreeItemCollapsibleState.None);
     this.id = `merge:target:${targetPath}`;
-    this.description = active ? 'current target' : targetPath;
+    this.description = active ? t('sidebar.currentTarget') : targetPath;
     this.tooltip = targetPath;
     this.contextValue = 'armTfsMergeTargetOption';
     this.iconPath = new vscode.ThemeIcon(active ? 'check' : 'git-branch');
@@ -148,18 +150,31 @@ export class ArmTfsSidebarController implements vscode.Disposable {
   private workspaceStatus: StatusResponse | undefined;
   private activeServerPath: string | undefined;
   private activeBranchPath: string | undefined;
+  private selectedCompareChangesetId: number | undefined;
 
   constructor(
     private readonly client: ArmTfsCliClient,
     private readonly output: vscode.OutputChannel,
     private readonly rootPath: string | undefined,
     private readonly refreshScm: () => Promise<void>,
+    private readonly historyBrowser: ArmTfsHistoryBrowser,
   ) {
-    const branchView = vscode.window.createTreeView('armTfs.branches', { treeDataProvider: this.branchProvider });
+    const branchView = vscode.window.createTreeView('armTfs.branches', {
+      treeDataProvider: this.branchProvider,
+      canSelectMany: true,
+    });
 
     this.disposables.push(
       branchView,
       branchView.onDidChangeSelection((event) => {
+        const branches = event.selection.filter((item): item is BranchNode => item instanceof BranchNode);
+        if (branches.length === 2) {
+          void this.historyBrowser.openTargets(branches.map((branch) => ({
+            label: path.posix.basename(branch.branch.path),
+            serverPath: branch.branch.path,
+          })));
+          return;
+        }
         const selected = event.selection[0];
         if (selected instanceof BranchNode) {
           void this.setActiveServerPath(selected.branch.path, {
@@ -181,13 +196,25 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       }),
       vscode.commands.registerCommand('armTfs.sidebar.useMergeTarget', async (targetPath: string) => this.useMergeTarget(targetPath)),
       vscode.commands.registerCommand('armTfs.sidebar.setBranchScope', async (node?: BranchNode) => this.setBranchScope(node?.branch.path)),
-      vscode.commands.registerCommand('armTfs.sidebar.setMergeSource', async (node?: BranchNode) => this.setMergePath(MERGE_SOURCE_KEY, 'Merge source path', node?.branch.path)),
-      vscode.commands.registerCommand('armTfs.sidebar.setMergeTarget', async (node?: BranchNode) => this.setMergePath(MERGE_TARGET_KEY, 'Merge target path', node?.branch.path)),
+      vscode.commands.registerCommand('armTfs.sidebar.setMergeSource', async (node?: BranchNode) => this.setMergePath(MERGE_SOURCE_KEY, t('sidebar.prompt.mergeSourcePath'), node?.branch.path)),
+      vscode.commands.registerCommand('armTfs.sidebar.setMergeTarget', async (node?: BranchNode) => this.setMergePath(MERGE_TARGET_KEY, t('sidebar.prompt.mergeTargetPath'), node?.branch.path)),
       vscode.commands.registerCommand('armTfs.sidebar.copyTfvcPath', async (node?: BranchNode | MergeTargetOptionNode | string) => this.copyTfvcPath(node)),
       vscode.commands.registerCommand('armTfs.sidebar.pullBranch', async (node?: BranchNode) => this.pullBranch(node)),
       vscode.commands.registerCommand('armTfs.sidebar.checkoutBranch', async (node?: BranchNode) => this.checkoutBranch(node)),
       vscode.commands.registerCommand('armTfs.sidebar.showBranchHistory', async (node?: BranchNode) => this.showBranchHistory(node)),
       vscode.commands.registerCommand('armTfs.sidebar.mergeFromBranch', async (node?: BranchNode) => this.mergeFromBranch(node)),
+      vscode.commands.registerCommand('armTfs.sidebar.addBranch', async (node?: BranchNode) => this.addBranch(node)),
+      vscode.commands.registerCommand('armTfs.history.diffPrevious', async (node?: HistoryNode) => this.diffHistoryNodeWithPrevious(node)),
+      vscode.commands.registerCommand('armTfs.history.selectForCompare', async (node?: HistoryNode) => this.selectChangesetForCompare(node)),
+      vscode.commands.registerCommand('armTfs.history.compareSelected', async (node?: HistoryNode) => this.compareWithSelectedChangeset(node)),
+      vscode.commands.registerCommand('armTfs.history.openChangeset', async (node?: HistoryNode) => {
+        if (node) {
+          await this.historyBrowser.open(await this.getPreferredHistoryPath(), node.item.changesetId);
+        }
+      }),
+      vscode.commands.registerCommand('armTfs.history.openBrowser', async () => {
+        await this.historyBrowser.open(await this.getPreferredHistoryPath());
+      }),
       vscode.commands.registerCommand('armTfs.sidebar.swapMergePaths', async () => this.swapMergePaths()),
       vscode.commands.registerCommand('armTfs.sidebar.executeMergeCandidate', async (node?: MergeCandidateNode) => this.executeMergeCandidate(node)),
       vscode.workspace.onDidCloseTextDocument((document) => {
@@ -203,8 +230,16 @@ export class ArmTfsSidebarController implements vscode.Disposable {
   }
 
   async initialize(): Promise<void> {
-    this.activeServerPath = this.getConfiguredServerExplorerRoot();
+    await this.refreshWorkspaceStatus();
+    const mappedServerPath = this.getCurrentWorkspaceMappingPath();
+    this.activeServerPath = mappedServerPath ?? this.getConfiguredServerExplorerRoot();
     this.activeBranchPath = this.activeServerPath;
+    if (mappedServerPath) {
+      await this.persistActiveServerPath(mappedServerPath, {
+        syncBranchScope: true,
+        syncMergeSource: false,
+      });
+    }
     await this.refreshAll();
   }
 
@@ -517,14 +552,19 @@ export class ArmTfsSidebarController implements vscode.Disposable {
   }
 
   private getBranchScope(): string | undefined {
-    const configuredScope = vscode.workspace.getConfiguration('armTfs').get<string>('branch.scope')?.trim();
-    if (configuredScope) {
-      return cleanServerPath(configuredScope);
-    }
-
     const activeScope = this.getActiveBranchScope();
     if (activeScope) {
       return activeScope;
+    }
+
+    const discovered = this.getCurrentWorkspaceMappingPath();
+    if (discovered) {
+      return discovered;
+    }
+
+    const configuredScope = vscode.workspace.getConfiguration('armTfs').get<string>('branch.scope')?.trim();
+    if (configuredScope) {
+      return cleanServerPath(configuredScope);
     }
 
     const mergeSource = this.getStoredPath(MERGE_SOURCE_KEY);
@@ -537,11 +577,36 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       return mergeTarget;
     }
 
-    return this.workspaceStatus?.workspace.mappings[0]?.serverPath;
+    return undefined;
   }
 
   private getActiveServerPath(): string | undefined {
     return this.activeServerPath ?? this.getConfiguredServerExplorerRoot();
+  }
+
+  private async getPreferredHistoryPath(): Promise<string> {
+    const active = this.getActiveServerPath();
+    if (active && normalizeServerPath(active) !== normalizeServerPath('$/')) {
+      return active;
+    }
+    const mapped = this.getCurrentWorkspaceMappingPath();
+    if (mapped) {
+      return cleanServerPath(mapped);
+    }
+    const workspaceRoot = this.resolvedWorkspaceRoot ?? await findTfvcWorkspaceRoot(this.rootPath);
+    if (workspaceRoot) {
+      try {
+        const status = await this.client.status(workspaceRoot, false, { cwdOverride: workspaceRoot });
+        this.workspaceStatus = status;
+        const workspaceMapping = this.getCurrentWorkspaceMappingPath();
+        if (workspaceMapping) {
+          return cleanServerPath(workspaceMapping);
+        }
+      } catch {
+        // The history request below will surface the actionable CLI error.
+      }
+    }
+    return active ?? this.getBranchScope() ?? '$/';
   }
 
   private getActiveBranchScope(): string | undefined {
@@ -556,11 +621,28 @@ export class ArmTfsSidebarController implements vscode.Disposable {
   private getMergeSourcePath(): string | undefined {
     return this.getStoredPath(MERGE_SOURCE_KEY)
       ?? this.getActiveBranchPath()
-      ?? this.workspaceStatus?.workspace.mappings[0]?.serverPath;
+      ?? this.getCurrentWorkspaceMappingPath();
   }
 
   private getActiveBranchPath(): string | undefined {
     return this.activeBranchPath ?? this.getConfiguredServerExplorerRoot();
+  }
+
+  private getCurrentWorkspaceMappingPath(): string | undefined {
+    const anchorPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? this.rootPath;
+    const discovered = discoverTfvcMappingForPath(anchorPath);
+    if (discovered) {
+      return cleanServerPath(discovered.serverPath);
+    }
+    if (!this.workspaceStatus) {
+      return undefined;
+    }
+    const normalizedAnchor = anchorPath ? path.resolve(anchorPath).toLowerCase() : undefined;
+    const mapping = this.workspaceStatus.workspace.mappings
+      .filter((item) => !normalizedAnchor || normalizedAnchor === path.resolve(item.localPath).toLowerCase()
+        || normalizedAnchor.startsWith(`${path.resolve(item.localPath).toLowerCase()}${path.sep}`))
+      .sort((left, right) => right.localPath.length - left.localPath.length)[0];
+    return mapping?.serverPath ? cleanServerPath(mapping.serverPath) : undefined;
   }
 
   private async getMergeTargetPath(sourcePath: string | undefined): Promise<string | undefined> {
@@ -682,7 +764,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
 
   private async setMergePath(key: string, prompt: string, suggestedValue?: string): Promise<void> {
     const configKey = key === MERGE_SOURCE_KEY ? 'merge.sourcePath' : 'merge.targetPath';
-    const existingValue = this.getStoredPath(key) ?? suggestedValue ?? this.workspaceStatus?.workspace.mappings[0]?.serverPath ?? '$/';
+    const existingValue = this.getStoredPath(key) ?? suggestedValue ?? this.getCurrentWorkspaceMappingPath() ?? '$/';
     const value = await vscode.window.showInputBox({
       prompt,
       value: existingValue,
@@ -727,7 +809,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
         }),
       );
 
-      const document = await vscode.workspace.openTextDocument({ language: 'text', content: result });
+      const document = await vscode.workspace.openTextDocument({ language: 'text', content: translateCliText(result) });
       await vscode.window.showTextDocument(document, { preview: false });
       await this.refreshScm();
       await this.refreshAll();
@@ -753,7 +835,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
         }),
       );
 
-      const document = await vscode.workspace.openTextDocument({ language: 'text', content: result });
+      const document = await vscode.workspace.openTextDocument({ language: 'text', content: translateCliText(result) });
       await vscode.window.showTextDocument(document, { preview: false });
       await this.refreshScm();
       await this.refreshAll();
@@ -768,17 +850,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       return;
     }
 
-    const top = vscode.workspace.getConfiguration('armTfs').get<number>('history.top', 30);
-    try {
-      const response = await this.client.history(node.branch.path, top);
-      const document = await vscode.workspace.openTextDocument({
-        language: 'json',
-        content: JSON.stringify(response, null, 2),
-      });
-      await vscode.window.showTextDocument(document, { preview: false });
-    } catch (error) {
-      this.showError('arm-tfs branch history', error);
-    }
+    await this.historyBrowser.open(node.branch.path);
   }
 
   private async mergeFromBranch(node?: BranchNode): Promise<void> {
@@ -788,30 +860,170 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     }
 
     const sourcePath = node.branch.path;
-    const targetPath = await vscode.window.showInputBox({
-      prompt: t('sidebar.prompt.mergeTargetPath'),
-      value: this.getStoredPath(MERGE_TARGET_KEY) ?? this.workspaceStatus?.workspace.mappings[0]?.serverPath ?? '$/',
-      ignoreFocusOut: true,
-      validateInput(input) {
-        const trimmed = input.trim();
-        if (!trimmed.startsWith('$/')) {
-          return t('sidebar.validate.serverPath');
-        }
-        if (trimmed.toLowerCase() === sourcePath.toLowerCase()) {
-          return t('sidebar.validate.mergeTargetDifferent');
-        }
-        return undefined;
-      },
-    });
-    if (targetPath === undefined) {
+    const siblingTargets = await this.getSiblingBranchPaths(sourcePath);
+    const target = await vscode.window.showQuickPick(
+      siblingTargets.map((targetPath) => ({
+        label: path.posix.basename(targetPath),
+        description: targetPath,
+        targetPath,
+      })),
+      { placeHolder: t('sidebar.merge.pickTarget') },
+    );
+    if (!target) {
       return;
     }
 
-    const target = getConfigTarget();
-    await vscode.workspace.getConfiguration('armTfs').update('merge.sourcePath', sourcePath, target);
-    await vscode.workspace.getConfiguration('armTfs').update('merge.targetPath', targetPath.trim(), target);
-    await this.refreshMerge();
-    void vscode.commands.executeCommand('workbench.view.extension.armTfsHub');
+    const top = vscode.workspace.getConfiguration('armTfs').get<number>('merge.candidateTop', 20);
+    const scan = vscode.workspace.getConfiguration('armTfs').get<number>('merge.candidateScan', 80);
+    try {
+      const response = await this.client.mergeCandidates(sourcePath, target.targetPath, top, scan);
+      if (!response.items.length) {
+        void vscode.window.showInformationMessage(t('sidebar.noMergeCandidates'));
+        return;
+      }
+      const candidate = await vscode.window.showQuickPick(
+        response.items.map((item) => ({
+          label: `cs${item.changesetId}`,
+          description: buildMergeCandidateDescription(item),
+          item,
+        })),
+        { placeHolder: t('sidebar.merge.pickCandidate') },
+      );
+      if (!candidate) {
+        return;
+      }
+      await this.executeMergeCandidate(new MergeCandidateNode(
+        sourcePath,
+        target.targetPath,
+        candidate.item.changesetId,
+        buildMergeCandidateDescription(candidate.item),
+        `${candidate.item.comment ?? ''}\n${candidate.item.createdAt}\n${candidate.item.author?.displayName ?? ''}`.trim(),
+      ));
+    } catch (error) {
+      this.showError('arm-tfs merge', error);
+    }
+  }
+
+  private async addBranch(node?: BranchNode): Promise<void> {
+    if (!node) {
+      void vscode.window.showWarningMessage(t('sidebar.warning.selectBranchFromView'));
+      return;
+    }
+    const sourcePath = node.branch.path;
+    const parent = getServerParentPath(sourcePath) ?? '$/';
+    const targetPath = await vscode.window.showInputBox({
+      prompt: t('sidebar.branch.createTarget'),
+      value: `${parent}/${path.posix.basename(sourcePath)}-branch`,
+      ignoreFocusOut: true,
+      validateInput: (value) => {
+        const trimmed = value.trim();
+        if (!trimmed.startsWith('$/')) {
+          return t('sidebar.validate.serverPath');
+        }
+        return normalizeServerPath(trimmed) === normalizeServerPath(sourcePath)
+          ? t('sidebar.validate.mergeTargetDifferent')
+          : undefined;
+      },
+    });
+    if (!targetPath) {
+      return;
+    }
+    const comment = await vscode.window.showInputBox({
+      prompt: t('sidebar.branch.createComment'),
+      value: `Branch ${targetPath.trim()} from ${sourcePath}`,
+      ignoreFocusOut: true,
+    });
+    if (comment === undefined) {
+      return;
+    }
+    try {
+      const created = await this.client.branchCreate(sourcePath, targetPath.trim(), {
+        comment: comment.trim() || undefined,
+      });
+      void vscode.window.showInformationMessage(t('sidebar.branch.created', {
+        path: targetPath.trim(),
+        changeset: created.createdChangesetId,
+      }));
+      await this.refreshBranches();
+    } catch (error) {
+      this.showError('arm-tfs branch create', error);
+    }
+  }
+
+  private async diffHistoryNodeWithPrevious(node?: HistoryNode): Promise<void> {
+    if (!node) {
+      return;
+    }
+    const detail = await this.client.changesetShow(node.item.changesetId);
+    const serverPath = await this.pickChangesetFile([detail]);
+    if (!serverPath) {
+      return;
+    }
+    const history = await this.client.history(serverPath, 100);
+    const previous = history.items
+      .map((item) => item.changesetId)
+      .filter((changesetId) => changesetId < node.item.changesetId)
+      .sort((left, right) => right - left)[0];
+    if (previous === undefined) {
+      void vscode.window.showInformationMessage(t('sidebar.diff.noPreviousVersion'));
+      return;
+    }
+    await this.showServerVersionDiff(serverPath, previous, node.item.changesetId);
+  }
+
+  private selectChangesetForCompare(node?: HistoryNode): void {
+    if (!node) {
+      return;
+    }
+    this.selectedCompareChangesetId = node.item.changesetId;
+    vscode.window.setStatusBarMessage(t('sidebar.diff.selectedChangeset', { changeset: node.item.changesetId }), 3000);
+  }
+
+  private async compareWithSelectedChangeset(node?: HistoryNode): Promise<void> {
+    if (!node || this.selectedCompareChangesetId === undefined) {
+      void vscode.window.showWarningMessage(t('sidebar.diff.selectFirst'));
+      return;
+    }
+    const from = Math.min(this.selectedCompareChangesetId, node.item.changesetId);
+    const to = Math.max(this.selectedCompareChangesetId, node.item.changesetId);
+    if (from === to) {
+      void vscode.window.showWarningMessage(t('sidebar.diff.sameChangeset'));
+      return;
+    }
+    const details = await Promise.all([this.client.changesetShow(from), this.client.changesetShow(to)]);
+    const serverPath = await this.pickChangesetFile(details);
+    if (serverPath) {
+      await this.showServerVersionDiff(serverPath, from, to);
+    }
+  }
+
+  private async pickChangesetFile(details: ChangesetShowResponse[]): Promise<string | undefined> {
+    const paths = new Set<string>();
+    for (const detail of details) {
+      for (const change of detail.changeset.changes ?? []) {
+        if (change.item?.path && !change.item.isBranch) {
+          paths.add(change.item.path);
+        }
+      }
+    }
+    const picked = await vscode.window.showQuickPick(
+      [...paths].sort((left, right) => left.localeCompare(right)).map((serverPath) => ({
+        label: path.posix.basename(serverPath),
+        description: serverPath,
+        serverPath,
+      })),
+      { placeHolder: t('sidebar.diff.pickFile') },
+    );
+    return picked?.serverPath;
+  }
+
+  private async showServerVersionDiff(serverPath: string, from: number, to: number): Promise<void> {
+    try {
+      const result = await this.client.diffVersions(serverPath, from, to);
+      await showDiffDocument(serverPath, result);
+    } catch (error) {
+      this.showError('arm-tfs diff versions', error);
+    }
   }
 
   private resolveMappedBranchPath(node: BranchNode | undefined, action: 'pull' | 'checkout'): MappedBranchPath | undefined {
@@ -873,7 +1085,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
         }),
       );
 
-      const document = await vscode.workspace.openTextDocument({ language: 'text', content: result });
+      const document = await vscode.workspace.openTextDocument({ language: 'text', content: translateCliText(result) });
       await vscode.window.showTextDocument(document, { preview: false });
       if (mode.value !== 'dryRun') {
         await this.refreshScm();
@@ -894,13 +1106,13 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       if (error.stderr.trim()) {
         this.output.appendLine(error.stderr.trim());
       }
-      void vscode.window.showErrorMessage(`${title} failed: ${error.message}`);
+      void vscode.window.showErrorMessage(t('error.failed', { title, message: translateCliMessage(error.message) }));
       return;
     }
 
-    const message = getErrorMessage(error);
+    const message = translateCliMessage(getErrorMessage(error));
     this.output.appendLine(message);
-    void vscode.window.showErrorMessage(`${title} failed: ${message}`);
+    void vscode.window.showErrorMessage(t('error.failed', { title, message }));
   }
 }
 
@@ -1019,6 +1231,22 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : `${error}`;
 }
 
+async function showDiffDocument(serverPath: string, diff: DiffResponse): Promise<void> {
+  let content: string;
+  if (diff.result.kind === 'text') {
+    content = diff.result.patch ?? '';
+  } else if (diff.result.kind === 'binary') {
+    content = `${serverPath}\n\n${t('sidebar.diff.binary')}`;
+  } else {
+    content = `${serverPath}\n\n${t('sidebar.diff.none')}`;
+  }
+  const document = await vscode.workspace.openTextDocument({
+    language: diff.result.kind === 'text' ? 'diff' : 'text',
+    content,
+  });
+  await vscode.window.showTextDocument(document, { preview: false });
+}
+
 interface MappedBranchPath {
   workspaceRoot: string;
   serverPath: string;
@@ -1075,8 +1303,11 @@ function getServerPathSuffix(candidate: string, parent: string): string {
 }
 
 function cleanServerPath(serverPath: string): string {
-  const trimmed = serverPath.trim().replace(/\/+$/, '');
-  return trimmed || '$/';
+  const trimmed = serverPath.trim();
+  if (trimmed === '$' || /^\$\/+$/.test(trimmed)) {
+    return '$/';
+  }
+  return trimmed.replace(/\/+$/, '') || '$/';
 }
 
 function normalizeServerPath(serverPath: string): string {
@@ -1286,6 +1517,8 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
       serverPath: string,
       options?: { branchContext?: boolean; syncBranchScope?: boolean; refresh?: boolean; syncMergeSource?: boolean },
     ) => Promise<void> | void,
+    private readonly onRootPathChanged?: (serverPath: string) => Promise<void> | void,
+    private readonly historyBrowser?: ArmTfsHistoryBrowser,
   ) {
     this.provider = new ServerExplorerProvider(client, output);
     const treeView = vscode.window.createTreeView('armTfs.serverExplorer', { treeDataProvider: this.provider });
@@ -1321,6 +1554,7 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
 
         const trimmed = value.trim();
         await vscode.workspace.getConfiguration('armTfs').update('serverExplorer.rootPath', trimmed, getConfigTarget());
+        await this.onRootPathChanged?.(trimmed);
         this.provider.setRootPath(trimmed);
         await this.onActiveServerPathChanged?.(trimmed, {
           branchContext: true,
@@ -1347,13 +1581,17 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
         try {
           const result = await vscode.window.withProgress(
             { location: vscode.ProgressLocation.Notification, title: `arm-tfs get ${serverPath}` },
-            () => this.client.get(serverPath, { recursive: node.entry.isFolder }, { cwdOverride: localPath }),
+            () => checkoutServerPathToLocalFolder(this.client, serverPath, localPath),
           );
-          const doc = await vscode.workspace.openTextDocument({ language: 'text', content: result });
+          const doc = await vscode.workspace.openTextDocument({ language: 'text', content: translateCliText(result) });
           await vscode.window.showTextDocument(doc, { preview: false });
           await this.refreshScm();
+          await this.provider.refresh();
         } catch (error) {
-          void vscode.window.showErrorMessage(`arm-tfs get failed: ${getErrorMessage(error)}`);
+          void vscode.window.showErrorMessage(t('error.failed', {
+            title: 'arm-tfs get',
+            message: translateCliMessage(getErrorMessage(error)),
+          }));
         }
       }),
 
@@ -1368,11 +1606,14 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
             { location: vscode.ProgressLocation.Notification, title: `arm-tfs checkout ${serverPath}` },
             () => this.client.checkout([serverPath]),
           );
-          const doc = await vscode.workspace.openTextDocument({ language: 'text', content: result });
+          const doc = await vscode.workspace.openTextDocument({ language: 'text', content: translateCliText(result) });
           await vscode.window.showTextDocument(doc, { preview: false });
           await this.refreshScm();
         } catch (error) {
-          void vscode.window.showErrorMessage(`arm-tfs checkout failed: ${getErrorMessage(error)}`);
+          void vscode.window.showErrorMessage(t('error.failed', {
+            title: 'arm-tfs checkout',
+            message: translateCliMessage(getErrorMessage(error)),
+          }));
         }
       }),
 
@@ -1382,13 +1623,7 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
         }
 
         const serverPath = node.entry.serverPath;
-        try {
-          const response = await this.client.history(serverPath, 30);
-          const doc = await vscode.workspace.openTextDocument({ language: 'json', content: JSON.stringify(response, null, 2) });
-          await vscode.window.showTextDocument(doc, { preview: false });
-        } catch (error) {
-          void vscode.window.showErrorMessage(`arm-tfs history failed: ${getErrorMessage(error)}`);
-        }
+        await this.historyBrowser?.open(serverPath);
       }),
 
       vscode.commands.registerCommand('armTfs.serverExplorer.copyPath', async (node?: ServerExplorerNode) => {
@@ -1404,5 +1639,13 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
 
   dispose(): void {
     vscode.Disposable.from(...this.disposables).dispose();
+  }
+
+  setRootPath(serverPath: string): void {
+    this.provider.setRootPath(serverPath);
+  }
+
+  refresh(): void {
+    this.provider.refresh();
   }
 }

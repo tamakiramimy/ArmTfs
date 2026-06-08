@@ -174,6 +174,45 @@ public sealed class TfvcClientService
         return changeset;
     }
 
+    public async Task<TfvcChangesetRef> CreateBranchAsync(
+        string sourcePath,
+        string targetPath,
+        int? sourceChangesetId = null,
+        string? comment = null,
+        CancellationToken ct = default)
+    {
+        var normalizedSource = NormalizeServerPath(sourcePath);
+        var normalizedTarget = NormalizeServerPath(targetPath);
+        if (string.Equals(normalizedSource, normalizedTarget, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Source and target branch paths must be different.");
+
+        var sourceVersion = sourceChangesetId ?? await TryGetItemVersionAsync(normalizedSource, ct).ConfigureAwait(false)
+            ?? throw new InvalidOperationException($"Source branch '{normalizedSource}' does not exist.");
+        if (await TryGetItemVersionAsync(normalizedTarget, ct).ConfigureAwait(false) is not null)
+            throw new InvalidOperationException($"Target branch '{normalizedTarget}' already exists.");
+
+        var change = new TfvcChange
+        {
+            ChangeType = VersionControlChangeType.Branch,
+            SourceServerItem = normalizedSource,
+            Item = new TfvcItem
+            {
+                Path = normalizedTarget,
+                ChangesetVersion = sourceVersion,
+                IsBranch = true,
+                IsFolder = true,
+            },
+        };
+
+        return await _connection.GetTfvcClient().CreateChangesetAsync(new TfvcChangeset
+        {
+            Comment = string.IsNullOrWhiteSpace(comment)
+                ? $"Branch {normalizedTarget} from {normalizedSource} at cs#{sourceVersion}"
+                : comment.Trim(),
+            Changes = new[] { change },
+        }, cancellationToken: ct).ConfigureAwait(false);
+    }
+
     /// <summary>查询 TFVC Label 列表。</summary>
     public async Task<IReadOnlyList<TfvcLabelRef>> GetLabelsAsync(
         string? owner = null,

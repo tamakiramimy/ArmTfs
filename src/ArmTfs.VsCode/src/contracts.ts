@@ -63,15 +63,18 @@ export interface HistoryResponse extends JsonEnvelope {
 }
 
 export interface DiffResponse extends JsonEnvelope {
-  command: 'diff';
+  command: 'diff' | 'diff.versions';
   target: {
     inputPath: string;
-    localPath: string;
+    localPath?: string | null;
     serverPath: string;
+    toServerPath?: string;
   };
   compareTo: {
-    mode: 'latest' | 'base' | 'changeset';
+    mode: 'latest' | 'base' | 'changeset' | 'changesetRange';
     changesetId?: number;
+    fromChangesetId?: number;
+    toChangesetId?: number;
   };
   workspaceState: {
     state: string;
@@ -84,6 +87,14 @@ export interface DiffResponse extends JsonEnvelope {
     serverSize: number;
     patch?: string;
   };
+}
+
+export interface BranchCreateResponse extends JsonEnvelope {
+  command: 'branch.create';
+  sourcePath: string;
+  targetPath: string;
+  sourceChangesetId?: number;
+  createdChangesetId: number;
 }
 
 export interface BranchRef {

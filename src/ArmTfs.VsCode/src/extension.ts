@@ -1,7 +1,9 @@
-import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { ArmTfsCliClient, ArmTfsCliError } from './armTfsCliClient';
-import { getUiLanguage, t, type UiLanguage } from './i18n';
+import { ArmTfsConnectionsController } from './connections';
+import { ArmTfsHistoryBrowser } from './historyBrowser';
+import { getUiLanguage, t, translateCliMessage, translateCliText, type UiLanguage } from './i18n';
+import { checkoutServerPathToLocalFolder } from './serverPathCheckout';
 import { ArmTfsScmController, ArmTfsResourceState } from './scm';
 import { ArmTfsSidebarController, ArmTfsServerExplorerController } from './sidebar';
 import { findTfvcWorkspaceRoot, getCommandCwd } from './tfvcContext';
@@ -13,23 +15,49 @@ export interface ArmTfsExtensionApi {
 export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   const output = vscode.window.createOutputChannel('arm-tfs');
   const client = new ArmTfsCliClient(output);
+  const historyBrowser = new ArmTfsHistoryBrowser(client, output);
   const scm = new ArmTfsScmController(client, output, getWorkspaceRoot());
-  const sidebar = new ArmTfsSidebarController(client, output, getWorkspaceRoot(), async () => scm.refresh());
+  const sidebar = new ArmTfsSidebarController(client, output, getWorkspaceRoot(), async () => scm.refresh(), historyBrowser);
+  let connections: ArmTfsConnectionsController;
+  let uiInitialized = false;
   const serverExplorer = new ArmTfsServerExplorerController(
     client,
     output,
     async () => scm.refresh(),
     async (serverPath, options) => sidebar.setActiveServerPath(serverPath, options),
+    async (serverPath) => connections.updateActiveRootPath(serverPath),
+    historyBrowser,
   );
+  connections = new ArmTfsConnectionsController(context, client, async (profile) => {
+    if (!uiInitialized) {
+      return;
+    }
+    if (profile) {
+      serverExplorer.setRootPath(profile.rootPath);
+      await sidebar.setActiveServerPath(profile.rootPath, {
+        branchContext: true,
+        syncBranchScope: true,
+        syncMergeSource: false,
+      });
+    } else {
+      serverExplorer.refresh();
+      await sidebar.refreshAll();
+    }
+  });
+  client.setConnectionEnvironmentProvider(() => connections.getActiveEnvironment());
 
   const refreshUi = async () => {
     await scm.refresh();
     await sidebar.refreshAll();
   };
 
-  context.subscriptions.push(output, scm, sidebar, serverExplorer, vscode.window.registerFileDecorationProvider(scm));
-  void scm.initialize();
-  void sidebar.initialize();
+  context.subscriptions.push(output, historyBrowser, scm, sidebar, serverExplorer, connections, vscode.window.registerFileDecorationProvider(scm));
+  void (async () => {
+    await connections.initialize();
+    await scm.initialize();
+    await sidebar.initialize();
+    uiInitialized = true;
+  })();
 
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument((document) => {
@@ -103,15 +131,17 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
 
     const resolved = await client.describeResolvedInvocation();
     output.appendLine(`Configured CLI: ${resolved}`);
+    await connections.refreshCliDescription();
     vscode.window.showInformationMessage(t('extension.cliUpdated'));
   });
 
   register('armTfs.switchLanguage', async () => {
-    const current = getUiLanguage();
+    const configured = vscode.workspace.getConfiguration('armTfs').get<UiLanguage>('ui.language', 'auto');
     const selected = await vscode.window.showQuickPick(
       [
-        { label: t('language.name.zh-CN'), value: 'zh-CN' as UiLanguage, description: current === 'zh-CN' ? 'current' : undefined },
-        { label: t('language.name.en'), value: 'en' as UiLanguage, description: current === 'en' ? 'current' : undefined },
+        { label: t('language.name.auto'), value: 'auto' as UiLanguage, description: configured === 'auto' ? t('language.current') : undefined },
+        { label: t('language.name.zh-CN'), value: 'zh-CN' as UiLanguage, description: configured === 'zh-CN' ? t('language.current') : undefined },
+        { label: t('language.name.en'), value: 'en' as UiLanguage, description: configured === 'en' ? t('language.current') : undefined },
       ],
       { placeHolder: t('language.switch.title') },
     );
@@ -131,34 +161,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   });
 
   register('armTfs.configurePat', async () => {
-    const serverUrl = await vscode.window.showInputBox({
-      prompt: t('extension.prompt.serverUrl'),
-      placeHolder: t('extension.prompt.serverUrl.placeholder'),
-      ignoreFocusOut: true,
-      validateInput: (v) => v.trim().startsWith('http') ? undefined : t('extension.validate.httpUrl'),
-    });
-    if (!serverUrl) {
-      return;
-    }
-
-    const pat = await vscode.window.showInputBox({
-      prompt: t('extension.prompt.pat'),
-      password: true,
-      ignoreFocusOut: true,
-      validateInput: (v) => v.trim() ? undefined : t('extension.validate.pat'),
-    });
-    if (!pat) {
-      return;
-    }
-
-    const displayName = await vscode.window.showInputBox({
-      prompt: t('extension.prompt.displayName'),
-      ignoreFocusOut: true,
-    });
-
-    return runAndShowText('arm-tfs configure', output, async () =>
-      client.configurePat(serverUrl.trim(), pat.trim(), displayName?.trim() || undefined),
-    );
+    return vscode.commands.executeCommand('armTfs.connections.add');
   });
 
   register('armTfs.createWorkspace', async (input) => {
@@ -196,7 +199,9 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
       return;
     }
 
-    const result = await checkoutServerPathToLocalFolder(client, output, serverPath, localPath);
+    const result = await runAndShowText('arm-tfs checkout server path', output, async () =>
+      checkoutServerPathToLocalFolder(client, serverPath, localPath),
+    );
     await refreshUi();
     return result;
   });
@@ -423,12 +428,12 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   });
 
   register('armTfs.showMergeBase', async (input) => {
-    const sourcePath = readStringOption(input, 'sourcePath') ?? await promptPath('Merge source path', '$/');
+    const sourcePath = readStringOption(input, 'sourcePath') ?? await promptPath(t('sidebar.prompt.mergeSourcePath'), '$/');
     if (!sourcePath) {
       return;
     }
 
-    const targetPath = readStringOption(input, 'targetPath') ?? await promptPath('Merge target path', '$/');
+    const targetPath = readStringOption(input, 'targetPath') ?? await promptPath(t('sidebar.prompt.mergeTargetPath'), '$/');
     if (!targetPath) {
       return;
     }
@@ -437,12 +442,12 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   });
 
   register('armTfs.showMergeCandidates', async (input) => {
-    const sourcePath = readStringOption(input, 'sourcePath') ?? await promptPath('Merge source path', '$/');
+    const sourcePath = readStringOption(input, 'sourcePath') ?? await promptPath(t('sidebar.prompt.mergeSourcePath'), '$/');
     if (!sourcePath) {
       return;
     }
 
-    const targetPath = readStringOption(input, 'targetPath') ?? await promptPath('Merge target path', '$/');
+    const targetPath = readStringOption(input, 'targetPath') ?? await promptPath(t('sidebar.prompt.mergeTargetPath'), '$/');
     if (!targetPath) {
       return;
     }
@@ -494,7 +499,7 @@ async function runAndShow(title: string, output: vscode.OutputChannel, runner: (
       content: JSON.stringify(result, null, 2),
     });
     await vscode.window.showTextDocument(document, { preview: false });
-    vscode.window.setStatusBarMessage(`${title} completed`, 2500);
+    vscode.window.setStatusBarMessage(t('status.completed', { title }), 2500);
     return result;
   } catch (error) {
     output.show(true);
@@ -506,13 +511,13 @@ async function runAndShow(title: string, output: vscode.OutputChannel, runner: (
       if (error.stderr.trim()) {
         output.appendLine(error.stderr.trim());
       }
-      void vscode.window.showErrorMessage(`${title} failed: ${error.message}`);
+      void vscode.window.showErrorMessage(t('error.failed', { title, message: translateCliMessage(error.message) }));
       return undefined;
     }
 
-    const message = error instanceof Error ? error.message : `${error}`;
+    const message = translateCliMessage(error instanceof Error ? error.message : `${error}`);
     output.appendLine(message);
-    void vscode.window.showErrorMessage(`${title} failed: ${message}`);
+    void vscode.window.showErrorMessage(t('error.failed', { title, message }));
     return undefined;
   }
 }
@@ -522,10 +527,10 @@ async function runAndShowText(title: string, output: vscode.OutputChannel, runne
     const result = await runner();
     const document = await vscode.workspace.openTextDocument({
       language: 'text',
-      content: result,
+      content: translateCliText(result),
     });
     await vscode.window.showTextDocument(document, { preview: false });
-    vscode.window.setStatusBarMessage(`${title} completed`, 2500);
+    vscode.window.setStatusBarMessage(t('status.completed', { title }), 2500);
     return result;
   } catch (error) {
     output.show(true);
@@ -537,13 +542,13 @@ async function runAndShowText(title: string, output: vscode.OutputChannel, runne
       if (error.stderr.trim()) {
         output.appendLine(error.stderr.trim());
       }
-      void vscode.window.showErrorMessage(`${title} failed: ${error.message}`);
+      void vscode.window.showErrorMessage(t('error.failed', { title, message: translateCliMessage(error.message) }));
       return undefined;
     }
 
-    const message = error instanceof Error ? error.message : `${error}`;
+    const message = translateCliMessage(error instanceof Error ? error.message : `${error}`);
     output.appendLine(message);
-    void vscode.window.showErrorMessage(`${title} failed: ${message}`);
+    void vscode.window.showErrorMessage(t('error.failed', { title, message }));
     return undefined;
   }
 }
@@ -775,7 +780,7 @@ interface LocalWorkspaceContext {
 async function resolveLocalWorkspaceContext(targetPath?: string): Promise<LocalWorkspaceContext | undefined> {
   const workspaceRoot = await findTfvcWorkspaceRoot(targetPath ?? getActivePath() ?? getWorkspaceRoot());
   if (!workspaceRoot) {
-    void vscode.window.showWarningMessage('No arm-tfs workspace found for this path. Create or configure a TFVC workspace first.');
+    void vscode.window.showWarningMessage(t('warning.noWorkspace.path'));
     return undefined;
   }
 
@@ -788,7 +793,7 @@ async function resolveLocalWorkspaceContext(targetPath?: string): Promise<LocalW
 async function withLocalWorkspace<T>(targetPath: string | undefined, runner: (localContext: LocalWorkspaceContext) => Promise<T>): Promise<T> {
   const localContext = await resolveLocalWorkspaceContext(targetPath);
   if (!localContext) {
-    throw new Error('No arm-tfs workspace found for this path.');
+    throw new Error(t('warning.noWorkspace.path'));
   }
 
   return runner(localContext);
@@ -796,61 +801,4 @@ async function withLocalWorkspace<T>(targetPath: string | undefined, runner: (lo
 
 function isServerPath(targetPath: string): boolean {
   return targetPath.startsWith('$/');
-}
-
-async function checkoutServerPathToLocalFolder(
-  client: ArmTfsCliClient,
-  output: vscode.OutputChannel,
-  serverPath: string,
-  localPath: string,
-): Promise<string | undefined> {
-  const normalizedServerPath = serverPath.trim();
-  const normalizedLocalPath = path.resolve(localPath);
-
-  return runAndShowText('arm-tfs checkout server path', output, async () => {
-    await vscode.workspace.fs.createDirectory(vscode.Uri.file(normalizedLocalPath));
-
-    const workspaceRoot = await findTfvcWorkspaceRoot(normalizedLocalPath);
-    const steps: string[] = [];
-
-    if (workspaceRoot) {
-      const commandCwd = getCommandCwd(workspaceRoot, normalizedLocalPath);
-      const status = await client.status(workspaceRoot, false, { cwdOverride: workspaceRoot });
-      const existingMapping = status.workspace.mappings.find((mapping) => sameLocalPath(mapping.localPath, normalizedLocalPath));
-
-      if (existingMapping && existingMapping.serverPath !== normalizedServerPath) {
-        throw new Error(`Local folder '${normalizedLocalPath}' is already mapped to '${existingMapping.serverPath}'. Choose another folder or remove the existing mapping first.`);
-      }
-
-      const hasRequestedMapping = status.workspace.mappings.some((mapping) =>
-        sameLocalPath(mapping.localPath, normalizedLocalPath) && mapping.serverPath === normalizedServerPath,
-      );
-
-      if (!hasRequestedMapping) {
-        steps.push(await client.workspaceMap(normalizedServerPath, normalizedLocalPath, { cwdOverride: workspaceRoot }));
-      }
-
-      steps.push(await client.get(normalizedLocalPath, undefined, { cwdOverride: commandCwd }));
-      return steps.join('\n\n');
-    }
-
-    const workspaceName = buildWorkspaceName(normalizedServerPath, normalizedLocalPath);
-    steps.push(await client.workspaceNew(workspaceName, normalizedServerPath, normalizedLocalPath, normalizedLocalPath, { cwdOverride: normalizedLocalPath }));
-    steps.push(await client.get(normalizedLocalPath, undefined, { cwdOverride: normalizedLocalPath }));
-    return steps.join('\n\n');
-  });
-}
-
-function buildWorkspaceName(serverPath: string, localPath: string): string {
-  const leaf = serverPath.split('/').filter(Boolean).pop() ?? path.basename(localPath) ?? 'workspace';
-  const normalizedLeaf = leaf.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'workspace';
-  return `arm-tfs-${normalizedLeaf}`;
-}
-
-function sameLocalPath(leftPath: string, rightPath: string): boolean {
-  return normalizeLocalPath(leftPath) === normalizeLocalPath(rightPath);
-}
-
-function normalizeLocalPath(targetPath: string): string {
-  return path.resolve(targetPath).toLowerCase();
 }

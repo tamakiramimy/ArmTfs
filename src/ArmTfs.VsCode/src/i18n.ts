@@ -6,13 +6,29 @@ type Messages = Record<string, string>;
 
 const dictionaries: Record<'en' | 'zh-CN', Messages> = {
   en: {
+    'language.name.auto': 'Auto',
     'language.name.en': 'English',
     'language.name.zh-CN': 'Chinese',
     'language.switch.title': 'Select arm-tfs UI language',
     'language.changed': 'arm-tfs UI language updated to {language}. Reload views if needed.',
+    'language.current': 'Current',
     'command.switchLanguage': 'Switch UI Language',
     'command.openTfsDiff': 'Open TFS Diff',
     'command.checkIn': 'Check In',
+    'connections.cli': 'arm-tfs CLI',
+    'connections.cli.unconfigured': 'Not configured - click to select',
+    'connections.configureCli': 'Configure CLI',
+    'connections.add': 'Add TFS connection',
+    'connections.none': 'No connections configured',
+    'connections.count': '{count} connection(s)',
+    'connections.active': 'Active',
+    'connections.select': 'Use connection',
+    'connections.delete': 'Delete',
+    'connections.delete.confirm': 'Delete TFS connection "{name}"?',
+    'connections.prompt.name': 'TFS connection name',
+    'connections.prompt.patOptional': 'PAT (leave empty to keep the current PAT)',
+    'connections.validate.required': 'This value is required',
+    'error.localFolderMapped': 'Local folder "{localPath}" is already mapped to "{serverPath}". Choose another folder or remove the existing mapping first.',
     'scm.input.placeholder': 'Enter TFVC check-in comment',
     'scm.group.changes': 'Changes',
     'scm.group.localChanges': 'Local Modifications',
@@ -50,10 +66,12 @@ const dictionaries: Record<'en' | 'zh-CN', Messages> = {
     'sidebar.showChangesetJson': 'Show Changeset JSON',
     'sidebar.setMergeSource': 'Set Merge Source',
     'sidebar.setMergeTarget': 'Set Merge Target',
+    'sidebar.prompt.mergeSourcePath': 'Merge source path',
     'sidebar.swapMergePaths': 'Swap source/target',
     'sidebar.swapMergePaths.desc': 'Reverse the merge direction',
     'sidebar.swapMergePaths.title': 'Swap Merge Source and Target',
     'sidebar.targetBranches': 'Target branches',
+    'sidebar.currentTarget': 'current target',
     'sidebar.mergeCandidatesUnavailable': 'Merge candidates unavailable',
     'sidebar.pickTargetBranch': 'Pick a target branch from the list above.',
     'sidebar.pickSourceAndTarget': 'Pick both source and target branches first.',
@@ -85,6 +103,19 @@ const dictionaries: Record<'en' | 'zh-CN', Messages> = {
     'sidebar.pendingCount': '{count} pending',
     'sidebar.noMergeCandidates': 'No merge candidates',
     'sidebar.noMergeCandidates.desc': 'Source is already covered by target history.',
+    'sidebar.merge.pickTarget': 'Select the target branch',
+    'sidebar.merge.pickCandidate': 'Select a changeset to merge',
+    'sidebar.branch.createTarget': 'New branch TFVC path',
+    'sidebar.branch.createComment': 'Branch creation comment',
+    'sidebar.branch.created': 'Created branch {path} in changeset {changeset}.',
+    'sidebar.diff.selectedChangeset': 'Selected cs{changeset} for comparison',
+    'sidebar.diff.selectFirst': 'Select a changeset for comparison first.',
+  'sidebar.diff.sameChangeset': 'Choose two different changesets.',
+  'sidebar.diff.noPreviousVersion': 'No previous version was found for this file.',
+    'sidebar.diff.pickFile': 'Select a changed file to compare',
+    'sidebar.diff.binary': 'Binary files differ.',
+    'sidebar.diff.none': 'No differences found between these versions.',
+    'serverExplorer.history.pickVersions': 'Select one version to inspect, or two versions to compare',
     'sidebar.sourceAncestry': 'Source ancestry',
     'sidebar.targetAncestry': 'Target ancestry',
     'sidebar.historyScan': 'History scan',
@@ -106,13 +137,29 @@ const dictionaries: Record<'en' | 'zh-CN', Messages> = {
     'extension.prompt.displayName': 'Your display name for checkin attribution (optional)',
   },
   'zh-CN': {
+    'language.name.auto': '跟随 VS Code',
     'language.name.en': '英文',
     'language.name.zh-CN': '中文',
     'language.switch.title': '选择 arm-tfs 界面语言',
     'language.changed': 'arm-tfs 界面语言已切换为 {language}，必要时可刷新视图。',
+    'language.current': '当前',
     'command.switchLanguage': '切换界面语言',
     'command.openTfsDiff': '打开 TFS Diff',
     'command.checkIn': '签入',
+    'connections.cli': 'arm-tfs CLI',
+    'connections.cli.unconfigured': '尚未配置，点击选择',
+    'connections.configureCli': '配置 CLI',
+    'connections.add': '添加 TFS 连接',
+    'connections.none': '尚未配置连接',
+    'connections.count': '共 {count} 个连接',
+    'connections.active': '当前连接',
+    'connections.select': '使用此连接',
+    'connections.delete': '删除',
+    'connections.delete.confirm': '确定删除 TFS 连接“{name}”吗？',
+    'connections.prompt.name': 'TFS 连接名称',
+    'connections.prompt.patOptional': 'PAT（留空则保留当前 PAT）',
+    'connections.validate.required': '此项不能为空',
+    'error.localFolderMapped': '本地目录“{localPath}”已经映射到“{serverPath}”。请更换目录，或先移除现有映射。',
     'scm.input.placeholder': '输入 TFVC 签入备注',
     'scm.group.changes': '变更',
     'scm.group.localChanges': '本地修改',
@@ -150,10 +197,12 @@ const dictionaries: Record<'en' | 'zh-CN', Messages> = {
     'sidebar.showChangesetJson': '显示 Changeset JSON',
     'sidebar.setMergeSource': '设置合并源分支',
     'sidebar.setMergeTarget': '设置合并目标分支',
+    'sidebar.prompt.mergeSourcePath': '合并源路径',
     'sidebar.swapMergePaths': '交换源/目标',
     'sidebar.swapMergePaths.desc': '反转当前合并方向',
     'sidebar.swapMergePaths.title': '交换合并源和目标',
     'sidebar.targetBranches': '目标分支候选',
+    'sidebar.currentTarget': '当前目标',
     'sidebar.mergeCandidatesUnavailable': '合并候选不可用',
     'sidebar.pickTargetBranch': '请先从上方列表选择目标分支。',
     'sidebar.pickSourceAndTarget': '请先选择源分支和目标分支。',
@@ -185,6 +234,19 @@ const dictionaries: Record<'en' | 'zh-CN', Messages> = {
     'sidebar.pendingCount': '{count} 个待处理',
     'sidebar.noMergeCandidates': '没有合并候选',
     'sidebar.noMergeCandidates.desc': '目标分支已经覆盖了源分支历史。',
+    'sidebar.merge.pickTarget': '选择目标分支',
+    'sidebar.merge.pickCandidate': '选择要合并的 Changeset',
+    'sidebar.branch.createTarget': '新分支的 TFVC 路径',
+    'sidebar.branch.createComment': '创建分支备注',
+    'sidebar.branch.created': '已创建分支 {path}，Changeset 为 {changeset}。',
+    'sidebar.diff.selectedChangeset': '已选择 cs{changeset} 用于比较',
+    'sidebar.diff.selectFirst': '请先选择一个 Changeset 作为比较基准。',
+  'sidebar.diff.sameChangeset': '请选择两个不同的 Changeset。',
+  'sidebar.diff.noPreviousVersion': '未找到该文件的上一历史版本。',
+    'sidebar.diff.pickFile': '选择要比较的变更文件',
+    'sidebar.diff.binary': '二进制文件内容不同。',
+    'sidebar.diff.none': '这两个版本之间没有差异。',
+    'serverExplorer.history.pickVersions': '选择一个版本查看详情，或选择两个版本进行比较',
     'sidebar.sourceAncestry': '源分支祖先链',
     'sidebar.targetAncestry': '目标分支祖先链',
     'sidebar.historyScan': '历史扫描',
@@ -224,4 +286,28 @@ export function t(key: string, params?: Record<string, string | number | undefin
   }
 
   return message.replace(/\{([^}]+)\}/g, (_, name: string) => `${params[name] ?? ''}`);
+}
+
+export function translateCliText(text: string): string {
+  if (getUiLanguage() !== 'zh-CN' || !text.trim()) {
+    return text;
+  }
+
+  return text
+    .replaceAll(
+      "No workspace found. Run 'arm-tfs workspace new' first.",
+      "未找到工作区。请先运行 'arm-tfs workspace new'。",
+    )
+    .replace(
+      /No workspace found for path '([^']+)'\. Run 'arm-tfs workspace new' first\./g,
+      "路径“$1”没有找到工作区。请先运行 'arm-tfs workspace new'。",
+    )
+    .replace(
+      /Local folder '([^']+)' is already mapped to '([^']+)'\. Choose another folder or remove the existing mapping first\./g,
+      "本地目录“$1”已经映射到“$2”。请更换目录，或先移除现有映射。",
+    );
+}
+
+export function translateCliMessage(message: string): string {
+  return translateCliText(message);
 }

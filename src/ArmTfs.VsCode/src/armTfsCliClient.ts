@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import * as vscode from 'vscode';
 import type {
   BranchListResponse,
+  BranchCreateResponse,
   BranchShowResponse,
   ChangesetShowResponse,
   DiffResponse,
@@ -21,6 +22,12 @@ const execFileAsync = promisify(execFile);
 
 export interface ArmTfsRunOptions {
   cwdOverride?: string;
+}
+
+export interface ArmTfsConnectionEnvironment {
+  serverUrl: string;
+  pat: string;
+  displayName?: string;
 }
 
 export interface ArmTfsInvocation {
@@ -41,7 +48,15 @@ export class ArmTfsCliError extends Error {
 }
 
 export class ArmTfsCliClient {
+  private connectionEnvironmentProvider?: () => Promise<ArmTfsConnectionEnvironment | undefined>;
+
   constructor(private readonly output: vscode.OutputChannel) {}
+
+  setConnectionEnvironmentProvider(
+    provider: () => Promise<ArmTfsConnectionEnvironment | undefined>,
+  ): void {
+    this.connectionEnvironmentProvider = provider;
+  }
 
   async describeResolvedInvocation(): Promise<string> {
     const invocation = await this.resolveInvocation([]);
@@ -160,12 +175,54 @@ export class ArmTfsCliClient {
     return this.executeJson<DiffResponse>(args, runOptions);
   }
 
+  diffVersions(
+    serverPath: string,
+    fromChangesetId: number,
+    toChangesetId: number,
+    options?: { ignoreWhitespace?: boolean; toServerPath?: string },
+    runOptions?: ArmTfsRunOptions,
+  ): Promise<DiffResponse> {
+    const args = [
+      'diff',
+      serverPath,
+      '--from-version',
+      String(fromChangesetId),
+      '--to-version',
+      String(toChangesetId),
+      '--format',
+      'json',
+    ];
+    if (options?.toServerPath && options.toServerPath !== serverPath) {
+      args.splice(args.length - 2, 0, '--to-path', options.toServerPath);
+    }
+    if (options?.ignoreWhitespace) {
+      args.push('--ignore-whitespace');
+    }
+    return this.executeJson<DiffResponse>(args, runOptions);
+  }
+
   branchList(scope = '$/', options?: ArmTfsRunOptions): Promise<BranchListResponse> {
     return this.executeJson<BranchListResponse>(['branch', 'list', scope, '--format', 'json'], options);
   }
 
   branchShow(branchPath: string, options?: ArmTfsRunOptions): Promise<BranchShowResponse> {
     return this.executeJson<BranchShowResponse>(['branch', 'show', branchPath, '--format', 'json'], options);
+  }
+
+  branchCreate(
+    sourcePath: string,
+    targetPath: string,
+    options?: { version?: number; comment?: string },
+    runOptions?: ArmTfsRunOptions,
+  ): Promise<BranchCreateResponse> {
+    const args = ['branch', 'create', '--source', sourcePath, '--target', targetPath, '--format', 'json'];
+    if (options?.version !== undefined) {
+      args.push('--version', String(options.version));
+    }
+    if (options?.comment) {
+      args.push('--comment', options.comment);
+    }
+    return this.executeJson<BranchCreateResponse>(args, runOptions);
   }
 
   changesetShow(changesetId: number, options?: ArmTfsRunOptions): Promise<ChangesetShowResponse> {
@@ -292,10 +349,20 @@ export class ArmTfsCliClient {
   private async execute(commandArgs: string[], options?: ArmTfsRunOptions): Promise<{ stdout: string; stderr: string }> {
     const invocation = await this.resolveInvocation(commandArgs, options?.cwdOverride);
     this.output.appendLine(`> ${this.formatInvocation(invocation)}`);
+    const connection = await this.connectionEnvironmentProvider?.();
+    const env = connection
+      ? {
+          ...process.env,
+          ARM_TFS_URL: connection.serverUrl,
+          ARM_TFS_PAT: connection.pat,
+          ARM_TFS_DISPLAY_NAME: connection.displayName ?? '',
+        }
+      : process.env;
 
     try {
       const { stdout, stderr } = await execFileAsync(invocation.command, invocation.args, {
         cwd: invocation.cwd,
+        env,
         maxBuffer: 10 * 1024 * 1024,
       });
 

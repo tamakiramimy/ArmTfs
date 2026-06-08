@@ -14,6 +14,54 @@ public static class BranchCommand
 
         cmd.AddCommand(BuildList(config));
         cmd.AddCommand(BuildShow(config));
+        cmd.AddCommand(BuildCreate(config));
+
+        return cmd;
+    }
+
+    private static Command BuildCreate(TfsConfig config)
+    {
+        var cmd = new Command("create", "Create a TFVC branch from an existing branch.");
+        var sourceOpt = new Option<string>("--source") { Description = "Source branch path ($/...)", IsRequired = true };
+        var targetOpt = new Option<string>("--target") { Description = "New target branch path ($/...)", IsRequired = true };
+        var versionOpt = new Option<int?>("--version") { Description = "Optional source changeset version" };
+        var commentOpt = new Option<string?>("--comment") { Description = "Changeset comment" };
+        var formatOpt = new Option<string>("--format", () => "table") { Description = "Output format: table | json" };
+
+        cmd.AddOption(sourceOpt);
+        cmd.AddOption(targetOpt);
+        cmd.AddOption(versionOpt);
+        cmd.AddOption(commentOpt);
+        cmd.AddOption(formatOpt);
+
+        cmd.SetHandler(async (source, target, version, comment, format) =>
+        {
+            using var conn = new TfsConnection(config);
+            var svc = new TfvcClientService(conn);
+            try
+            {
+                var created = await svc.CreateBranchAsync(source, target, version, comment).ConfigureAwait(false);
+                if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+                {
+                    JsonOutput.Write(new
+                    {
+                        schemaVersion = 1,
+                        command = "branch.create",
+                        sourcePath = source,
+                        targetPath = target,
+                        sourceChangesetId = version,
+                        createdChangesetId = created.ChangesetId,
+                    });
+                    return;
+                }
+                Console.WriteLine($"Created branch {target} from {source} in changeset {created.ChangesetId}.");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Error: {ex.Message}");
+                Environment.ExitCode = 1;
+            }
+        }, sourceOpt, targetOpt, versionOpt, commentOpt, formatOpt);
 
         return cmd;
     }
