@@ -10,6 +10,7 @@ import type {
   ChangesetShowResponse,
   DiffResponse,
   HistoryResponse,
+  ItemContentResponse,
   ItemsListResponse,
   LabelListResponse,
   LabelShowResponse,
@@ -158,6 +159,14 @@ export class ArmTfsCliClient {
     }
 
     return this.executeJson<HistoryResponse>(args, options);
+  }
+
+  itemContent(serverPath: string, version?: number, options?: ArmTfsRunOptions): Promise<ItemContentResponse> {
+    const args = ['items', 'cat', serverPath, '--format', 'json'];
+    if (version !== undefined) {
+      args.splice(3, 0, '--version', String(version));
+    }
+    return this.executeJson<ItemContentResponse>(args, options);
   }
 
   diff(targetPath: string, options?: { useBase?: boolean; changesetId?: number; ignoreWhitespace?: boolean }, runOptions?: ArmTfsRunOptions): Promise<DiffResponse> {

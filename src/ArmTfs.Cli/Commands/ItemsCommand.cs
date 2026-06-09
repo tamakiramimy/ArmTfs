@@ -79,6 +79,99 @@ public static class ItemsCommand
         });
 
         cmd.AddCommand(listCmd);
+        cmd.AddCommand(BuildCat(config));
         return cmd;
+    }
+
+    private static Command BuildCat(TfsConfig config)
+    {
+        var catCmd = new Command("cat", "Download a single TFVC file version and return its content.");
+
+        var pathArg = new Argument<string>("path", "TFVC file path (e.g. $/Project/Main/File.cs)");
+        var versionOpt = new Option<int?>("--version", "-v")
+        {
+            Description = "Optional changeset version. Defaults to the latest version."
+        };
+        var formatOpt = new Option<string>("--format")
+        {
+            Description = "Output format: plain or json."
+        };
+        formatOpt.SetDefaultValue("plain");
+
+        catCmd.AddArgument(pathArg);
+        catCmd.AddOption(versionOpt);
+        catCmd.AddOption(formatOpt);
+
+        catCmd.SetHandler(async (InvocationContext context) =>
+        {
+            var path = context.ParseResult.GetValueForArgument(pathArg);
+            var version = context.ParseResult.GetValueForOption(versionOpt);
+            var format = context.ParseResult.GetValueForOption(formatOpt) ?? "plain";
+
+            using var conn = new TfsConnection(config);
+            var svc = new TfvcClientService(conn);
+
+            try
+            {
+                await using var stream = new MemoryStream();
+                await svc.DownloadFileAsync(path, stream, version).ConfigureAwait(false);
+                var bytes = stream.ToArray();
+                var isText = TryDecodeUtf8Text(bytes, out var text);
+
+                if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+                {
+                    JsonOutput.Write(new
+                    {
+                        schemaVersion = 1,
+                        command = "items.cat",
+                        item = new
+                        {
+                            serverPath = path,
+                            changesetId = version,
+                            size = bytes.Length,
+                            isBinary = !isText,
+                            encoding = isText ? "utf-8" : (string?)null,
+                            contentBase64 = Convert.ToBase64String(bytes),
+                            text = isText ? text : null,
+                        }
+                    });
+                    return;
+                }
+
+                if (!isText)
+                {
+                    Console.Error.WriteLine("Binary content requires '--format json'.");
+                    context.ExitCode = 1;
+                    return;
+                }
+
+                Console.Write(text);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Error: {ex.Message}");
+                context.ExitCode = 1;
+            }
+        });
+
+        return catCmd;
+    }
+
+    private static bool TryDecodeUtf8Text(byte[] content, out string text)
+    {
+        text = string.Empty;
+        if (Array.IndexOf(content, (byte)0) >= 0)
+            return false;
+
+        try
+        {
+            text = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
+                .GetString(content);
+            return true;
+        }
+        catch (System.Text.DecoderFallbackException)
+        {
+            return false;
+        }
     }
 }

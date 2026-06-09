@@ -1,8 +1,14 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { ArmTfsCliClient } from './armTfsCliClient';
-import type { ChangesetShowResponse, DiffResponse, HistoryItem } from './contracts';
+import type { ChangesetShowResponse, HistoryItem } from './contracts';
 import { getUiLanguage, translateCliMessage } from './i18n';
+import { checkoutServerPathToLocalFolder } from './serverPathCheckout';
+import {
+  openServerVersion,
+  openServerVersionDiff,
+  openServerVersionDiffFromEmpty,
+} from './versionedFiles';
 
 interface HistoryTarget {
   label: string;
@@ -11,13 +17,21 @@ interface HistoryTarget {
 
 interface BrowserMessage {
   type: string;
-  changesetId?: number;
-  changesetIds?: number[];
-  serverPath?: string;
-  fromPath?: string;
-  toPath?: string;
-  fromVersion?: number;
-  toVersion?: number;
+      changesetId?: number;
+      changesetIds?: number[];
+      serverPath?: string;
+      fromPath?: string;
+      toPath?: string;
+      fromVersion?: number;
+      toVersion?: number;
+      title?: string;
+}
+
+interface ProjectedFile {
+  path: string;
+  name: string;
+  changeType: string;
+  isBranch: boolean;
 }
 
 interface ComparedFile {
@@ -89,12 +103,20 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
     if (!panel) {
       return;
     }
+
     try {
       const groups = await Promise.all(this.targets.map(async (target) => ({
         ...target,
         items: (await this.client.history(target.serverPath, 100)).items,
       })));
-      await panel.webview.postMessage({ type: 'histories', groups, initialChangesetId });
+      await panel.webview.postMessage({
+        type: 'histories',
+        groups,
+        initialChangesetId,
+        pathLabel: this.targets.length === 1
+          ? this.targets[0].serverPath
+          : this.targets.map((target) => target.serverPath).join('  ↔  '),
+      });
       if (initialChangesetId !== undefined) {
         await this.loadChangeset(initialChangesetId);
       }
@@ -110,7 +132,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
           await this.loadHistories(this.initialChangesetId);
           break;
         case 'reload':
-          await this.loadHistories();
+          await this.loadHistories(this.initialChangesetId);
           break;
         case 'selectChangeset':
           if (message.changesetId !== undefined) {
@@ -132,6 +154,11 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
             await this.loadFileHistory(message.serverPath);
           }
           break;
+        case 'viewCurrentVersion':
+          if (message.serverPath && message.changesetId !== undefined) {
+            await this.openCurrentVersion(message.serverPath, message.changesetId, message.title);
+          }
+          break;
         case 'compareFileVersions':
           if (message.serverPath && message.changesetIds?.length === 2) {
             const versions = [...message.changesetIds].sort((left, right) => left - right);
@@ -148,6 +175,11 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
             await this.showDiff(message.fromPath, message.toPath, message.fromVersion, message.toVersion);
           }
           break;
+        case 'checkoutChangeset':
+          if (message.changesetId !== undefined) {
+            await this.checkoutSnapshot(message.changesetId);
+          }
+          break;
       }
     } catch (error) {
       this.showError(message.type, error);
@@ -157,10 +189,12 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
   private async loadChangeset(changesetId: number): Promise<void> {
     const detail = await this.client.changesetShow(changesetId);
     const files = this.projectFiles(detail);
+    const target = this.findTargetForChangeset(detail) ?? this.targets[0];
     await this.panel?.webview.postMessage({
-      type: 'changeset',
+      type: 'changesetDetails',
       changeset: detail.changeset,
       files,
+      scopePath: target?.serverPath ?? this.targets[0]?.serverPath ?? '',
     });
   }
 
@@ -175,10 +209,12 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
     const toTarget = this.findTargetForChangeset(to);
     const files = this.buildComparedFiles(from, to, fromTarget, toTarget);
     await this.panel?.webview.postMessage({
-      type: 'comparison',
+      type: 'comparisonDetails',
       from: from.changeset,
       to: to.changeset,
       files,
+      leftPath: fromTarget?.serverPath ?? this.targets[0]?.serverPath ?? '',
+      rightPath: toTarget?.serverPath ?? this.targets[this.targets.length - 1]?.serverPath ?? '',
     });
   }
 
@@ -189,18 +225,36 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       .filter((id) => id < changesetId)
       .sort((left, right) => right - left)[0];
     if (previous === undefined) {
-      void vscode.window.showInformationMessage(
-        getUiLanguage() === 'zh-CN' ? '未找到该文件的上一历史版本。' : 'No previous file version was found.',
+      await openServerVersionDiffFromEmpty(
+        this.client,
+        {
+          serverPath,
+          version: changesetId,
+          label: `${path.posix.basename(serverPath)} (cs${changesetId})`,
+        },
+        `${path.posix.basename(serverPath)}: empty ↔ cs${changesetId}`,
       );
       return;
     }
     await this.showDiff(serverPath, serverPath, previous, changesetId);
   }
 
+  private async openCurrentVersion(serverPath: string, changesetId: number, title?: string): Promise<void> {
+    await openServerVersion(
+      this.client,
+      {
+        serverPath,
+        version: changesetId,
+        label: `${path.posix.basename(serverPath)} (cs${changesetId})`,
+      },
+      { title },
+    );
+  }
+
   private async loadFileHistory(serverPath: string): Promise<void> {
     const history = await this.client.history(serverPath, 100);
     await this.panel?.webview.postMessage({
-      type: 'fileHistory',
+      type: 'fileHistoryDetails',
       serverPath,
       items: history.items,
     });
@@ -212,21 +266,57 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
     fromVersion: number,
     toVersion: number,
   ): Promise<void> {
-    const diff = await this.client.diffVersions(
-      fromPath,
-      fromVersion,
-      toVersion,
-      { toServerPath: toPath },
+    await openServerVersionDiff(
+      this.client,
+      {
+        serverPath: fromPath,
+        version: fromVersion,
+        label: `${path.posix.basename(fromPath)} (cs${fromVersion})`,
+      },
+      {
+        serverPath: toPath,
+        version: toVersion,
+        label: `${path.posix.basename(toPath)} (cs${toVersion})`,
+      },
+      `${path.posix.basename(toPath)}: cs${fromVersion} ↔ cs${toVersion}`,
     );
-    await showDiffDocument(`${fromPath} ↔ ${toPath}`, diff);
   }
 
-  private projectFiles(detail: ChangesetShowResponse): Array<{
-    path: string;
-    name: string;
-    changeType: string;
-    isBranch: boolean;
-  }> {
+  private async checkoutSnapshot(changesetId: number): Promise<void> {
+    const detail = await this.client.changesetShow(changesetId);
+    const target = this.findTargetForChangeset(detail) ?? this.targets[0];
+    if (!target) {
+      return;
+    }
+
+    const picked = await vscode.window.showOpenDialog({
+      canSelectFiles: false,
+      canSelectFolders: true,
+      canSelectMany: false,
+      openLabel: getUiLanguage() === 'zh-CN' ? '选择签出目录' : 'Choose checkout folder',
+    });
+    if (!picked?.length) {
+      return;
+    }
+
+    const result = await checkoutServerPathToLocalFolder(
+      this.client,
+      target.serverPath,
+      picked[0].fsPath,
+      { version: changesetId },
+    );
+    if (result.trim()) {
+      this.output.appendLine(result.trim());
+      this.output.show(true);
+    }
+    void vscode.window.showInformationMessage(
+      getUiLanguage() === 'zh-CN'
+        ? `已将 cs${changesetId} 获取到 ${picked[0].fsPath}`
+        : `Downloaded cs${changesetId} to ${picked[0].fsPath}`,
+    );
+  }
+
+  private projectFiles(detail: ChangesetShowResponse): ProjectedFile[] {
     return (detail.changeset.changes ?? [])
       .filter((change) => change.item?.path)
       .map((change) => ({
@@ -273,8 +363,10 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
         byRelativePath.set(relativePath, current);
       }
     };
+
     add(from, fromTarget, 'from');
     add(to, toTarget, 'to');
+
     for (const file of byRelativePath.values()) {
       if (!file.fromPath && fromTarget && !file.relativePath.startsWith('$/')) {
         file.fromPath = joinServerPath(fromTarget.serverPath, file.relativePath);
@@ -283,6 +375,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
         file.toPath = joinServerPath(toTarget.serverPath, file.relativePath);
       }
     }
+
     return [...byRelativePath.values()].sort((left, right) =>
       left.relativePath.localeCompare(right.relativePath, undefined, { sensitivity: 'base' }),
     );
@@ -299,16 +392,45 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
     const nonce = getNonce();
     const zh = getUiLanguage() === 'zh-CN';
     const labels = {
-      title: zh ? 'TFVC 版本历史' : 'TFVC History',
+      title: zh ? 'TFVC 历史记录' : 'TFVC History',
       refresh: zh ? '刷新' : 'Refresh',
-      compare: zh ? '比较选中的两个变更集' : 'Compare selected changesets',
-      hint: zh ? 'Ctrl/Command 点击可选择两条记录进行比较' : 'Ctrl/Command-click to select two records',
-      files: zh ? '变更文件' : 'Changed files',
-      diff: zh ? '与上一版本比较' : 'Diff previous',
-      history: zh ? '文件历史' : 'File history',
-      compareVersions: zh ? '比较选中的两个文件版本' : 'Compare selected file versions',
-      empty: zh ? '请选择一个变更集查看文件列表。' : 'Select a changeset to inspect its files.',
+      compare: zh ? '比较选中项' : 'Compare Selected',
+      compareShort: zh ? '比较' : 'Compare',
+      refreshShort: zh ? '刷新' : 'Refresh',
+      getSnapshot: zh ? '获取此版本' : 'Get This Version',
+      getSnapshotShort: zh ? '获取' : 'Get',
+      changeset: zh ? '变更集' : 'Changeset',
+      user: zh ? '用户' : 'User',
+      date: zh ? '日期' : 'Date',
+      comment: zh ? '注释' : 'Comment',
+      changes: zh ? '更改' : 'Changes',
+      previous: zh ? '与上一版本比较' : 'Compare With Previous',
+      previousShort: zh ? '对比' : 'Diff',
+      fileHistory: zh ? '查看历史记录' : 'View History',
+      fileHistoryShort: zh ? '历史' : 'History',
+      viewCurrent: zh ? '查看当前版本' : 'View Current Version',
+      viewCurrentShort: zh ? '查看' : 'View',
+      compareVersions: zh ? '比较选中的两个版本' : 'Compare Selected Versions',
+      compareVersionsShort: zh ? '比较版本' : 'Compare',
+      empty: zh ? '请选择一条变更记录查看文件列表。' : 'Select a changeset to inspect changed files.',
+      detail: zh ? '变更集详细信息' : 'Changeset Details',
+      changedFiles: zh ? '更改文件' : 'Changed Files',
+      sourcePath: zh ? '源位置' : 'Source Location',
+      from: zh ? '左侧' : 'Left',
+      to: zh ? '右侧' : 'Right',
+      contextDetails: zh ? '查看详细信息' : 'View Details',
+      contextCompare: zh ? '比较选中的两个变更集' : 'Compare selected changesets',
+      contextGet: zh ? '获取此版本到文件夹' : 'Get this version to folder',
+      contextDiff: zh ? '与上一版本比较' : 'Compare with previous',
+      contextHistory: zh ? '查看文件历史' : 'View file history',
+      contextViewCurrent: zh ? '查看当前版本' : 'View current version',
+      contextPair: zh ? '比较这两个版本' : 'Compare these versions',
+      filePath: zh ? '文件路径' : 'File Path',
+      modeHistory: zh ? '历史记录' : 'History',
+      modeFileHistory: zh ? '文件历史记录' : 'File History',
+      modeCompare: zh ? '变更集比较' : 'Changeset Comparison',
     };
+
     return `<!doctype html>
 <html lang="${zh ? 'zh-CN' : 'en'}">
 <head>
@@ -318,202 +440,584 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
   <title>${escapeHtml(labels.title)}</title>
   <style>
     :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
     body { margin: 0; color: var(--vscode-foreground); background: var(--vscode-editor-background); font-family: var(--vscode-font-family); }
-    header { display:flex; align-items:center; gap:12px; padding:14px 18px; border-bottom:1px solid var(--vscode-panel-border); position:sticky; top:0; background:var(--vscode-editor-background); z-index:3; }
-    header h1 { font-size:16px; margin:0; flex:1; }
-    button { color:var(--vscode-button-foreground); background:var(--vscode-button-background); border:0; padding:6px 10px; cursor:pointer; }
-    button:hover { background:var(--vscode-button-hoverBackground); }
+    header { display:grid; grid-template-columns: 1fr auto auto; gap:12px; align-items:center; padding:14px 18px; border-bottom:1px solid var(--vscode-panel-border); }
+    .pathbar { display:flex; flex-direction:column; gap:4px; min-width:0; }
+    .pathbar strong { font-size: 15px; }
+    .pathbar span { color: var(--vscode-descriptionForeground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    button { color:var(--vscode-foreground); background:var(--vscode-button-secondaryBackground); border:1px solid var(--vscode-panel-border); padding:6px 10px; cursor:pointer; border-radius:6px; }
+    button:hover { background:var(--vscode-list-hoverBackground); }
     button.secondary { color:var(--vscode-foreground); background:var(--vscode-button-secondaryBackground); }
     button:disabled { opacity:.45; cursor:default; }
-    .layout { display:grid; grid-template-columns:minmax(300px, 38%) 1fr; height:calc(100vh - 53px); }
-    .history { overflow:auto; border-right:1px solid var(--vscode-panel-border); }
-    .details { overflow:auto; padding:18px; }
-    .target { padding:10px 12px 6px; font-size:12px; font-weight:700; color:var(--vscode-descriptionForeground); background:var(--vscode-sideBarSectionHeader-background); position:sticky; top:0; }
-    .changeset { display:grid; grid-template-columns:22px 82px 1fr; gap:8px; padding:9px 12px; border-bottom:1px solid color-mix(in srgb, var(--vscode-panel-border) 55%, transparent); cursor:pointer; }
-    .changeset:hover, .changeset.active { background:var(--vscode-list-hoverBackground); }
-    .changeset strong { color:var(--vscode-textLink-foreground); }
-    .meta { color:var(--vscode-descriptionForeground); font-size:12px; margin-top:3px; }
-    .comment { white-space:pre-wrap; overflow-wrap:anywhere; }
-    .hint { color:var(--vscode-descriptionForeground); font-size:12px; }
-    .card { border:1px solid var(--vscode-panel-border); margin-bottom:14px; }
-    .card-title { padding:9px 11px; font-weight:700; background:var(--vscode-sideBarSectionHeader-background); }
-    table { width:100%; border-collapse:collapse; }
-    td, th { text-align:left; padding:8px 10px; border-top:1px solid var(--vscode-panel-border); vertical-align:top; }
-    th { color:var(--vscode-descriptionForeground); font-size:12px; }
-    .path { font-family:var(--vscode-editor-font-family); overflow-wrap:anywhere; }
-    .actions { white-space:nowrap; }
-    .actions button { margin-left:5px; padding:4px 7px; }
-    .error { color:var(--vscode-errorForeground); padding:10px; border:1px solid var(--vscode-inputValidation-errorBorder); }
-    @media (max-width:800px) { .layout { grid-template-columns:1fr; height:auto; } .history { max-height:45vh; border-right:0; border-bottom:1px solid var(--vscode-panel-border); } }
+    .layout { display:grid; grid-template-columns: minmax(560px, 58%) 1fr; height: calc(100vh - 73px); }
+    .master { overflow:auto; border-right:1px solid var(--vscode-panel-border); }
+    .detail { overflow:auto; }
+    .section-title { padding:10px 14px; font-weight:700; border-bottom:1px solid var(--vscode-panel-border); background: var(--vscode-sideBarSectionHeader-background); position: sticky; top: 0; z-index: 1; }
+    table.grid { width:100%; border-collapse:collapse; table-layout:fixed; }
+    .grid thead th { position: sticky; top: 42px; z-index: 1; background: var(--vscode-editor-background); color: var(--vscode-descriptionForeground); font-size:12px; border-bottom:1px solid var(--vscode-panel-border); padding:8px 10px; text-align:left; }
+    .grid td { padding:8px 10px; border-bottom:1px solid color-mix(in srgb, var(--vscode-panel-border) 55%, transparent); vertical-align:top; }
+    .grid tbody tr { cursor:pointer; }
+    .grid tbody tr:hover { background: var(--vscode-list-hoverBackground); }
+    .grid tbody tr.active { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+    .grid tbody tr.multi { background: color-mix(in srgb, var(--vscode-list-hoverBackground) 70%, transparent); }
+    .cs-col { width:118px; }
+    .user-col { width:160px; }
+    .date-col { width:180px; }
+    .path-col { width:42%; }
+    .comment-cell, .path-text { white-space:pre-wrap; overflow-wrap:anywhere; }
+    .detail-wrap { padding:16px; display:flex; flex-direction:column; gap:14px; }
+    .card { border:1px solid var(--vscode-panel-border); }
+    .card-header { padding:10px 12px; border-bottom:1px solid var(--vscode-panel-border); background: var(--vscode-sideBarSectionHeader-background); font-weight:700; display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .card-body { padding:12px; }
+    .meta { color: var(--vscode-descriptionForeground); font-size:12px; }
+    .tree { font-family: var(--vscode-editor-font-family); font-size:13px; }
+    .tree-node { margin-left: 14px; }
+    .tree-label { display:flex; align-items:center; gap:8px; padding:4px 6px; border-radius:4px; cursor:pointer; }
+    .tree-label:hover { background: var(--vscode-list-hoverBackground); }
+    .tree-label.selected { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+    .folder > .tree-label::before { content: '▾'; width: 12px; color: var(--vscode-descriptionForeground); }
+    .folder.collapsed > .tree-label::before { content: '▸'; }
+    .file > .tree-label::before { content: '•'; width: 12px; color: var(--vscode-descriptionForeground); }
+    .folder.collapsed > .tree-children { display: none; }
+    .badge { color: var(--vscode-descriptionForeground); font-size: 12px; }
+    .toolbar { display:flex; flex-wrap:wrap; gap:8px; }
+    .action-btn { display:inline-flex; align-items:center; gap:6px; min-height:30px; }
+    .action-btn.compact { padding:6px 8px; }
+    .action-icon { width:14px; text-align:center; font-size:13px; opacity:.92; }
+    .empty { padding:16px; color: var(--vscode-descriptionForeground); }
+    .error { margin:16px; color: var(--vscode-errorForeground); padding:10px; border:1px solid var(--vscode-inputValidation-errorBorder); }
+    .context-menu { position: fixed; z-index: 20; min-width: 220px; border: 1px solid var(--vscode-panel-border); background: var(--vscode-menu-background, var(--vscode-editor-background)); box-shadow: 0 8px 24px rgba(0,0,0,.25); display: none; }
+    .context-menu button { display:block; width:100%; text-align:left; background:transparent; color:var(--vscode-menu-foreground, var(--vscode-foreground)); padding:8px 12px; }
+    .context-menu button:hover { background:var(--vscode-list-hoverBackground); }
+    @media (max-width: 1100px) { .layout { grid-template-columns:1fr; height:auto; } .master { max-height:44vh; border-right:0; border-bottom:1px solid var(--vscode-panel-border); } .grid thead th { top: 42px; } }
   </style>
 </head>
 <body>
   <header>
-    <h1>${escapeHtml(labels.title)}</h1>
-    <span class="hint">${escapeHtml(labels.hint)}</span>
+    <div class="pathbar">
+      <strong>${escapeHtml(labels.title)}</strong>
+      <span id="pathLabel"></span>
+    </div>
     <button id="compare" disabled>${escapeHtml(labels.compare)}</button>
     <button id="reload" class="secondary">${escapeHtml(labels.refresh)}</button>
   </header>
   <main class="layout">
-    <section id="history" class="history"></section>
-    <section id="details" class="details"><p class="hint">${escapeHtml(labels.empty)}</p></section>
+    <section class="master">
+      <div class="section-title" id="masterTitle">${escapeHtml(labels.modeHistory)}</div>
+      <table class="grid" id="historyTable">
+        <thead>
+          <tr>
+            <th class="cs-col">${escapeHtml(labels.changeset)}</th>
+            <th class="user-col">${escapeHtml(labels.user)}</th>
+            <th class="date-col">${escapeHtml(labels.date)}</th>
+            <th>${escapeHtml(labels.comment)}</th>
+          </tr>
+        </thead>
+        <tbody id="historyBody"></tbody>
+      </table>
+    </section>
+    <section class="detail">
+      <div class="detail-wrap" id="detailWrap">
+        <div class="empty">${escapeHtml(labels.empty)}</div>
+      </div>
+    </section>
   </main>
+  <div class="context-menu" id="contextMenu"></div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const labels = ${JSON.stringify(labels)};
-    const historyEl = document.getElementById('history');
-    const detailsEl = document.getElementById('details');
+    const pathLabel = document.getElementById('pathLabel');
+    const masterTitle = document.getElementById('masterTitle');
+    const historyBody = document.getElementById('historyBody');
+    const detailWrap = document.getElementById('detailWrap');
     const compareButton = document.getElementById('compare');
-    let selected = [];
+    const contextMenu = document.getElementById('contextMenu');
+    const state = {
+      historyRows: [],
+      selectedChangesets: [],
+      activeChangesetId: null,
+      latestPayload: null,
+      latestPathLabel: '',
+      fileHistoryPath: '',
+      fileHistorySelected: [],
+      selectedFilePath: null,
+    };
 
     document.getElementById('reload').addEventListener('click', () => vscode.postMessage({ type: 'reload' }));
-    compareButton.addEventListener('click', () => vscode.postMessage({ type: 'compareChangesets', changesetIds: selected }));
+    compareButton.addEventListener('click', () => {
+      if (state.selectedChangesets.length === 2) {
+        vscode.postMessage({ type: 'compareChangesets', changesetIds: [...state.selectedChangesets] });
+      }
+    });
+    window.addEventListener('click', () => hideContextMenu());
+    window.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') hideContextMenu();
+    });
 
-    function toggleSelection(id, checked) {
-      selected = selected.filter(value => value !== id);
-      if (checked) selected.push(id);
-      if (selected.length > 2) selected.shift();
-      document.querySelectorAll('.changeset input').forEach(input => {
-        input.checked = selected.includes(Number(input.dataset.id));
-      });
-      compareButton.disabled = selected.length !== 2;
-    }
-
-    function renderHistories(groups) {
-      selected = [];
+    function renderHistories(groups, initialChangesetId, currentPathLabel) {
+      state.historyRows = groups.flatMap(group => group.items.map(item => ({ ...item, scopePath: group.serverPath, scopeLabel: group.label })));
+      state.selectedChangesets = [];
+      state.activeChangesetId = initialChangesetId ?? null;
+      state.latestPathLabel = currentPathLabel || '';
+      pathLabel.textContent = currentPathLabel || '';
+      masterTitle.textContent = labels.modeHistory;
       compareButton.disabled = true;
-      historyEl.innerHTML = groups.map(group => \`
-        <div class="target">\${escape(group.label)} <span class="hint">\${escape(group.serverPath)}</span></div>
-        \${group.items.map(item => \`
-          <div class="changeset" data-id="\${item.changesetId}">
-            <input type="checkbox" data-id="\${item.changesetId}" aria-label="select">
-            <strong>cs\${item.changesetId}</strong>
-            <div>
-              <div class="comment">\${escape(item.comment || '')}</div>
-              <div class="meta">\${escape(item.author?.displayName || '')} · \${formatDate(item.createdAt)}</div>
-            </div>
-          </div>\`).join('')}
-      \`).join('');
-      historyEl.querySelectorAll('.changeset').forEach(row => {
-        const id = Number(row.dataset.id);
-        row.addEventListener('click', event => {
-          if (event.target instanceof HTMLInputElement) {
-            toggleSelection(id, event.target.checked);
-            return;
+
+      historyBody.innerHTML = state.historyRows.map(item => \`
+        <tr data-id="\${item.changesetId}">
+          <td class="cs-col">cs\${item.changesetId}</td>
+          <td class="user-col">\${escape(item.author?.displayName || item.checkedInBy?.displayName || '')}</td>
+          <td class="date-col">\${escape(formatDate(item.createdAt))}</td>
+          <td class="comment-cell">\${escape(item.comment || '')}</td>
+        </tr>\`).join('');
+
+      historyBody.querySelectorAll('tr').forEach(row => {
+        const changesetId = Number(row.dataset.id);
+        row.addEventListener('click', event => handleHistoryRowClick(event, changesetId));
+        row.addEventListener('dblclick', () => activateChangeset(changesetId));
+        row.addEventListener('contextmenu', event => {
+          event.preventDefault();
+          const selected = state.selectedChangesets.includes(changesetId)
+            ? [...state.selectedChangesets]
+            : [changesetId];
+          if (!state.selectedChangesets.includes(changesetId)) {
+            state.selectedChangesets = selected;
+            refreshHistorySelection();
           }
-          if (event.ctrlKey || event.metaKey) {
-            toggleSelection(id, !selected.includes(id));
-            return;
-          }
-          document.querySelectorAll('.changeset').forEach(item => item.classList.remove('active'));
-          row.classList.add('active');
-          vscode.postMessage({ type: 'selectChangeset', changesetId: id });
+          showContextMenu(event.clientX, event.clientY, [
+            { label: labels.contextDetails, run: () => activateChangeset(changesetId) },
+            { label: labels.contextCompare, disabled: selected.length !== 2, run: () => vscode.postMessage({ type: 'compareChangesets', changesetIds: selected }) },
+            { label: labels.contextGet, run: () => vscode.postMessage({ type: 'checkoutChangeset', changesetId }) },
+          ]);
         });
       });
+
+      refreshHistorySelection();
+      if (initialChangesetId) {
+        activateChangeset(initialChangesetId);
+      }
     }
 
-    function renderChangeset(message) {
-      const cs = message.changeset;
-      detailsEl.innerHTML = \`
+    function handleHistoryRowClick(event, changesetId) {
+      if (event.metaKey || event.ctrlKey) {
+        toggleHistorySelection(changesetId);
+        return;
+      }
+      state.selectedChangesets = [changesetId];
+      state.activeChangesetId = changesetId;
+      refreshHistorySelection();
+      vscode.postMessage({ type: 'selectChangeset', changesetId });
+    }
+
+    function toggleHistorySelection(changesetId) {
+      if (state.selectedChangesets.includes(changesetId)) {
+        state.selectedChangesets = state.selectedChangesets.filter(value => value !== changesetId);
+      } else {
+        state.selectedChangesets = [...state.selectedChangesets, changesetId].slice(-2);
+      }
+      refreshHistorySelection();
+    }
+
+    function activateChangeset(changesetId) {
+      state.selectedChangesets = [changesetId];
+      state.activeChangesetId = changesetId;
+      refreshHistorySelection();
+      vscode.postMessage({ type: 'selectChangeset', changesetId });
+    }
+
+    function refreshHistorySelection() {
+      compareButton.disabled = state.selectedChangesets.length !== 2;
+      historyBody.querySelectorAll('tr').forEach(row => {
+        const changesetId = Number(row.dataset.id);
+        row.classList.toggle('active', state.activeChangesetId === changesetId);
+        row.classList.toggle('multi', state.selectedChangesets.includes(changesetId) && state.activeChangesetId !== changesetId);
+      });
+    }
+
+    function renderChangesetDetails(message) {
+      state.latestPayload = message;
+      state.selectedFilePath = null;
+      masterTitle.textContent = labels.modeHistory;
+      const filesTree = buildChangesetTree(message.files, message.scopePath);
+      detailWrap.innerHTML = \`
         <div class="card">
-          <div class="card-title">cs\${cs.changesetId} · \${escape(cs.author?.displayName || '')}</div>
-          <div style="padding:11px"><div class="comment">\${escape(cs.comment || '')}</div><div class="meta">\${formatDate(cs.createdAt)}</div></div>
+          <div class="card-header">
+            <span>\${labels.detail} · cs\${message.changeset.changesetId}</span>
+            <button data-role="get-snapshot">\${labels.getSnapshot}</button>
+          </div>
+          <div class="card-body">
+            <div><strong>\${escape(message.changeset.comment || '')}</strong></div>
+            <div class="meta">\${escape(message.changeset.author?.displayName || '')} · \${escape(formatDate(message.changeset.createdAt))}</div>
+            <div class="meta" style="margin-top:6px;">\${labels.sourcePath}: \${escape(message.scopePath || '')}</div>
+          </div>
         </div>
         <div class="card">
-          <div class="card-title">\${labels.files} (\${message.files.length})</div>
-          <table><thead><tr><th>Type</th><th>Path</th><th></th></tr></thead><tbody>
-          \${message.files.map(file => \`
-            <tr><td>\${escape(file.changeType)}</td><td class="path">\${escape(file.path)}</td>
-            <td class="actions">\${file.isBranch ? '' : \`
-              <button data-action="diff" data-path="\${attr(file.path)}" data-version="\${cs.changesetId}">\${labels.diff}</button>
-              <button class="secondary" data-action="history" data-path="\${attr(file.path)}">\${labels.history}</button>\`}</td></tr>
-          \`).join('')}
-          </tbody></table>
+          <div class="card-header">
+            <span>\${labels.changedFiles} (\${message.files.length})</span>
+            <div class="toolbar" id="fileToolbar"></div>
+          </div>
+          <div class="card-body">
+            <div class="tree" id="fileTree"></div>
+          </div>
         </div>\`;
-      bindFileActions();
+
+      detailWrap.querySelector('[data-role="get-snapshot"]').addEventListener('click', () => {
+        vscode.postMessage({ type: 'checkoutChangeset', changesetId: message.changeset.changesetId });
+      });
+      renderTreeInto(detailWrap.querySelector('#fileTree'), filesTree, 'changeset', message.changeset.changesetId);
+      updateFileToolbar('changeset', message.changeset.changesetId);
     }
 
-    function renderComparison(message) {
-      detailsEl.innerHTML = \`
-        <div class="card"><div class="card-title">cs\${message.from.changesetId} ↔ cs\${message.to.changesetId}</div>
-        <div style="padding:11px" class="hint">\${escape(message.from.comment || '')}<br>↔<br>\${escape(message.to.comment || '')}</div></div>
-        <div class="card"><div class="card-title">\${labels.files} (\${message.files.length})</div>
-        <table><thead><tr><th>Path</th><th>From</th><th>To</th><th></th></tr></thead><tbody>
-        \${message.files.map(file => \`
-          <tr><td class="path">\${escape(file.relativePath)}</td><td>\${escape(file.fromChangeType || '—')}</td><td>\${escape(file.toChangeType || '—')}</td>
-          <td class="actions">\${file.fromPath && file.toPath ? \`<button data-action="pair" data-from="\${attr(file.fromPath)}" data-to="\${attr(file.toPath)}" data-from-version="\${message.from.changesetId}" data-to-version="\${message.to.changesetId}">Diff</button>\` : ''}</td></tr>
-        \`).join('')}</tbody></table></div>\`;
-      detailsEl.querySelectorAll('[data-action="pair"]').forEach(button => button.addEventListener('click', () => {
+    function renderComparisonDetails(message) {
+      state.latestPayload = message;
+      state.selectedFilePath = null;
+      masterTitle.textContent = labels.modeCompare;
+      const filesTree = buildComparedTree(message.files);
+      detailWrap.innerHTML = \`
+        <div class="card">
+          <div class="card-header">
+            <span>cs\${message.from.changesetId} ↔ cs\${message.to.changesetId}</span>
+          </div>
+          <div class="card-body">
+            <div class="meta">\${labels.from}: \${escape(message.leftPath || '')}</div>
+            <div class="meta">\${labels.to}: \${escape(message.rightPath || '')}</div>
+            <div style="margin-top:8px;"><strong>\${escape(message.from.comment || '')}</strong></div>
+            <div class="meta">\${escape(formatDate(message.from.createdAt))}</div>
+            <div style="margin-top:10px;"><strong>\${escape(message.to.comment || '')}</strong></div>
+            <div class="meta">\${escape(formatDate(message.to.createdAt))}</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <span>\${labels.changedFiles} (\${message.files.length})</span>
+            <div class="toolbar" id="fileToolbar"></div>
+          </div>
+          <div class="card-body">
+            <div class="tree" id="fileTree"></div>
+          </div>
+        </div>\`;
+
+      renderTreeInto(detailWrap.querySelector('#fileTree'), filesTree, 'comparison', message);
+      updateFileToolbar('comparison', message);
+    }
+
+    function renderFileHistoryDetails(message) {
+      state.latestPayload = message;
+      state.fileHistoryPath = message.serverPath;
+      state.fileHistorySelected = [];
+      masterTitle.textContent = labels.modeFileHistory;
+      detailWrap.innerHTML = \`
+        <div class="card">
+          <div class="card-header">
+            <span>\${labels.fileHistory}</span>
+            <div class="toolbar">
+              <button id="compareFileVersions" disabled>\${labels.compareVersions}</button>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="meta">\${labels.filePath}: \${escape(message.serverPath)}</div>
+          </div>
+        </div>
+        <div class="card">
+          <table class="grid">
+            <thead>
+              <tr>
+                <th class="cs-col">\${labels.changeset}</th>
+                <th class="user-col">\${labels.user}</th>
+                <th class="date-col">\${labels.date}</th>
+                <th>${escapeHtml(labels.comment)}</th>
+              </tr>
+            </thead>
+            <tbody id="fileHistoryBody">
+              \${message.items.map(item => \`
+                <tr data-id="\${item.changesetId}">
+                  <td class="cs-col">cs\${item.changesetId}</td>
+                  <td class="user-col">\${escape(item.author?.displayName || item.checkedInBy?.displayName || '')}</td>
+                  <td class="date-col">\${escape(formatDate(item.createdAt))}</td>
+                  <td class="comment-cell">\${escape(item.comment || '')}</td>
+                </tr>\`).join('')}
+            </tbody>
+          </table>
+        </div>\`;
+
+      const compareFileVersions = detailWrap.querySelector('#compareFileVersions');
+      const rows = detailWrap.querySelectorAll('#fileHistoryBody tr');
+      rows.forEach(row => {
+        const changesetId = Number(row.dataset.id);
+        row.addEventListener('click', event => {
+          if (event.metaKey || event.ctrlKey) {
+            toggleFileHistorySelection(changesetId);
+          } else {
+            state.fileHistorySelected = [changesetId];
+            refreshFileHistorySelection();
+          }
+        });
+        row.addEventListener('dblclick', () => vscode.postMessage({ type: 'diffPrevious', serverPath: message.serverPath, changesetId }));
+        row.addEventListener('contextmenu', event => {
+          event.preventDefault();
+          const selected = state.fileHistorySelected.includes(changesetId)
+            ? [...state.fileHistorySelected]
+            : [changesetId];
+          if (!state.fileHistorySelected.includes(changesetId)) {
+            state.fileHistorySelected = selected;
+            refreshFileHistorySelection();
+          }
+          showContextMenu(event.clientX, event.clientY, [
+            { label: labels.contextDiff, run: () => vscode.postMessage({ type: 'diffPrevious', serverPath: message.serverPath, changesetId }) },
+            { label: labels.contextPair, disabled: selected.length !== 2, run: () => vscode.postMessage({ type: 'compareFileVersions', serverPath: message.serverPath, changesetIds: selected }) },
+          ]);
+        });
+      });
+
+      compareFileVersions.addEventListener('click', () => {
+        if (state.fileHistorySelected.length === 2) {
+          vscode.postMessage({ type: 'compareFileVersions', serverPath: message.serverPath, changesetIds: [...state.fileHistorySelected] });
+        }
+      });
+      refreshFileHistorySelection();
+    }
+
+    function toggleFileHistorySelection(changesetId) {
+      if (state.fileHistorySelected.includes(changesetId)) {
+        state.fileHistorySelected = state.fileHistorySelected.filter(value => value !== changesetId);
+      } else {
+        state.fileHistorySelected = [...state.fileHistorySelected, changesetId].slice(-2);
+      }
+      refreshFileHistorySelection();
+    }
+
+    function refreshFileHistorySelection() {
+      const rows = detailWrap.querySelectorAll('#fileHistoryBody tr');
+      rows.forEach(row => {
+        const changesetId = Number(row.dataset.id);
+        row.classList.toggle('active', state.fileHistorySelected.length === 1 && state.fileHistorySelected[0] === changesetId);
+        row.classList.toggle('multi', state.fileHistorySelected.includes(changesetId) && !(state.fileHistorySelected.length === 1 && state.fileHistorySelected[0] === changesetId));
+      });
+      const compareFileVersions = detailWrap.querySelector('#compareFileVersions');
+      if (compareFileVersions) {
+        compareFileVersions.disabled = state.fileHistorySelected.length !== 2;
+      }
+    }
+
+    function buildChangesetTree(files, scopePath) {
+      return buildTree(files.map(file => ({
+        ...file,
+        relativePath: makeRelativePath(file.path, scopePath),
+      })));
+    }
+
+    function buildComparedTree(files) {
+      return buildTree(files.map(file => ({
+        ...file,
+        path: file.relativePath,
+        relativePath: file.relativePath,
+        changeType: \`\${file.fromChangeType || '—'} → \${file.toChangeType || '—'}\`,
+      })));
+    }
+
+    function buildTree(entries) {
+      const root = [];
+      const folderMap = new Map();
+      for (const entry of entries) {
+        const parts = (entry.relativePath || entry.path || '').split('/').filter(Boolean);
+        let container = root;
+        let folderPath = '';
+        for (let index = 0; index < parts.length; index += 1) {
+          const part = parts[index];
+          const isLeaf = index === parts.length - 1;
+          folderPath = folderPath ? folderPath + '/' + part : part;
+          if (isLeaf) {
+            container.push({ kind: 'file', name: part, fullPath: entry.path, entry });
+            continue;
+          }
+          const key = folderPath;
+          let folder = folderMap.get(key);
+          if (!folder) {
+            folder = { kind: 'folder', name: part, children: [], id: key };
+            folderMap.set(key, folder);
+            container.push(folder);
+          }
+          container = folder.children;
+        }
+      }
+      sortTree(root);
+      return root;
+    }
+
+    function sortTree(nodes) {
+      nodes.sort((left, right) => {
+        if (left.kind !== right.kind) return left.kind === 'folder' ? -1 : 1;
+        return left.name.localeCompare(right.name, undefined, { sensitivity: 'base' });
+      });
+      nodes.filter(node => node.kind === 'folder').forEach(node => sortTree(node.children));
+    }
+
+    function renderTreeInto(host, nodes, mode, payload) {
+      host.innerHTML = '';
+      if (!nodes.length) {
+        host.innerHTML = '<div class="empty">' + escape(labels.empty) + '</div>';
+        return;
+      }
+      nodes.forEach(node => host.appendChild(renderTreeNode(node, mode, payload)));
+    }
+
+    function renderTreeNode(node, mode, payload) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'tree-node ' + node.kind;
+      const label = document.createElement('div');
+      label.className = 'tree-label';
+      label.innerHTML = '<span>' + escape(node.name) + '</span>' + (node.kind === 'file' ? '<span class="badge">' + escape(node.entry.changeType || '') + '</span>' : '');
+      wrapper.appendChild(label);
+
+      if (node.kind === 'folder') {
+        wrapper.classList.add('folder');
+        const children = document.createElement('div');
+        children.className = 'tree-children';
+        node.children.forEach(child => children.appendChild(renderTreeNode(child, mode, payload)));
+        label.addEventListener('click', () => wrapper.classList.toggle('collapsed'));
+        wrapper.appendChild(children);
+        return wrapper;
+      }
+
+      wrapper.classList.add('file');
+      label.dataset.path = node.entry.path;
+      label.dataset.mode = mode;
+      label.addEventListener('click', () => {
+        state.selectedFilePath = node.entry.path;
+        hostSelectFile();
+        updateFileToolbar(mode, payload, node.entry);
+      });
+      label.addEventListener('dblclick', () => runPrimaryFileAction(mode, payload, node.entry));
+      label.addEventListener('contextmenu', event => {
+        event.preventDefault();
+        state.selectedFilePath = node.entry.path;
+        hostSelectFile();
+        updateFileToolbar(mode, payload, node.entry);
+        if (mode === 'changeset') {
+          showContextMenu(event.clientX, event.clientY, [
+            { label: labels.contextDiff, run: () => vscode.postMessage({ type: 'diffPrevious', serverPath: node.entry.path, changesetId: payload }) },
+            { label: labels.contextHistory, run: () => vscode.postMessage({ type: 'fileHistory', serverPath: node.entry.path }) },
+          ]);
+          return;
+        }
+        showContextMenu(event.clientX, event.clientY, [
+          { label: labels.contextPair, run: () => vscode.postMessage({ type: 'compareFilePair', fromPath: node.entry.fromPath, toPath: node.entry.toPath, fromVersion: payload.from.changesetId, toVersion: payload.to.changesetId }) },
+          { label: labels.contextHistory, run: () => vscode.postMessage({ type: 'fileHistory', serverPath: node.entry.toPath || node.entry.fromPath }) },
+        ]);
+      });
+      return wrapper;
+    }
+
+    function runPrimaryFileAction(mode, payload, entry) {
+      if (mode === 'changeset') {
+        vscode.postMessage({ type: 'diffPrevious', serverPath: entry.path, changesetId: payload });
+        return;
+      }
+      vscode.postMessage({ type: 'compareFilePair', fromPath: entry.fromPath, toPath: entry.toPath, fromVersion: payload.from.changesetId, toVersion: payload.to.changesetId });
+    }
+
+    function hostSelectFile() {
+      detailWrap.querySelectorAll('.tree-label').forEach(node => node.classList.toggle('selected', node.dataset.path === state.selectedFilePath));
+    }
+
+    function updateFileToolbar(mode, payload, entry) {
+      const toolbar = detailWrap.querySelector('#fileToolbar');
+      if (!toolbar) return;
+      const selectedEntry = entry || findSelectedEntry(mode);
+      if (!selectedEntry) {
+        toolbar.innerHTML = '<span class="meta">' + escape(labels.empty) + '</span>';
+        return;
+      }
+      if (mode === 'changeset') {
+        toolbar.innerHTML = \`
+          <button data-role="diffPrevious">\${labels.previous}</button>
+          <button data-role="fileHistory" class="secondary">\${labels.fileHistory}</button>\`;
+        toolbar.querySelector('[data-role="diffPrevious"]').addEventListener('click', () => {
+          vscode.postMessage({ type: 'diffPrevious', serverPath: selectedEntry.path, changesetId: payload });
+        });
+        toolbar.querySelector('[data-role="fileHistory"]').addEventListener('click', () => {
+          vscode.postMessage({ type: 'fileHistory', serverPath: selectedEntry.path });
+        });
+        return;
+      }
+
+      toolbar.innerHTML = \`
+        <button data-role="comparePair">\${labels.compareVersions}</button>
+        <button data-role="fileHistory" class="secondary">\${labels.fileHistory}</button>\`;
+      toolbar.querySelector('[data-role="comparePair"]').addEventListener('click', () => {
         vscode.postMessage({
           type: 'compareFilePair',
-          fromPath: button.dataset.from,
-          toPath: button.dataset.to,
-          fromVersion: Number(button.dataset.fromVersion),
-          toVersion: Number(button.dataset.toVersion),
+          fromPath: selectedEntry.fromPath,
+          toPath: selectedEntry.toPath,
+          fromVersion: payload.from.changesetId,
+          toVersion: payload.to.changesetId,
         });
-      }));
+      });
+      toolbar.querySelector('[data-role="fileHistory"]').addEventListener('click', () => {
+        vscode.postMessage({ type: 'fileHistory', serverPath: selectedEntry.toPath || selectedEntry.fromPath });
+      });
     }
 
-    function renderFileHistory(message) {
-      detailsEl.innerHTML = \`
-        <div class="card"><div class="card-title">\${labels.history}: \${escape(message.serverPath)}</div>
-        <div style="padding:9px 11px"><button id="compare-file" disabled>\${labels.compareVersions}</button></div>
-        <table><tbody>\${message.items.map(item => \`
-          <tr><td><input type="checkbox" class="file-version" value="\${item.changesetId}"></td><td><strong>cs\${item.changesetId}</strong></td>
-          <td><div>\${escape(item.comment || '')}</div><div class="meta">\${escape(item.author?.displayName || '')} · \${formatDate(item.createdAt)}</div></td></tr>
-        \`).join('')}</tbody></table></div>\`;
-      let versions = [];
-      const button = document.getElementById('compare-file');
-      detailsEl.querySelectorAll('.file-version').forEach(input => input.addEventListener('change', () => {
-        versions = [...detailsEl.querySelectorAll('.file-version:checked')].map(item => Number(item.value));
-        if (versions.length > 2) {
-          input.checked = false;
-          versions = versions.slice(0, 2);
-        }
-        button.disabled = versions.length !== 2;
-      }));
-      button.addEventListener('click', () => vscode.postMessage({ type: 'compareFileVersions', serverPath: message.serverPath, changesetIds: versions }));
+    function findSelectedEntry(mode) {
+      if (!state.selectedFilePath || !state.latestPayload) {
+        return null;
+      }
+      const entries = mode === 'changeset' ? (state.latestPayload.files || []) : (state.latestPayload.files || []);
+      return entries.find(item => item.path === state.selectedFilePath || item.relativePath === state.selectedFilePath || item.toPath === state.selectedFilePath || item.fromPath === state.selectedFilePath) || null;
     }
 
-    function bindFileActions() {
-      detailsEl.querySelectorAll('[data-action="diff"]').forEach(button => button.addEventListener('click', () => {
-        vscode.postMessage({ type: 'diffPrevious', serverPath: button.dataset.path, changesetId: Number(button.dataset.version) });
-      }));
-      detailsEl.querySelectorAll('[data-action="history"]').forEach(button => button.addEventListener('click', () => {
-        vscode.postMessage({ type: 'fileHistory', serverPath: button.dataset.path });
-      }));
+    function makeRelativePath(fullPath, scopePath) {
+      if (scopePath && fullPath.startsWith(scopePath + '/')) {
+        return fullPath.slice(scopePath.length + 1);
+      }
+      if (scopePath === fullPath) {
+        return pathLeaf(fullPath);
+      }
+      return fullPath.replace(/^\\$\\//, '');
+    }
+
+    function pathLeaf(value) {
+      const parts = value.split('/').filter(Boolean);
+      return parts[parts.length - 1] || value;
+    }
+
+    function showContextMenu(x, y, actions) {
+      contextMenu.innerHTML = actions.map((action, index) => \`<button data-index="\${index}" \${action.disabled ? 'disabled' : ''}>\${escape(action.label)}</button>\`).join('');
+      contextMenu.style.display = 'block';
+      contextMenu.style.left = x + 'px';
+      contextMenu.style.top = y + 'px';
+      contextMenu.querySelectorAll('button').forEach(button => {
+        button.addEventListener('click', event => {
+          event.stopPropagation();
+          const action = actions[Number(button.dataset.index)];
+          hideContextMenu();
+          if (!action.disabled) action.run();
+        });
+      });
+    }
+
+    function hideContextMenu() {
+      contextMenu.style.display = 'none';
+      contextMenu.innerHTML = '';
     }
 
     window.addEventListener('message', event => {
       const message = event.data;
-      if (message.type === 'histories') renderHistories(message.groups);
-      if (message.type === 'changeset') renderChangeset(message);
-      if (message.type === 'comparison') renderComparison(message);
-      if (message.type === 'fileHistory') renderFileHistory(message);
-      if (message.type === 'error') detailsEl.innerHTML = '<div class="error">' + escape(message.message) + '</div>';
+      if (message.type === 'histories') renderHistories(message.groups, message.initialChangesetId, message.pathLabel);
+      if (message.type === 'changesetDetails') renderChangesetDetails(message);
+      if (message.type === 'comparisonDetails') renderComparisonDetails(message);
+      if (message.type === 'fileHistoryDetails') renderFileHistoryDetails(message);
+      if (message.type === 'error') detailWrap.innerHTML = '<div class="error">' + escape(message.message) + '</div>';
     });
 
     function formatDate(value) { return value ? new Date(value).toLocaleString() : ''; }
     function escape(value) { const div = document.createElement('div'); div.textContent = String(value ?? ''); return div.innerHTML; }
-    function attr(value) { return escape(value).replace(/"/g, '&quot;'); }
     vscode.postMessage({ type: 'ready' });
   </script>
 </body>
 </html>`;
   }
-}
-
-async function showDiffDocument(title: string, diff: DiffResponse): Promise<void> {
-  const content = diff.result.kind === 'text'
-    ? diff.result.patch ?? ''
-    : diff.result.kind === 'binary'
-      ? `${title}\n\nBinary files differ.`
-      : `${title}\n\nNo differences.`;
-  const document = await vscode.workspace.openTextDocument({
-    language: diff.result.kind === 'text' ? 'diff' : 'text',
-    content,
-  });
-  await vscode.window.showTextDocument(document, { preview: false });
 }
 
 function isSameOrChild(candidate: string, parent: string): boolean {

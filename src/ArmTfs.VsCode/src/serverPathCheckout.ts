@@ -8,6 +8,7 @@ export async function checkoutServerPathToLocalFolder(
   client: ArmTfsCliClient,
   serverPath: string,
   localPath: string,
+  options?: { version?: number },
 ): Promise<string> {
   const normalizedServerPath = serverPath.trim();
   const normalizedLocalPath = path.resolve(localPath);
@@ -37,13 +38,13 @@ export async function checkoutServerPathToLocalFolder(
       steps.push(await client.workspaceMap(normalizedServerPath, normalizedLocalPath, { cwdOverride: workspaceRoot }));
     }
 
-    steps.push(await client.get(normalizedLocalPath, undefined, { cwdOverride: commandCwd }));
+    steps.push(await client.get(normalizedLocalPath, { version: options?.version }, { cwdOverride: commandCwd }));
     return steps.join('\n\n');
   }
 
   const workspaceName = buildWorkspaceName(normalizedServerPath, normalizedLocalPath);
   steps.push(await client.workspaceNew(workspaceName, normalizedServerPath, normalizedLocalPath, normalizedLocalPath, { cwdOverride: normalizedLocalPath }));
-  steps.push(await client.get(normalizedLocalPath, undefined, { cwdOverride: normalizedLocalPath }));
+  steps.push(await client.get(normalizedLocalPath, { version: options?.version }, { cwdOverride: normalizedLocalPath }));
   return steps.join('\n\n');
 }
 

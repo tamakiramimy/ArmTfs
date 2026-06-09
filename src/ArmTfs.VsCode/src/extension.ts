@@ -1,3 +1,5 @@
+import * as path from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 import * as vscode from 'vscode';
 import { ArmTfsCliClient, ArmTfsCliError } from './armTfsCliClient';
 import { ArmTfsConnectionsController } from './connections';
@@ -7,6 +9,7 @@ import { checkoutServerPathToLocalFolder } from './serverPathCheckout';
 import { ArmTfsScmController, ArmTfsResourceState } from './scm';
 import { ArmTfsSidebarController, ArmTfsServerExplorerController } from './sidebar';
 import { findTfvcWorkspaceRoot, getCommandCwd } from './tfvcContext';
+import { openServerVersionDiff } from './versionedFiles';
 
 export interface ArmTfsExtensionApi {
   client: ArmTfsCliClient;
@@ -57,6 +60,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     await scm.initialize();
     await sidebar.initialize();
     uiInitialized = true;
+    await maybeRunGuiSmoke(client, historyBrowser, output);
   })();
 
   context.subscriptions.push(
@@ -199,8 +203,10 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
       return;
     }
 
+    const version = readNumberOption(input, 'version');
+
     const result = await runAndShowText('arm-tfs checkout server path', output, async () =>
-      checkoutServerPathToLocalFolder(client, serverPath, localPath),
+      checkoutServerPathToLocalFolder(client, serverPath, localPath, { version }),
     );
     await refreshUi();
     return result;
@@ -364,17 +370,23 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
       return;
     }
 
-    const top = readNumberOption(input, 'top') ?? await promptNumber('History depth', '20');
-    if (top === undefined) {
-      return;
+    if (isServerPath(targetPath)) {
+      await historyBrowser.open(targetPath);
+      return undefined;
     }
 
-    return runAndShow('arm-tfs history', output, async () => {
-      if (isServerPath(targetPath)) {
-        return client.history(targetPath, top);
+    return withLocalWorkspace(targetPath, async (localContext) => {
+      const status = await client.status(targetPath, false, { cwdOverride: localContext.commandCwd });
+      const serverPath = status.items.find((item) => item.localPath === targetPath)?.serverPath
+        ?? status.workspace.mappings
+          .filter((mapping) => targetPath === mapping.localPath || targetPath.startsWith(`${mapping.localPath}${pathSeparator()}`))
+          .sort((left, right) => right.localPath.length - left.localPath.length)
+          .map((mapping) => remapLocalToServer(targetPath, mapping.localPath, mapping.serverPath))[0];
+      if (!serverPath) {
+        throw new Error(`Unable to resolve TFVC server path for ${targetPath}`);
       }
-
-      return withLocalWorkspace(targetPath, (localContext) => client.history(targetPath, top, undefined, { cwdOverride: localContext.commandCwd }));
+      await historyBrowser.open(serverPath);
+      return undefined;
     });
   });
 
@@ -382,6 +394,11 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     const targetPath = readStringOption(input, 'path') ?? await promptPath('Diff path', getActivePath());
     if (!targetPath) {
       return;
+    }
+
+    if (!isServerPath(targetPath)) {
+      await scm.openDiff(vscode.Uri.file(targetPath));
+      return undefined;
     }
 
     const compareMode = readStringOption(input, 'compareMode') ?? (await vscode.window.showQuickPick(
@@ -801,4 +818,65 @@ async function withLocalWorkspace<T>(targetPath: string | undefined, runner: (lo
 
 function isServerPath(targetPath: string): boolean {
   return targetPath.startsWith('$/');
+}
+
+function remapLocalToServer(targetPath: string, localRoot: string, serverRoot: string): string {
+  if (targetPath === localRoot) {
+    return serverRoot;
+  }
+
+  const relativePath = path.relative(localRoot, targetPath).split(path.sep).join('/');
+  return `${serverRoot.replace(/\/+$/, '')}/${relativePath.replace(/^\/+/, '')}`;
+}
+
+function pathSeparator(): string {
+  return path.sep;
+}
+
+interface GuiSmokeScenario {
+  historyPath?: string;
+  initialChangesetId?: number;
+  diff?: {
+    fromPath: string;
+    toPath?: string;
+    fromVersion: number;
+    toVersion: number;
+    title?: string;
+  };
+}
+
+async function maybeRunGuiSmoke(
+  client: ArmTfsCliClient,
+  historyBrowser: ArmTfsHistoryBrowser,
+  output: vscode.OutputChannel,
+): Promise<void> {
+  const raw = process.env.ARM_TFS_GUI_SMOKE
+    ?? (existsSync('/tmp/arm-tfs-gui-smoke.json') ? readFileSync('/tmp/arm-tfs-gui-smoke.json', 'utf8') : undefined);
+  if (!raw) {
+    return;
+  }
+
+  try {
+    const scenario = JSON.parse(raw) as GuiSmokeScenario;
+    if (scenario.historyPath) {
+      await historyBrowser.open(scenario.historyPath, scenario.initialChangesetId);
+    }
+    if (scenario.diff) {
+      await openServerVersionDiff(
+        client,
+        {
+          serverPath: scenario.diff.fromPath,
+          version: scenario.diff.fromVersion,
+        },
+        {
+          serverPath: scenario.diff.toPath ?? scenario.diff.fromPath,
+          version: scenario.diff.toVersion,
+        },
+        scenario.diff.title,
+      );
+    }
+    output.appendLine('arm-tfs GUI smoke scenario executed.');
+  } catch (error) {
+    output.appendLine(`arm-tfs GUI smoke failed: ${error instanceof Error ? error.message : `${error}`}`);
+  }
 }

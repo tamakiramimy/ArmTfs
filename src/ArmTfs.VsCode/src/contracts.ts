@@ -8,6 +8,19 @@ export interface IdentityRef {
   uniqueName?: string;
 }
 
+export interface ItemContentResponse extends JsonEnvelope {
+  command: 'items.cat';
+  item: {
+    serverPath: string;
+    changesetId?: number;
+    size: number;
+    isBinary: boolean;
+    encoding?: string | null;
+    contentBase64: string;
+    text?: string | null;
+  };
+}
+
 export interface WorkspaceMapping {
   serverPath: string;
   localPath: string;

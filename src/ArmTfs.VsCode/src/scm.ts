@@ -3,9 +3,10 @@ import { existsSync } from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { ArmTfsCliClient, ArmTfsCliError } from './armTfsCliClient';
-import type { DiffResponse, StatusItem } from './contracts';
+import type { StatusItem } from './contracts';
 import { t } from './i18n';
 import { findTfvcWorkspaceRoot, findTfvcWorkspaceRootSync, getCommandCwd } from './tfvcContext';
+import { openLocalWorkingDiff } from './versionedFiles';
 
 export class ArmTfsResourceState implements vscode.SourceControlResourceState {
   readonly resourceUri: vscode.Uri;
@@ -197,15 +198,25 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
         return;
       }
 
-      const diff = await vscode.window.withProgress(
+      const version = shouldUseBase(item)
+        ? item?.baselineChangesetId ?? item?.trackedChangesetId
+        : undefined;
+
+      await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.SourceControl,
           title: `arm-tfs diff ${path.basename(targetPath)}`,
         },
-        () => this.client.diff(targetPath, { useBase: shouldUseBase(item) }, { cwdOverride: getCommandCwd(workspaceRoot, targetPath) }),
+        () => openLocalWorkingDiff(
+          this.client,
+          targetPath,
+          item?.serverPath ?? targetPath,
+          {
+            version,
+            title: `${path.basename(targetPath)} (${version ? `cs${version}` : 'server'}) ↔ ${path.basename(targetPath)} (working tree)`,
+          },
+        ),
       );
-
-      await this.showDiffResult(targetPath, diff);
     } catch (error) {
       this.showError('arm-tfs diff', error);
     }
@@ -301,16 +312,6 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
       return undefined;
     }
   }
-
-  private async showDiffResult(targetPath: string, diff: DiffResponse): Promise<void> {
-    const content = buildDiffDocument(targetPath, diff);
-    const document = await vscode.workspace.openTextDocument({
-      language: diff.result.kind === 'text' ? 'diff' : 'text',
-      content,
-    });
-    await vscode.window.showTextDocument(document, { preview: false });
-  }
-
   private showError(title: string, error: unknown): void {
     this.output.show(true);
     if (error instanceof ArmTfsCliError) {
@@ -360,24 +361,6 @@ function resolveResourcePath(resource: ArmTfsResourceState | vscode.Uri | undefi
 
 function shouldUseBase(item: StatusItem | undefined): boolean {
   return item?.baselineChangesetId !== undefined || item?.trackedChangesetId !== undefined || item?.state === 'modifiedNotCheckedOut';
-}
-
-function buildDiffDocument(targetPath: string, diff: DiffResponse): string {
-  if (diff.result.kind === 'none') {
-    return `${targetPath}\n\nNo differences found against the selected TFVC base.`;
-  }
-
-  if (diff.result.kind === 'binary') {
-    return [
-      targetPath,
-      '',
-      'Binary files differ.',
-      `Local size: ${diff.result.localSize} byte(s)`,
-      `Server size: ${diff.result.serverSize} byte(s)`,
-    ].join('\n');
-  }
-
-  return diff.result.patch?.trim() || `${targetPath}\n\nNo textual differences were returned.`;
 }
 
 function buildTooltip(item: StatusItem): string {
