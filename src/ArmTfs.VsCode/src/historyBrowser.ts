@@ -499,8 +499,8 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       <strong>${escapeHtml(labels.title)}</strong>
       <span id="pathLabel"></span>
     </div>
-    <button id="compare" disabled>${escapeHtml(labels.compare)}</button>
-    <button id="reload" class="secondary">${escapeHtml(labels.refresh)}</button>
+    <button id="compare" class="action-btn compact" title="${escapeHtml(labels.compare)}" disabled></button>
+    <button id="reload" class="action-btn compact secondary" title="${escapeHtml(labels.refresh)}"></button>
   </header>
   <main class="layout">
     <section class="master">
@@ -543,6 +543,9 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       fileHistorySelected: [],
       selectedFilePath: null,
     };
+
+    setButtonMarkup(compareButton, '⇄', labels.compareShort);
+    setButtonMarkup(document.getElementById('reload'), '↻', labels.refreshShort);
 
     document.getElementById('reload').addEventListener('click', () => vscode.postMessage({ type: 'reload' }));
     compareButton.addEventListener('click', () => {
@@ -644,7 +647,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
         <div class="card">
           <div class="card-header">
             <span>\${labels.detail} · cs\${message.changeset.changesetId}</span>
-            <button data-role="get-snapshot">\${labels.getSnapshot}</button>
+            <button data-role="get-snapshot" class="action-btn compact" title="\${escape(labels.getSnapshot)}"></button>
           </div>
           <div class="card-body">
             <div><strong>\${escape(message.changeset.comment || '')}</strong></div>
@@ -665,6 +668,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       detailWrap.querySelector('[data-role="get-snapshot"]').addEventListener('click', () => {
         vscode.postMessage({ type: 'checkoutChangeset', changesetId: message.changeset.changesetId });
       });
+      setButtonMarkup(detailWrap.querySelector('[data-role="get-snapshot"]'), '↓', labels.getSnapshotShort);
       renderTreeInto(detailWrap.querySelector('#fileTree'), filesTree, 'changeset', message.changeset.changesetId);
       updateFileToolbar('changeset', message.changeset.changesetId);
     }
@@ -712,7 +716,8 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
           <div class="card-header">
             <span>\${labels.fileHistory}</span>
             <div class="toolbar">
-              <button id="compareFileVersions" disabled>\${labels.compareVersions}</button>
+              <button id="viewFileVersion" class="action-btn compact" title="\${escape(labels.viewCurrent)}" disabled></button>
+              <button id="compareFileVersions" class="action-btn compact" title="\${escape(labels.compareVersions)}" disabled></button>
             </div>
           </div>
           <div class="card-body">
@@ -741,7 +746,10 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
           </table>
         </div>\`;
 
+      const viewFileVersion = detailWrap.querySelector('#viewFileVersion');
       const compareFileVersions = detailWrap.querySelector('#compareFileVersions');
+      setButtonMarkup(viewFileVersion, '◨', labels.viewCurrentShort);
+      setButtonMarkup(compareFileVersions, '⇄', labels.compareVersionsShort);
       const rows = detailWrap.querySelectorAll('#fileHistoryBody tr');
       rows.forEach(row => {
         const changesetId = Number(row.dataset.id);
@@ -764,12 +772,22 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
             refreshFileHistorySelection();
           }
           showContextMenu(event.clientX, event.clientY, [
+            { label: labels.contextViewCurrent, run: () => vscode.postMessage({ type: 'viewCurrentVersion', serverPath: message.serverPath, changesetId }) },
             { label: labels.contextDiff, run: () => vscode.postMessage({ type: 'diffPrevious', serverPath: message.serverPath, changesetId }) },
             { label: labels.contextPair, disabled: selected.length !== 2, run: () => vscode.postMessage({ type: 'compareFileVersions', serverPath: message.serverPath, changesetIds: selected }) },
           ]);
         });
       });
 
+      viewFileVersion.addEventListener('click', () => {
+        if (state.fileHistorySelected.length === 1) {
+          vscode.postMessage({
+            type: 'viewCurrentVersion',
+            serverPath: message.serverPath,
+            changesetId: state.fileHistorySelected[0],
+          });
+        }
+      });
       compareFileVersions.addEventListener('click', () => {
         if (state.fileHistorySelected.length === 2) {
           vscode.postMessage({ type: 'compareFileVersions', serverPath: message.serverPath, changesetIds: [...state.fileHistorySelected] });
@@ -795,8 +813,12 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
         row.classList.toggle('multi', state.fileHistorySelected.includes(changesetId) && !(state.fileHistorySelected.length === 1 && state.fileHistorySelected[0] === changesetId));
       });
       const compareFileVersions = detailWrap.querySelector('#compareFileVersions');
+      const viewFileVersion = detailWrap.querySelector('#viewFileVersion');
       if (compareFileVersions) {
         compareFileVersions.disabled = state.fileHistorySelected.length !== 2;
+      }
+      if (viewFileVersion) {
+        viewFileVersion.disabled = state.fileHistorySelected.length !== 1;
       }
     }
 
@@ -896,12 +918,14 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
         updateFileToolbar(mode, payload, node.entry);
         if (mode === 'changeset') {
           showContextMenu(event.clientX, event.clientY, [
+            { label: labels.contextViewCurrent, run: () => vscode.postMessage({ type: 'viewCurrentVersion', serverPath: node.entry.path, changesetId: payload }) },
             { label: labels.contextDiff, run: () => vscode.postMessage({ type: 'diffPrevious', serverPath: node.entry.path, changesetId: payload }) },
             { label: labels.contextHistory, run: () => vscode.postMessage({ type: 'fileHistory', serverPath: node.entry.path }) },
           ]);
           return;
         }
         showContextMenu(event.clientX, event.clientY, [
+          { label: labels.contextViewCurrent, run: () => vscode.postMessage({ type: 'viewCurrentVersion', serverPath: node.entry.toPath || node.entry.fromPath, changesetId: payload.to.changesetId }) },
           { label: labels.contextPair, run: () => vscode.postMessage({ type: 'compareFilePair', fromPath: node.entry.fromPath, toPath: node.entry.toPath, fromVersion: payload.from.changesetId, toVersion: payload.to.changesetId }) },
           { label: labels.contextHistory, run: () => vscode.postMessage({ type: 'fileHistory', serverPath: node.entry.toPath || node.entry.fromPath }) },
         ]);
@@ -931,8 +955,15 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       }
       if (mode === 'changeset') {
         toolbar.innerHTML = \`
-          <button data-role="diffPrevious">\${labels.previous}</button>
-          <button data-role="fileHistory" class="secondary">\${labels.fileHistory}</button>\`;
+          <button data-role="viewCurrent" class="action-btn compact" title="\${escape(labels.viewCurrent)}"></button>
+          <button data-role="diffPrevious" class="action-btn compact" title="\${escape(labels.previous)}"></button>
+          <button data-role="fileHistory" class="action-btn compact secondary" title="\${escape(labels.fileHistory)}"></button>\`;
+        setButtonMarkup(toolbar.querySelector('[data-role="viewCurrent"]'), '◨', labels.viewCurrentShort);
+        setButtonMarkup(toolbar.querySelector('[data-role="diffPrevious"]'), '≶', labels.previousShort);
+        setButtonMarkup(toolbar.querySelector('[data-role="fileHistory"]'), '🕘', labels.fileHistoryShort);
+        toolbar.querySelector('[data-role="viewCurrent"]').addEventListener('click', () => {
+          vscode.postMessage({ type: 'viewCurrentVersion', serverPath: selectedEntry.path, changesetId: payload });
+        });
         toolbar.querySelector('[data-role="diffPrevious"]').addEventListener('click', () => {
           vscode.postMessage({ type: 'diffPrevious', serverPath: selectedEntry.path, changesetId: payload });
         });
@@ -943,8 +974,19 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       }
 
       toolbar.innerHTML = \`
-        <button data-role="comparePair">\${labels.compareVersions}</button>
-        <button data-role="fileHistory" class="secondary">\${labels.fileHistory}</button>\`;
+        <button data-role="viewCurrent" class="action-btn compact" title="\${escape(labels.viewCurrent)}"></button>
+        <button data-role="comparePair" class="action-btn compact" title="\${escape(labels.compareVersions)}"></button>
+        <button data-role="fileHistory" class="action-btn compact secondary" title="\${escape(labels.fileHistory)}"></button>\`;
+      setButtonMarkup(toolbar.querySelector('[data-role="viewCurrent"]'), '◨', labels.viewCurrentShort);
+      setButtonMarkup(toolbar.querySelector('[data-role="comparePair"]'), '⇄', labels.compareVersionsShort);
+      setButtonMarkup(toolbar.querySelector('[data-role="fileHistory"]'), '🕘', labels.fileHistoryShort);
+      toolbar.querySelector('[data-role="viewCurrent"]').addEventListener('click', () => {
+        vscode.postMessage({
+          type: 'viewCurrentVersion',
+          serverPath: selectedEntry.toPath || selectedEntry.fromPath,
+          changesetId: payload.to.changesetId,
+        });
+      });
       toolbar.querySelector('[data-role="comparePair"]').addEventListener('click', () => {
         vscode.postMessage({
           type: 'compareFilePair',
@@ -1000,6 +1042,13 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
     function hideContextMenu() {
       contextMenu.style.display = 'none';
       contextMenu.innerHTML = '';
+    }
+
+    function setButtonMarkup(button, icon, label) {
+      if (!button) {
+        return;
+      }
+      button.innerHTML = '<span class="action-icon">' + escape(icon) + '</span><span>' + escape(label) + '</span>';
     }
 
     window.addEventListener('message', event => {
