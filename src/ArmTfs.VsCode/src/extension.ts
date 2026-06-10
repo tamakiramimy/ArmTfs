@@ -1,5 +1,7 @@
 import * as path from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
+import * as os from 'node:os';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import * as vscode from 'vscode';
 import { ArmTfsCliClient, ArmTfsCliError } from './armTfsCliClient';
 import { ArmTfsConnectionsController } from './connections';
@@ -54,6 +56,18 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     await sidebar.refreshAll();
   };
 
+  const refreshLanguageUi = async () => {
+    scm.refreshLabels();
+    connections.refreshLabels();
+    serverExplorer.refreshLabels();
+    sidebar.refreshLabels();
+    await connections.refreshCliDescription();
+    connections.refresh();
+    serverExplorer.refresh();
+    await historyBrowser.refreshLanguage();
+    await refreshUi();
+  };
+
   context.subscriptions.push(output, historyBrowser, scm, sidebar, serverExplorer, connections, vscode.window.registerFileDecorationProvider(scm));
   void (async () => {
     await connections.initialize();
@@ -91,8 +105,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration('armTfs.ui.language')) {
-        scm.refreshLabels();
-        void refreshUi();
+        void refreshLanguageUi();
       }
     }),
   );
@@ -115,7 +128,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
       canSelectFiles: true,
       canSelectFolders: false,
       canSelectMany: false,
-      openLabel: 'Select arm-tfs executable or DLL',
+      openLabel: t('extension.prompt.selectCli'),
     });
     if (!picked?.length) {
       return;
@@ -155,8 +168,25 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
 
     const target = vscode.workspace.workspaceFolders?.length ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
     await vscode.workspace.getConfiguration('armTfs').update('ui.language', selected.value, target);
-    scm.refreshLabels();
-    await refreshUi();
+    await refreshLanguageUi();
+
+    const localeResult = await syncVsCodeDisplayLanguage(selected.value, output);
+    if (localeResult.requiresRestart) {
+      const action = await vscode.window.showInformationMessage(
+        t('language.changed.reload', { language: selected.label }),
+        { modal: false },
+        t('language.reloadNow'),
+        t('language.reloadLater'),
+      );
+      if (action === t('language.reloadNow')) {
+        const restarted = await restartVsCodeNow(output);
+        if (!restarted) {
+          void vscode.window.showInformationMessage(t('language.restartManual'));
+        }
+      }
+      return;
+    }
+
     void vscode.window.showInformationMessage(t('language.changed', { language: selected.label }));
   });
 
@@ -170,42 +200,42 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
 
   register('armTfs.createWorkspace', async (input) => {
     const workspaceRoot = getWorkspaceRoot() ?? '.';
-    const name = readStringOption(input, 'name') ?? await promptPath('Workspace name', 'ArmTfsWorkspace');
+    const name = readStringOption(input, 'name') ?? await promptPath(t('extension.prompt.workspaceName'), 'ArmTfsWorkspace');
     if (!name) {
       return;
     }
 
-    const serverPath = readStringOption(input, 'serverPath') ?? await promptPath('Server path', '$/');
+    const serverPath = readStringOption(input, 'serverPath') ?? await promptPath(t('extension.prompt.serverPath'), '$/');
     if (!serverPath) {
       return;
     }
 
-    const directory = readStringOption(input, 'directory') ?? await promptPath('Workspace root directory', workspaceRoot);
+    const directory = readStringOption(input, 'directory') ?? await promptPath(t('extension.prompt.workspaceRootDirectory'), workspaceRoot);
     if (!directory) {
       return;
     }
 
-    const localPath = readStringOption(input, 'localPath') ?? await promptOptionalPath('Mapped local path (optional)', directory);
+    const localPath = readStringOption(input, 'localPath') ?? await promptOptionalPath(t('extension.prompt.mappedLocalPath'), directory);
 
-    const result = await runAndShowText('arm-tfs workspace new', output, async () => client.workspaceNew(name, serverPath, directory, localPath));
+    const result = await runAndShowText(t('extension.operation.workspaceNew'), output, async () => client.workspaceNew(name, serverPath, directory, localPath));
     await refreshUi();
     return result;
   });
 
   register('armTfs.checkoutServerPathToFolder', async (input) => {
-    const serverPath = readServerPathOption(input) ?? await promptServerPath('TFVC server path', '$/');
+    const serverPath = readServerPathOption(input) ?? await promptServerPath(t('extension.prompt.tfvcServerPath'), '$/');
     if (!serverPath) {
       return;
     }
 
-    const localPath = readStringOption(input, 'localPath') ?? readStringOption(input, 'directory') ?? await promptLocalFolder('Checkout destination folder', getWorkspaceRoot());
+    const localPath = readStringOption(input, 'localPath') ?? readStringOption(input, 'directory') ?? await promptLocalFolder(t('extension.prompt.checkoutDestination'), getWorkspaceRoot());
     if (!localPath) {
       return;
     }
 
     const version = readNumberOption(input, 'version');
 
-    const result = await runAndShowText('arm-tfs checkout server path', output, async () =>
+    const result = await runAndShowText(t('extension.operation.checkoutServerPath'), output, async () =>
       checkoutServerPathToLocalFolder(client, serverPath, localPath, { version }),
     );
     await refreshUi();
@@ -218,45 +248,45 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
       return undefined;
     }
 
-    return runAndShowText('arm-tfs workspace show', output, async () => client.workspaceShow({ cwdOverride: localContext.workspaceRoot }));
+    return runAndShowText(t('extension.operation.workspaceShow'), output, async () => client.workspaceShow({ cwdOverride: localContext.workspaceRoot }));
   });
 
   register('armTfs.addWorkspaceMapping', async (input) => {
-    const serverPath = readStringOption(input, 'serverPath') ?? await promptPath('Additional server path', '$/');
+    const serverPath = readStringOption(input, 'serverPath') ?? await promptPath(t('extension.prompt.additionalServerPath'), '$/');
     if (!serverPath) {
       return;
     }
 
     const workspaceRoot = getWorkspaceRoot() ?? '.';
-    const localPath = readStringOption(input, 'localPath') ?? await promptPath('Local path', workspaceRoot);
+    const localPath = readStringOption(input, 'localPath') ?? await promptPath(t('extension.prompt.localPath'), workspaceRoot);
     if (!localPath) {
       return;
     }
 
-    const result = await runAndShowText('arm-tfs workspace map', output, async () => client.workspaceMap(serverPath, localPath));
+    const result = await runAndShowText(t('extension.operation.workspaceMap'), output, async () => client.workspaceMap(serverPath, localPath));
     await refreshUi();
     return result;
   });
 
   register('armTfs.runGet', async (input) => {
-    const targetPath = readStringOption(input, 'path') ?? await promptPath('Get path', getActivePath() ?? '.');
+    const targetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.getPath'), getActivePath() ?? '.');
     if (!targetPath) {
       return;
     }
 
     const mode = readStringOption(input, 'mode') ?? (await vscode.window.showQuickPick(
       [
-        { label: 'Latest', description: 'Download latest server version', value: 'latest' },
-        { label: 'Force latest', description: 'Overwrite even if tracked version matches', value: 'force' },
-        { label: 'Dry run', description: 'Preview downloads without writing files', value: 'dryRun' },
+        { label: t('extension.getMode.latest'), description: t('extension.getMode.latest.desc'), value: 'latest' },
+        { label: t('extension.getMode.force'), description: t('extension.getMode.force.desc'), value: 'force' },
+        { label: t('extension.getMode.dryRun'), description: t('extension.getMode.dryRun.desc'), value: 'dryRun' },
       ],
-      { placeHolder: 'Choose get mode' },
+      { placeHolder: t('extension.getMode.placeholder') },
     ))?.value;
     if (!mode) {
       return;
     }
 
-    const result = await runAndShowText('arm-tfs get', output, async () =>
+    const result = await runAndShowText(t('extension.operation.get'), output, async () =>
       withLocalWorkspace(targetPath, (localContext) => client.get(targetPath, {
         version: readNumberOption(input, 'version'),
         force: mode === 'force',
@@ -268,17 +298,17 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   });
 
   register('armTfs.checkout', async (input) => {
-    const targetPath = readStringOption(input, 'path') ?? await promptPath('Checkout path', getActivePath() ?? '.');
+    const targetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.checkoutPath'), getActivePath() ?? '.');
     if (!targetPath) {
       return;
     }
 
-    const recursive = readBooleanOption(input, 'recursive') ?? await promptBoolean('Include subfiles recursively?', false);
+    const recursive = readBooleanOption(input, 'recursive') ?? await promptBoolean(t('extension.prompt.includeSubfiles'), false);
     if (recursive === undefined) {
       return;
     }
 
-    const result = await runAndShowText('arm-tfs checkout', output, async () =>
+    const result = await runAndShowText(t('extension.operation.checkout'), output, async () =>
       withLocalWorkspace(targetPath, (localContext) => client.checkout([targetPath], recursive, { cwdOverride: localContext.commandCwd })),
     );
     await refreshUi();
@@ -286,17 +316,17 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   });
 
   register('armTfs.add', async (input) => {
-    const targetPath = readStringOption(input, 'path') ?? await promptPath('Add path', getActivePath() ?? '.');
+    const targetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.addPath'), getActivePath() ?? '.');
     if (!targetPath) {
       return;
     }
 
-    const recursive = readBooleanOption(input, 'recursive') ?? await promptBoolean('Include subfiles recursively?', false);
+    const recursive = readBooleanOption(input, 'recursive') ?? await promptBoolean(t('extension.prompt.includeSubfiles'), false);
     if (recursive === undefined) {
       return;
     }
 
-    const result = await runAndShowText('arm-tfs add', output, async () =>
+    const result = await runAndShowText(t('extension.operation.add'), output, async () =>
       withLocalWorkspace(targetPath, (localContext) => client.add([targetPath], recursive, { cwdOverride: localContext.commandCwd })),
     );
     await refreshUi();
@@ -304,17 +334,17 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   });
 
   register('armTfs.undo', async (input) => {
-    const targetPath = readStringOption(input, 'path') ?? await promptPath('Undo path', getActivePath() ?? '.');
+    const targetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.undoPath'), getActivePath() ?? '.');
     if (!targetPath) {
       return;
     }
 
-    const noRestore = readBooleanOption(input, 'noRestore') ?? await promptBoolean('Only remove pending state without restoring file content?', false);
+    const noRestore = readBooleanOption(input, 'noRestore') ?? await promptBoolean(t('extension.prompt.undoNoRestore'), false);
     if (noRestore === undefined) {
       return;
     }
 
-    const result = await runAndShowText('arm-tfs undo', output, async () =>
+    const result = await runAndShowText(t('extension.operation.undo'), output, async () =>
       withLocalWorkspace(targetPath, (localContext) => client.undo([targetPath], noRestore, { cwdOverride: localContext.commandCwd })),
     );
     await refreshUi();
@@ -322,29 +352,29 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   });
 
   register('armTfs.checkin', async (input) => {
-    const comment = readStringOption(input, 'comment') ?? await promptPath('Checkin comment', '');
+    const comment = readStringOption(input, 'comment') ?? await promptPath(t('extension.prompt.checkinComment'), '');
     if (!comment) {
       return;
     }
 
-    const targetPath = readStringOption(input, 'path') ?? await promptPath('Checkin path', '.');
+    const targetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.checkinPath'), '.');
     if (!targetPath) {
       return;
     }
 
     const mode = readStringOption(input, 'mode') ?? (await vscode.window.showQuickPick(
       [
-        { label: 'Submit and clear pending', value: 'submit' },
-        { label: 'Dry run', value: 'dryRun' },
-        { label: 'Submit but keep pending', value: 'keepPending' },
+        { label: t('extension.checkinMode.submit'), value: 'submit' },
+        { label: t('extension.checkinMode.dryRun'), value: 'dryRun' },
+        { label: t('extension.checkinMode.keepPending'), value: 'keepPending' },
       ],
-      { placeHolder: 'Choose checkin mode' },
+      { placeHolder: t('extension.checkinMode.placeholder') },
     ))?.value;
     if (!mode) {
       return;
     }
 
-    const result = await runAndShowText('arm-tfs checkin', output, async () =>
+    const result = await runAndShowText(t('extension.operation.checkin'), output, async () =>
       withLocalWorkspace(targetPath, (localContext) =>
         client.checkin(comment, [targetPath], mode === 'keepPending', mode === 'dryRun', { cwdOverride: localContext.commandCwd })),
     );
@@ -359,13 +389,13 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
       return undefined;
     }
 
-    return runAndShow('arm-tfs status', output, async () =>
+    return runAndShow(t('extension.operation.status'), output, async () =>
       client.status(targetPath, readBooleanOption(input, 'all') ?? true, { cwdOverride: localContext.commandCwd }),
     );
   });
 
   register('armTfs.showHistory', async (input) => {
-    const targetPath = readStringOption(input, 'path') ?? await promptPath('History path', getActivePath() ?? '.');
+    const targetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.historyPath'), getActivePath() ?? '.');
     if (!targetPath) {
       return;
     }
@@ -383,7 +413,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
           .sort((left, right) => right.localPath.length - left.localPath.length)
           .map((mapping) => remapLocalToServer(targetPath, mapping.localPath, mapping.serverPath))[0];
       if (!serverPath) {
-        throw new Error(`Unable to resolve TFVC server path for ${targetPath}`);
+        throw new Error(t('extension.error.resolveServerPath', { path: targetPath }));
       }
       await historyBrowser.open(serverPath);
       return undefined;
@@ -391,7 +421,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   });
 
   register('armTfs.showDiff', async (input) => {
-    const targetPath = readStringOption(input, 'path') ?? await promptPath('Diff path', getActivePath());
+    const targetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.diffPath'), getActivePath());
     if (!targetPath) {
       return;
     }
@@ -403,45 +433,45 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
 
     const compareMode = readStringOption(input, 'compareMode') ?? (await vscode.window.showQuickPick(
       [
-        { label: 'Latest server version', value: 'latest' },
-        { label: 'Tracked base version', value: 'base' },
+        { label: t('extension.diffBase.latest'), value: 'latest' },
+        { label: t('extension.diffBase.base'), value: 'base' },
       ],
-      { placeHolder: 'Choose a diff base' },
+      { placeHolder: t('extension.diffBase.placeholder') },
     ))?.value;
     if (!compareMode) {
       return;
     }
 
-    return runAndShow('arm-tfs diff', output, async () =>
+    return runAndShow(t('extension.operation.diff'), output, async () =>
       withLocalWorkspace(targetPath, (localContext) => client.diff(targetPath, { useBase: compareMode === 'base' }, { cwdOverride: localContext.commandCwd })),
     );
   });
 
   register('armTfs.showBranch', async (input) => {
-    const branchPath = readStringOption(input, 'path') ?? await promptPath('Branch path', '$/');
+    const branchPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.branchPath'), '$/');
     if (!branchPath) {
       return;
     }
 
-    return runAndShow('arm-tfs branch', output, async () => client.branchShow(branchPath));
+    return runAndShow(t('extension.operation.branch'), output, async () => client.branchShow(branchPath));
   });
 
   register('armTfs.showChangeset', async (input) => {
-    const changesetId = readNumberOption(input, 'changesetId') ?? await promptNumber('Changeset ID', '1');
+    const changesetId = readNumberOption(input, 'changesetId') ?? await promptNumber(t('extension.prompt.changesetId'), '1');
     if (changesetId === undefined) {
       return;
     }
 
-    return runAndShow('arm-tfs changeset', output, async () => client.changesetShow(changesetId));
+    return runAndShow(t('extension.operation.changeset'), output, async () => client.changesetShow(changesetId));
   });
 
   register('armTfs.showLabel', async (input) => {
-    const labelId = readStringOption(input, 'labelId') ?? await promptPath('Label ID', '');
+    const labelId = readStringOption(input, 'labelId') ?? await promptPath(t('extension.prompt.labelId'), '');
     if (!labelId) {
       return;
     }
 
-    return runAndShow('arm-tfs label', output, async () => client.labelShow(labelId));
+    return runAndShow(t('extension.operation.label'), output, async () => client.labelShow(labelId));
   });
 
   register('armTfs.showMergeBase', async (input) => {
@@ -455,7 +485,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
       return;
     }
 
-    return runAndShow('arm-tfs merge base', output, async () => client.mergeBase(sourcePath, targetPath));
+    return runAndShow(t('extension.operation.mergeBase'), output, async () => client.mergeBase(sourcePath, targetPath));
   });
 
   register('armTfs.showMergeCandidates', async (input) => {
@@ -469,12 +499,12 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
       return;
     }
 
-    const top = readNumberOption(input, 'top') ?? await promptNumber('Candidate result count', '20');
+    const top = readNumberOption(input, 'top') ?? await promptNumber(t('extension.prompt.candidateResultCount'), '20');
     if (top === undefined) {
       return;
     }
 
-    return runAndShow('arm-tfs merge candidates', output, async () =>
+    return runAndShow(t('extension.operation.mergeCandidates'), output, async () =>
       client.mergeCandidates(sourcePath, targetPath, top, readNumberOption(input, 'scan') ?? 80),
     );
   });
@@ -598,7 +628,7 @@ async function promptServerPath(prompt: string, value?: string): Promise<string 
     value,
     ignoreFocusOut: true,
     validateInput(input) {
-      return input.trim().startsWith('$/') ? undefined : 'Enter a TFVC server path starting with $/.';
+      return input.trim().startsWith('$/') ? undefined : t('extension.validate.serverPath');
     },
   });
 
@@ -609,19 +639,19 @@ async function promptLocalFolder(prompt: string, defaultPath?: string): Promise<
   const choices: Array<{ label: string; description?: string; value: 'workspace' | 'browse' | 'manual' }> = [];
   if (defaultPath) {
     choices.push({
-      label: 'Use current workspace folder',
+      label: t('extension.localFolder.useWorkspace'),
       description: defaultPath,
       value: 'workspace',
     });
   }
   choices.push({
-    label: 'Browse for folder...',
-    description: 'Pick an existing local folder',
+    label: t('extension.localFolder.browse'),
+    description: t('extension.localFolder.browse.desc'),
     value: 'browse',
   });
   choices.push({
-    label: 'Enter path manually...',
-    description: 'Create or reuse any local folder path',
+    label: t('extension.localFolder.manual'),
+    description: t('extension.localFolder.manual.desc'),
     value: 'manual',
   });
 
@@ -642,13 +672,13 @@ async function promptLocalFolder(prompt: string, defaultPath?: string): Promise<
       canSelectFiles: false,
       canSelectFolders: true,
       canSelectMany: false,
-      openLabel: 'Use as checkout destination',
+      openLabel: t('extension.localFolder.openLabel'),
       defaultUri: defaultPath ? vscode.Uri.file(defaultPath) : undefined,
     });
     return selected?.[0]?.fsPath;
   }
 
-  return promptPath('Local folder path', defaultPath);
+  return promptPath(t('extension.prompt.localFolderPath'), defaultPath);
 }
 
 async function promptNumber(prompt: string, value: string): Promise<number | undefined> {
@@ -657,7 +687,7 @@ async function promptNumber(prompt: string, value: string): Promise<number | und
     value,
     ignoreFocusOut: true,
     validateInput(input) {
-      return /^\d+$/.test(input) ? undefined : 'Enter a non-negative integer.';
+      return /^\d+$/.test(input) ? undefined : t('extension.validate.nonNegativeInteger');
     },
   });
   if (raw === undefined) {
@@ -670,8 +700,8 @@ async function promptNumber(prompt: string, value: string): Promise<number | und
 async function promptBoolean(prompt: string, defaultValue: boolean): Promise<boolean | undefined> {
   const selected = await vscode.window.showQuickPick(
     [
-      { label: defaultValue ? 'Yes' : 'No', value: defaultValue },
-      { label: defaultValue ? 'No' : 'Yes', value: !defaultValue },
+      { label: defaultValue ? t('extension.boolean.yes') : t('extension.boolean.no'), value: defaultValue },
+      { label: defaultValue ? t('extension.boolean.no') : t('extension.boolean.yes'), value: !defaultValue },
     ],
     { placeHolder: prompt },
   );
@@ -879,4 +909,160 @@ async function maybeRunGuiSmoke(
   } catch (error) {
     output.appendLine(`arm-tfs GUI smoke failed: ${error instanceof Error ? error.message : `${error}`}`);
   }
+}
+
+interface LocaleSyncResult {
+  requiresRestart: boolean;
+}
+
+async function syncVsCodeDisplayLanguage(language: UiLanguage, output: vscode.OutputChannel): Promise<LocaleSyncResult> {
+  const desiredLocale = language === 'auto' ? undefined : normalizeVsCodeLocale(language);
+  const argvPath = getVsCodeArgvFilePath();
+  const argvData = readVsCodeArgv(argvPath);
+  const currentLocale = typeof argvData.locale === 'string' ? argvData.locale.toLowerCase() : undefined;
+  const nextLocale = desiredLocale?.toLowerCase();
+
+  if (currentLocale === nextLocale) {
+    return { requiresRestart: false };
+  }
+
+  try {
+    mkdirSync(path.dirname(argvPath), { recursive: true });
+    if (desiredLocale) {
+      argvData.locale = desiredLocale;
+    } else {
+      delete argvData.locale;
+    }
+    writeFileSync(argvPath, `${JSON.stringify(argvData, null, 2)}\n`, 'utf8');
+    cleanupLegacyLocaleFiles(output);
+    output.appendLine(
+      desiredLocale
+        ? `Updated VS Code runtime locale: ${desiredLocale} (${argvPath})`
+        : `Cleared VS Code runtime locale override (${argvPath})`,
+    );
+    return { requiresRestart: true };
+  } catch (error) {
+    output.appendLine(`Unable to update VS Code runtime args at ${argvPath}: ${error instanceof Error ? error.message : `${error}`}`);
+    return { requiresRestart: false };
+  }
+}
+
+function normalizeVsCodeLocale(language: Exclude<UiLanguage, 'auto'>): string {
+  return language.toLowerCase() === 'zh-cn' ? 'zh-cn' : 'en';
+}
+
+function readVsCodeArgv(argvPath: string): Record<string, unknown> {
+  if (!existsSync(argvPath)) {
+    return {};
+  }
+
+  try {
+    const raw = readFileSync(argvPath, 'utf8');
+    const json = raw
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '')
+      .trim();
+    if (!json) {
+      return {};
+    }
+
+    const parsed = JSON.parse(json);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? { ...(parsed as Record<string, unknown>) }
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function getVsCodeArgvFilePath(): string {
+  return path.join(os.homedir(), mapVsCodeArgvFolder(), 'argv.json');
+}
+
+function mapVsCodeArgvFolder(): string {
+  const appName = vscode.env.appName.toLowerCase();
+  if (appName.includes('insiders')) {
+    return '.vscode-insiders';
+  }
+  if (appName.includes('exploration')) {
+    return '.vscode-exploration';
+  }
+  if (appName.includes('vscodium')) {
+    return '.vscode-oss';
+  }
+  if (appName.includes('cursor')) {
+    return '.cursor';
+  }
+  return '.vscode';
+}
+
+function cleanupLegacyLocaleFiles(output: vscode.OutputChannel): void {
+  const legacyPaths = [
+    path.join(os.homedir(), 'Library', 'Application Support', 'Code', 'locale.json'),
+    path.join(os.homedir(), 'Library', 'Application Support', 'Code', 'User', 'locale.json'),
+  ];
+
+  for (const legacyPath of legacyPaths) {
+    try {
+      if (existsSync(legacyPath)) {
+        rmSync(legacyPath, { force: true });
+        output.appendLine(`Removed legacy locale override: ${legacyPath}`);
+      }
+    } catch (error) {
+      output.appendLine(`Unable to remove legacy locale override ${legacyPath}: ${error instanceof Error ? error.message : `${error}`}`);
+    }
+  }
+}
+
+async function restartVsCodeNow(output: vscode.OutputChannel): Promise<boolean> {
+  try {
+    if (process.platform === 'darwin') {
+      const command = `sleep 1; open -a ${shellQuote(vscode.env.appName)}`;
+      spawn('/bin/sh', ['-lc', command], { detached: true, stdio: 'ignore' }).unref();
+      await vscode.commands.executeCommand('workbench.action.quit');
+      return true;
+    }
+
+    if (process.platform === 'win32') {
+      const cliName = mapVsCodeCliName();
+      const command = `ping 127.0.0.1 -n 2 >NUL & start "" ${windowsQuote(cliName)}`;
+      spawn('cmd.exe', ['/c', command], { detached: true, stdio: 'ignore' }).unref();
+      await vscode.commands.executeCommand('workbench.action.quit');
+      return true;
+    }
+
+    const cliName = mapVsCodeCliName();
+    const command = `sleep 1; ${shellQuote(cliName)} >/dev/null 2>&1 &`;
+    spawn('/bin/sh', ['-lc', command], { detached: true, stdio: 'ignore' }).unref();
+    await vscode.commands.executeCommand('workbench.action.quit');
+    return true;
+  } catch (error) {
+    output.appendLine(`Unable to restart VS Code automatically: ${error instanceof Error ? error.message : `${error}`}`);
+    return false;
+  }
+}
+
+function mapVsCodeCliName(): string {
+  const appName = vscode.env.appName.toLowerCase();
+  if (appName.includes('insiders')) {
+    return 'code-insiders';
+  }
+  if (appName.includes('vscodium')) {
+    return 'codium';
+  }
+  if (appName.includes('cursor')) {
+    return 'cursor';
+  }
+  if (appName.includes('exploration')) {
+    return 'code-exploration';
+  }
+  return 'code';
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function windowsQuote(value: string): string {
+  return `"${value.replace(/"/g, '\\"')}"`;
 }

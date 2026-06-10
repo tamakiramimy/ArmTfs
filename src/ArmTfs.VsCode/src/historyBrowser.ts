@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { ArmTfsCliClient } from './armTfsCliClient';
 import type { ChangesetShowResponse, HistoryItem } from './contracts';
-import { getUiLanguage, translateCliMessage } from './i18n';
+import { getUiLanguage, t, translateChangeType, translateCliMessage } from './i18n';
 import { checkoutServerPathToLocalFolder } from './serverPathCheckout';
 import {
   openServerVersion,
@@ -69,11 +69,19 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
     this.targets = targets;
     this.initialChangesetId = initialChangesetId;
     const panel = this.ensurePanel();
-    panel.title = targets.length === 1
-      ? `TFVC History: ${targets[0].label}`
-      : `TFVC Compare: ${targets.map((target) => target.label).join(' ↔ ')}`;
+    panel.title = this.getPanelTitle(targets);
     panel.reveal(vscode.ViewColumn.Active, false);
     await this.loadHistories(initialChangesetId);
+  }
+
+  async refreshLanguage(): Promise<void> {
+    if (!this.panel) {
+      return;
+    }
+
+    this.panel.title = this.getPanelTitle(this.targets);
+    this.panel.webview.html = this.getHtml(this.panel.webview);
+    await this.loadHistories(this.initialChangesetId);
   }
 
   private ensurePanel(): vscode.WebviewPanel {
@@ -83,7 +91,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
 
     const panel = vscode.window.createWebviewPanel(
       'armTfs.historyBrowser',
-      'TFVC History',
+      t('historyBrowser.title'),
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true },
     );
@@ -136,6 +144,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
           break;
         case 'selectChangeset':
           if (message.changesetId !== undefined) {
+            this.initialChangesetId = message.changesetId;
             await this.loadChangeset(message.changesetId);
           }
           break;
@@ -226,14 +235,14 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       .sort((left, right) => right - left)[0];
     if (previous === undefined) {
       await openServerVersionDiffFromEmpty(
-        this.client,
-        {
-          serverPath,
-          version: changesetId,
-          label: `${path.posix.basename(serverPath)} (cs${changesetId})`,
-        },
-        `${path.posix.basename(serverPath)}: empty ↔ cs${changesetId}`,
-      );
+      this.client,
+      {
+        serverPath,
+        version: changesetId,
+        label: `${path.posix.basename(serverPath)} (cs${changesetId})`,
+      },
+      `${path.posix.basename(serverPath)}: ${t('version.emptyBaseline')} ↔ cs${changesetId}`,
+    );
       return;
     }
     await this.showDiff(serverPath, serverPath, previous, changesetId);
@@ -293,7 +302,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       canSelectFiles: false,
       canSelectFolders: true,
       canSelectMany: false,
-      openLabel: getUiLanguage() === 'zh-CN' ? '选择签出目录' : 'Choose checkout folder',
+      openLabel: t('historyBrowser.dialog.checkoutFolder'),
     });
     if (!picked?.length) {
       return;
@@ -310,9 +319,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       this.output.show(true);
     }
     void vscode.window.showInformationMessage(
-      getUiLanguage() === 'zh-CN'
-        ? `已将 cs${changesetId} 获取到 ${picked[0].fsPath}`
-        : `Downloaded cs${changesetId} to ${picked[0].fsPath}`,
+      t('historyBrowser.status.downloadedChangeset', { changeset: changesetId, path: picked[0].fsPath }),
     );
   }
 
@@ -322,7 +329,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       .map((change) => ({
         path: change.item!.path,
         name: path.posix.basename(change.item!.path),
-        changeType: change.changeType,
+        changeType: translateChangeType(change.changeType),
         isBranch: change.item?.isBranch ?? false,
       }))
       .sort((left, right) => left.path.localeCompare(right.path, undefined, { sensitivity: 'base' }));
@@ -359,7 +366,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
           : serverPath;
         const current = byRelativePath.get(relativePath) ?? { relativePath };
         current[`${side}Path`] = serverPath;
-        current[`${side}ChangeType`] = change.changeType;
+        current[`${side}ChangeType`] = translateChangeType(change.changeType);
         byRelativePath.set(relativePath, current);
       }
     };
@@ -384,15 +391,26 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
   private showError(operation: string, error: unknown): void {
     const message = translateCliMessage(error instanceof Error ? error.message : `${error}`);
     this.output.appendLine(`arm-tfs history browser ${operation}: ${message}`);
-    void vscode.window.showErrorMessage(`arm-tfs ${operation}: ${message}`);
+    void vscode.window.showErrorMessage(t('historyBrowser.error', { operation, message }));
     void this.panel?.webview.postMessage({ type: 'error', message });
+  }
+
+  private getPanelTitle(targets: HistoryTarget[]): string {
+    if (targets.length <= 1) {
+      const label = targets[0]?.label ?? '';
+      return label
+        ? t('historyBrowser.panel.history', { label })
+        : t('historyBrowser.title');
+    }
+
+    return t('historyBrowser.panel.compare', { label: targets.map((target) => target.label).join(' ↔ ') });
   }
 
   private getHtml(webview: vscode.Webview): string {
     const nonce = getNonce();
     const zh = getUiLanguage() === 'zh-CN';
     const labels = {
-      title: zh ? 'TFVC 历史记录' : 'TFVC History',
+      title: t('historyBrowser.title'),
       refresh: zh ? '刷新' : 'Refresh',
       compare: zh ? '比较选中项' : 'Compare Selected',
       compareShort: zh ? '比较' : 'Compare',
@@ -416,8 +434,8 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       detail: zh ? '变更集详细信息' : 'Changeset Details',
       changedFiles: zh ? '更改文件' : 'Changed Files',
       sourcePath: zh ? '源位置' : 'Source Location',
-      from: zh ? '左侧' : 'Left',
-      to: zh ? '右侧' : 'Right',
+      from: t('version.left'),
+      to: t('version.right'),
       contextDetails: zh ? '查看详细信息' : 'View Details',
       contextCompare: zh ? '比较选中的两个变更集' : 'Compare selected changesets',
       contextGet: zh ? '获取此版本到文件夹' : 'Get this version to folder',
@@ -429,6 +447,23 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       modeHistory: zh ? '历史记录' : 'History',
       modeFileHistory: zh ? '文件历史记录' : 'File History',
       modeCompare: zh ? '变更集比较' : 'Changeset Comparison',
+      noChangeType: t('changeType.none'),
+      changeTypes: {
+        add: t('changeType.add'),
+        edit: t('changeType.edit'),
+        delete: t('changeType.delete'),
+        rename: t('changeType.rename'),
+        merge: t('changeType.merge'),
+        branch: t('changeType.branch'),
+        undelete: t('changeType.undelete'),
+        rollback: t('changeType.rollback'),
+        encoding: t('changeType.encoding'),
+        lock: t('changeType.lock'),
+        sourcerename: t('changeType.sourceRename'),
+        targetrename: t('changeType.targetRename'),
+        sourcedelete: t('changeType.sourceDelete'),
+        targetdelete: t('changeType.targetDelete'),
+      },
     };
 
     return `<!doctype html>
@@ -549,8 +584,9 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
 
     document.getElementById('reload').addEventListener('click', () => vscode.postMessage({ type: 'reload' }));
     compareButton.addEventListener('click', () => {
-      if (state.selectedChangesets.length === 2) {
-        vscode.postMessage({ type: 'compareChangesets', changesetIds: [...state.selectedChangesets] });
+      const selected = getComparablePair(state.selectedChangesets);
+      if (selected.length === 2) {
+        vscode.postMessage({ type: 'compareChangesets', changesetIds: selected });
       }
     });
     window.addEventListener('click', () => hideContextMenu());
@@ -558,9 +594,25 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       if (event.key === 'Escape') hideContextMenu();
     });
 
+    function normalizeSelection(values) {
+      return [...new Set(values)].slice(-2);
+    }
+
+    function getComparablePair(values) {
+      return normalizeSelection(values);
+    }
+
+    function setHistorySelection(values) {
+      state.selectedChangesets = normalizeSelection(values);
+    }
+
+    function setFileHistorySelection(values) {
+      state.fileHistorySelected = normalizeSelection(values);
+    }
+
     function renderHistories(groups, initialChangesetId, currentPathLabel) {
       state.historyRows = groups.flatMap(group => group.items.map(item => ({ ...item, scopePath: group.serverPath, scopeLabel: group.label })));
-      state.selectedChangesets = [];
+      setHistorySelection([]);
       state.activeChangesetId = initialChangesetId ?? null;
       state.latestPathLabel = currentPathLabel || '';
       pathLabel.textContent = currentPathLabel || '';
@@ -581,11 +633,11 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
         row.addEventListener('dblclick', () => activateChangeset(changesetId));
         row.addEventListener('contextmenu', event => {
           event.preventDefault();
-          const selected = state.selectedChangesets.includes(changesetId)
+          const selected = getComparablePair(state.selectedChangesets.includes(changesetId)
             ? [...state.selectedChangesets]
-            : [changesetId];
+            : [...state.selectedChangesets, changesetId]);
           if (!state.selectedChangesets.includes(changesetId)) {
-            state.selectedChangesets = selected;
+            setHistorySelection(selected);
             refreshHistorySelection();
           }
           showContextMenu(event.clientX, event.clientY, [
@@ -607,7 +659,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
         toggleHistorySelection(changesetId);
         return;
       }
-      state.selectedChangesets = [changesetId];
+      setHistorySelection([changesetId]);
       state.activeChangesetId = changesetId;
       refreshHistorySelection();
       vscode.postMessage({ type: 'selectChangeset', changesetId });
@@ -615,15 +667,15 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
 
     function toggleHistorySelection(changesetId) {
       if (state.selectedChangesets.includes(changesetId)) {
-        state.selectedChangesets = state.selectedChangesets.filter(value => value !== changesetId);
+        setHistorySelection(state.selectedChangesets.filter(value => value !== changesetId));
       } else {
-        state.selectedChangesets = [...state.selectedChangesets, changesetId].slice(-2);
+        setHistorySelection([...state.selectedChangesets, changesetId]);
       }
       refreshHistorySelection();
     }
 
     function activateChangeset(changesetId) {
-      state.selectedChangesets = [changesetId];
+      setHistorySelection([changesetId]);
       state.activeChangesetId = changesetId;
       refreshHistorySelection();
       vscode.postMessage({ type: 'selectChangeset', changesetId });
@@ -709,7 +761,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
     function renderFileHistoryDetails(message) {
       state.latestPayload = message;
       state.fileHistoryPath = message.serverPath;
-      state.fileHistorySelected = [];
+      setFileHistorySelection([]);
       masterTitle.textContent = labels.modeFileHistory;
       detailWrap.innerHTML = \`
         <div class="card">
@@ -757,18 +809,18 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
           if (event.metaKey || event.ctrlKey) {
             toggleFileHistorySelection(changesetId);
           } else {
-            state.fileHistorySelected = [changesetId];
+            setFileHistorySelection([changesetId]);
             refreshFileHistorySelection();
           }
         });
         row.addEventListener('dblclick', () => vscode.postMessage({ type: 'diffPrevious', serverPath: message.serverPath, changesetId }));
         row.addEventListener('contextmenu', event => {
           event.preventDefault();
-          const selected = state.fileHistorySelected.includes(changesetId)
+          const selected = getComparablePair(state.fileHistorySelected.includes(changesetId)
             ? [...state.fileHistorySelected]
-            : [changesetId];
+            : [...state.fileHistorySelected, changesetId]);
           if (!state.fileHistorySelected.includes(changesetId)) {
-            state.fileHistorySelected = selected;
+            setFileHistorySelection(selected);
             refreshFileHistorySelection();
           }
           showContextMenu(event.clientX, event.clientY, [
@@ -789,8 +841,9 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
         }
       });
       compareFileVersions.addEventListener('click', () => {
-        if (state.fileHistorySelected.length === 2) {
-          vscode.postMessage({ type: 'compareFileVersions', serverPath: message.serverPath, changesetIds: [...state.fileHistorySelected] });
+        const selected = getComparablePair(state.fileHistorySelected);
+        if (selected.length === 2) {
+          vscode.postMessage({ type: 'compareFileVersions', serverPath: message.serverPath, changesetIds: selected });
         }
       });
       refreshFileHistorySelection();
@@ -798,9 +851,9 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
 
     function toggleFileHistorySelection(changesetId) {
       if (state.fileHistorySelected.includes(changesetId)) {
-        state.fileHistorySelected = state.fileHistorySelected.filter(value => value !== changesetId);
+        setFileHistorySelection(state.fileHistorySelected.filter(value => value !== changesetId));
       } else {
-        state.fileHistorySelected = [...state.fileHistorySelected, changesetId].slice(-2);
+        setFileHistorySelection([...state.fileHistorySelected, changesetId]);
       }
       refreshFileHistorySelection();
     }
@@ -834,7 +887,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
         ...file,
         path: file.relativePath,
         relativePath: file.relativePath,
-        changeType: \`\${file.fromChangeType || '—'} → \${file.toChangeType || '—'}\`,
+        changeType: formatComparedChangeType(file.fromChangeType, file.toChangeType),
       })));
     }
 
@@ -889,7 +942,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       wrapper.className = 'tree-node ' + node.kind;
       const label = document.createElement('div');
       label.className = 'tree-label';
-      label.innerHTML = '<span>' + escape(node.name) + '</span>' + (node.kind === 'file' ? '<span class="badge">' + escape(node.entry.changeType || '') + '</span>' : '');
+      label.innerHTML = '<span>' + escape(node.name) + '</span>' + (node.kind === 'file' ? '<span class="badge">' + escape(formatChangeTypeLabel(node.entry.changeType || '')) + '</span>' : '');
       wrapper.appendChild(label);
 
       if (node.kind === 'folder') {
@@ -1049,6 +1102,25 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
         return;
       }
       button.innerHTML = '<span class="action-icon">' + escape(icon) + '</span><span>' + escape(label) + '</span>';
+    }
+
+    function formatComparedChangeType(fromChangeType, toChangeType) {
+      return formatChangeTypeLabel(fromChangeType || labels.noChangeType) + ' → ' + formatChangeTypeLabel(toChangeType || labels.noChangeType);
+    }
+
+    function formatChangeTypeLabel(value) {
+      if (!value) {
+        return '';
+      }
+      return String(value)
+        .split(',')
+        .map(part => part.trim())
+        .filter(Boolean)
+        .map(part => {
+          const normalized = part.toLowerCase();
+          return labels.changeTypes[normalized] || part;
+        })
+        .join(', ');
     }
 
     window.addEventListener('message', event => {

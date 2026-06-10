@@ -4,7 +4,7 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { ArmTfsCliClient, ArmTfsCliError } from './armTfsCliClient';
 import type { StatusItem } from './contracts';
-import { t } from './i18n';
+import { t, translateChangeType, translateStatusLabel } from './i18n';
 import { findTfvcWorkspaceRoot, findTfvcWorkspaceRootSync, getCommandCwd } from './tfvcContext';
 import { openLocalWorkingDiff } from './versionedFiles';
 
@@ -213,7 +213,7 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
           item?.serverPath ?? targetPath,
           {
             version,
-            title: `${path.basename(targetPath)} (${version ? `cs${version}` : 'server'}) ↔ ${path.basename(targetPath)} (working tree)`,
+            title: `${path.basename(targetPath)} (${version ? `cs${version}` : t('version.server')}) ↔ ${path.basename(targetPath)} (${t('version.workingTree')})`,
           },
         ),
       );
@@ -364,16 +364,16 @@ function shouldUseBase(item: StatusItem | undefined): boolean {
 }
 
 function buildTooltip(item: StatusItem): string {
-  const parts = [`State: ${item.state}`];
+  const parts = [t('scm.tooltip.state', { state: translateStatusLabel(item.state) })];
   if (item.changeType) {
-    parts.push(`Change: ${item.changeType}`);
+    parts.push(t('scm.tooltip.change', { change: translateChangeType(item.changeType) }));
   }
-  parts.push(`Server: ${item.serverPath}`);
+  parts.push(t('scm.tooltip.server', { path: item.serverPath }));
   if (item.trackedChangesetId !== undefined) {
-    parts.push(`Tracked changeset: ${item.trackedChangesetId}`);
+    parts.push(t('scm.tooltip.trackedChangeset', { changeset: item.trackedChangesetId }));
   }
   if (item.baselineChangesetId !== undefined) {
-    parts.push(`Baseline changeset: ${item.baselineChangesetId}`);
+    parts.push(t('scm.tooltip.baselineChangeset', { changeset: item.baselineChangesetId }));
   }
   return parts.join('\n');
 }

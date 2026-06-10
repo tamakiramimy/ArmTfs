@@ -55,7 +55,8 @@
       {
         "command": "armTfs.configureCliCommand",
         "title": "%command.configureCli%",
-        "category": "arm-tfs"
+        "category": "arm-tfs",
+        "icon": "$(terminal)"
       },
       {
         "command": "armTfs.connections.add",
@@ -104,7 +105,8 @@
       {
         "command": "armTfs.checkoutServerPathToFolder",
         "title": "%command.checkoutServerPathToFolder%",
-        "category": "arm-tfs"
+        "category": "arm-tfs",
+        "icon": "$(cloud-download)"
       },
       {
         "command": "armTfs.showWorkspace",
@@ -214,7 +216,8 @@
       {
         "command": "armTfs.sidebar.refresh",
         "title": "%command.sidebarRefresh%",
-        "category": "arm-tfs"
+        "category": "arm-tfs",
+        "icon": "$(refresh)"
       },
       {
         "command": "armTfs.serverExplorer.refresh",
@@ -255,7 +258,8 @@
       {
         "command": "armTfs.sidebar.setBranchScope",
         "title": "%command.sidebarSetBranchScope%",
-        "category": "arm-tfs"
+        "category": "arm-tfs",
+        "icon": "$(target)"
       },
       {
         "command": "armTfs.sidebar.setMergeSource",
@@ -363,11 +367,6 @@
           "command": "armTfs.serverExplorer.setRoot",
           "when": "view == armTfs.serverExplorer",
           "group": "navigation@2"
-        },
-        {
-          "command": "armTfs.switchLanguage",
-          "when": "view == armTfs.serverExplorer",
-          "group": "navigation@3"
         },
         {
           "command": "armTfs.sidebar.refresh",

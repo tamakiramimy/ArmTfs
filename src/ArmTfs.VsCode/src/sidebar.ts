@@ -56,9 +56,9 @@ class HistoryNode extends ArmTfsTreeNode {
     this.id = `history:${item.changesetId}`;
     this.description = buildHistoryDescription(item);
     this.tooltip = [
-      `Changeset: ${item.changesetId}`,
-      `Created: ${item.createdAt}`,
-      item.author?.displayName ? `Author: ${item.author.displayName}` : undefined,
+      t('sidebar.history.tooltip.changeset', { changeset: item.changesetId }),
+      t('sidebar.history.tooltip.created', { createdAt: item.createdAt }),
+      item.author?.displayName ? t('sidebar.history.tooltip.author', { author: item.author.displayName }) : undefined,
       item.comment,
     ].filter(Boolean).join('\n');
     this.iconPath = new vscode.ThemeIcon('history');
@@ -145,6 +145,8 @@ export class ArmTfsSidebarController implements vscode.Disposable {
   private readonly historyProvider = new StaticTreeProvider();
   private readonly mergeProvider = new StaticTreeProvider();
   private readonly disposables: vscode.Disposable[] = [];
+  private readonly branchView: vscode.TreeView<ArmTfsTreeNode>;
+  private readonly historyView: vscode.TreeView<ArmTfsTreeNode>;
   private readonly autoCheckoutInFlight = new Set<string>();
   private readonly autoCheckoutSkipped = new Set<string>();
   private resolvedWorkspaceRoot: string | undefined;
@@ -160,14 +162,19 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     private readonly refreshScm: () => Promise<void>,
     private readonly historyBrowser: ArmTfsHistoryBrowser,
   ) {
-    const branchView = vscode.window.createTreeView('armTfs.branches', {
+    this.branchView = vscode.window.createTreeView('armTfs.branches', {
       treeDataProvider: this.branchProvider,
       canSelectMany: true,
     });
+    this.historyView = vscode.window.createTreeView('armTfs.historyGraph', {
+      treeDataProvider: this.historyProvider,
+    });
+    this.refreshLabels();
 
     this.disposables.push(
-      branchView,
-      branchView.onDidChangeSelection((event) => {
+      this.branchView,
+      this.historyView,
+      this.branchView.onDidChangeSelection((event) => {
         const branches = event.selection.filter((item): item is BranchNode => item instanceof BranchNode);
         if (branches.length === 2) {
           void this.historyBrowser.openTargets(branches.map((branch) => ({
@@ -184,7 +191,6 @@ export class ArmTfsSidebarController implements vscode.Disposable {
           });
         }
       }),
-      vscode.window.registerTreeDataProvider('armTfs.historyGraph', this.historyProvider),
       vscode.commands.registerCommand('armTfs.sidebar.refresh', async () => this.refreshAll()),
       vscode.commands.registerCommand('armTfs.sidebar.selectBranch', async (node?: BranchNode) => {
         if (node) {
@@ -241,6 +247,11 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       });
     }
     await this.refreshAll();
+  }
+
+  refreshLabels(): void {
+    this.branchView.title = t('view.branches');
+    this.historyView.title = t('view.historyGraph');
   }
 
   async setActiveServerPath(
@@ -1136,9 +1147,9 @@ function buildMergeSummaryNodes(mergeBase: MergeBaseResponse, candidates: MergeC
         item.changesetId,
         buildMergeCandidateDescription(item),
         [
-          `Changeset: ${item.changesetId}`,
-          `Created: ${item.createdAt}`,
-          item.author?.displayName ? `Author: ${item.author.displayName}` : undefined,
+          t('sidebar.history.tooltip.changeset', { changeset: item.changesetId }),
+          t('sidebar.history.tooltip.created', { createdAt: item.createdAt }),
+          item.author?.displayName ? t('sidebar.history.tooltip.author', { author: item.author.displayName }) : undefined,
           item.comment,
         ].filter(Boolean).join('\n'),
       ))
@@ -1302,8 +1313,8 @@ class ServerExplorerNode extends vscode.TreeItem {
     this.description = entry.isFolder ? undefined : `cs${entry.changesetId}`;
     this.tooltip = [
       entry.serverPath,
-      entry.checkinDate ? `Last modified: ${entry.checkinDate.slice(0, 10)}` : undefined,
-      entry.contentLength != null ? `Size: ${entry.contentLength} bytes` : undefined,
+      entry.checkinDate ? t('serverExplorer.tooltip.lastModified', { date: entry.checkinDate.slice(0, 10) }) : undefined,
+      entry.contentLength != null ? t('serverExplorer.tooltip.size', { size: entry.contentLength }) : undefined,
     ].filter(Boolean).join('\n');
     this.iconPath = entry.isFolder
       ? new vscode.ThemeIcon('folder')
@@ -1312,7 +1323,7 @@ class ServerExplorerNode extends vscode.TreeItem {
     if (!entry.isFolder) {
       this.command = {
         command: 'armTfs.serverExplorer.showHistory',
-        title: 'Show History',
+        title: t('serverExplorer.showHistory'),
         arguments: [this],
       };
     }
@@ -1419,7 +1430,7 @@ class ServerExplorerProvider implements vscode.TreeDataProvider<vscode.TreeItem>
         label = t('serverExplorer.commandMissingNode');
       } else {
         // Only show the first line to keep the tree node label short
-        label = `Error: ${msg.split('\n')[0].slice(0, 120)}`;
+        label = `${t('serverExplorer.errorPrefix')}: ${msg.split('\n')[0].slice(0, 120)}`;
       }
 
       const errNode = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
@@ -1447,6 +1458,7 @@ class ServerExplorerProvider implements vscode.TreeDataProvider<vscode.TreeItem>
 export class ArmTfsServerExplorerController implements vscode.Disposable {
   private readonly provider: ServerExplorerProvider;
   private readonly disposables: vscode.Disposable[] = [];
+  private readonly treeView: vscode.TreeView<ServerExplorerNode | vscode.TreeItem>;
 
   constructor(
     private readonly client: ArmTfsCliClient,
@@ -1460,11 +1472,12 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
     private readonly historyBrowser?: ArmTfsHistoryBrowser,
   ) {
     this.provider = new ServerExplorerProvider(client, output);
-    const treeView = vscode.window.createTreeView('armTfs.serverExplorer', { treeDataProvider: this.provider });
+    this.treeView = vscode.window.createTreeView('armTfs.serverExplorer', { treeDataProvider: this.provider });
+    this.refreshLabels();
 
     this.disposables.push(
-      treeView,
-      treeView.onDidChangeSelection((event) => {
+      this.treeView,
+      this.treeView.onDidChangeSelection((event) => {
         const selected = event.selection[0];
         if (selected instanceof ServerExplorerNode) {
           void this.onActiveServerPathChanged?.(selected.entry.serverPath, {
@@ -1519,7 +1532,7 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
 
         try {
           const result = await vscode.window.withProgress(
-            { location: vscode.ProgressLocation.Notification, title: `arm-tfs get ${serverPath}` },
+            { location: vscode.ProgressLocation.Notification, title: t('serverExplorer.progress.get', { path: serverPath }) },
             () => checkoutServerPathToLocalFolder(this.client, serverPath, localPath),
           );
           const doc = await vscode.workspace.openTextDocument({ language: 'text', content: translateCliText(result) });
@@ -1528,7 +1541,7 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
           await this.provider.refresh();
         } catch (error) {
           void vscode.window.showErrorMessage(t('error.failed', {
-            title: 'arm-tfs get',
+            title: t('extension.operation.get'),
             message: translateCliMessage(getErrorMessage(error)),
           }));
         }
@@ -1542,7 +1555,7 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
         const serverPath = node.entry.serverPath;
         try {
           const result = await vscode.window.withProgress(
-            { location: vscode.ProgressLocation.Notification, title: `arm-tfs checkout ${serverPath}` },
+            { location: vscode.ProgressLocation.Notification, title: t('serverExplorer.progress.checkout', { path: serverPath }) },
             () => this.client.checkout([serverPath]),
           );
           const doc = await vscode.workspace.openTextDocument({ language: 'text', content: translateCliText(result) });
@@ -1550,7 +1563,7 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
           await this.refreshScm();
         } catch (error) {
           void vscode.window.showErrorMessage(t('error.failed', {
-            title: 'arm-tfs checkout',
+            title: t('extension.operation.checkout'),
             message: translateCliMessage(getErrorMessage(error)),
           }));
         }
@@ -1574,6 +1587,10 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
         vscode.window.setStatusBarMessage(t('serverExplorer.status.copiedPath', { path: node.entry.serverPath }), 2000);
       }),
     );
+  }
+
+  refreshLabels(): void {
+    this.treeView.title = t('view.serverExplorer');
   }
 
   dispose(): void {

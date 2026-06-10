@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { ArmTfsCliClient } from './armTfsCliClient';
 import type { ItemContentResponse } from './contracts';
-import { getUiLanguage } from './i18n';
+import { t } from './i18n';
 
 interface ServerVersionSpec {
   serverPath: string;
@@ -115,7 +115,7 @@ export async function openLocalWorkingDiff(
   const leftFile = await materializeServerVersion(client, {
     serverPath,
     version: options?.version,
-    label: `${path.basename(localPath)} (${options?.version ? `cs${options.version}` : 'server'})`,
+    label: `${path.basename(localPath)} (${options?.version ? `cs${options.version}` : t('version.server')})`,
   });
 
   if (leftFile.isBinary) {
@@ -131,7 +131,7 @@ export async function openLocalWorkingDiff(
     'vscode.diff',
     leftFile.uri,
     vscode.Uri.file(localPath),
-    options?.title ?? `${leftFile.displayLabel} ↔ ${path.basename(localPath)} (working tree)`,
+    options?.title ?? `${leftFile.displayLabel} ↔ ${path.basename(localPath)} (${t('version.workingTree')})`,
     { preview: false },
   );
 }
@@ -155,9 +155,7 @@ async function materializeEmptyVersion(
     uri: vscode.Uri.file(filePath),
     filePath,
     isBinary: false,
-    displayLabel: getUiLanguage() === 'zh-CN'
-      ? `${path.posix.basename(serverPath)} (空白基线)`
-      : `${path.posix.basename(serverPath)} (empty baseline)`,
+    displayLabel: `${path.posix.basename(serverPath)} (${t('version.emptyBaseline')})`,
   };
 }
 
@@ -178,7 +176,7 @@ function decodeContent(response: ItemContentResponse): Buffer {
 }
 
 function buildVersionLabel(serverPath: string, version?: number): string {
-  return `${path.posix.basename(serverPath)} (${version !== undefined ? `cs${version}` : 'latest'})`;
+  return `${path.posix.basename(serverPath)} (${version !== undefined ? `cs${version}` : t('version.latest')})`;
 }
 
 async function openBinaryNotice(
@@ -194,12 +192,11 @@ async function openBinaryNotice(
 }
 
 function binaryNoticeText(title: string, leftPath: string, rightPath: string): string {
-  const zh = getUiLanguage() === 'zh-CN';
   return [
     title,
     '',
-    zh ? '当前比较的是二进制文件，已生成临时版本文件。' : 'This is a binary comparison. Temporary version files were generated.',
-    `${zh ? '左侧' : 'Left'}: ${leftPath}`,
-    `${zh ? '右侧' : 'Right'}: ${rightPath}`,
+    t('version.binaryDiff'),
+    `${t('version.left')}: ${leftPath}`,
+    `${t('version.right')}: ${rightPath}`,
   ].join('\n');
 }

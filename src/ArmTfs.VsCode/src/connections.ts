@@ -84,6 +84,7 @@ class ConnectionsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
 export class ArmTfsConnectionsController implements vscode.Disposable {
   private readonly provider: ConnectionsProvider;
   private readonly disposables: vscode.Disposable[] = [];
+  private readonly treeView: vscode.TreeView<vscode.TreeItem>;
   private cliDescription = '';
 
   constructor(
@@ -92,8 +93,12 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
     private readonly onConnectionChanged: (profile: TfsConnectionProfile | undefined) => Promise<void>,
   ) {
     this.provider = new ConnectionsProvider(this);
+    this.treeView = vscode.window.createTreeView('armTfs.connections', {
+      treeDataProvider: this.provider,
+    });
+    this.refreshLabels();
     this.disposables.push(
-      vscode.window.registerTreeDataProvider('armTfs.connections', this.provider),
+      this.treeView,
       vscode.commands.registerCommand('armTfs.connections.add', () => this.addProfile()),
       vscode.commands.registerCommand('armTfs.connections.edit', (node?: ProfileTreeItem | TfsConnectionProfile) => this.editProfile(this.unwrap(node))),
       vscode.commands.registerCommand('armTfs.connections.delete', (node?: ProfileTreeItem | TfsConnectionProfile) => this.deleteProfile(this.unwrap(node))),
@@ -127,6 +132,14 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
 
   getCliDescription(): string {
     return this.cliDescription;
+  }
+
+  refresh(): void {
+    this.provider.refresh();
+  }
+
+  refreshLabels(): void {
+    this.treeView.title = t('view.connections');
   }
 
   async getActiveEnvironment(): Promise<ArmTfsConnectionEnvironment | undefined> {

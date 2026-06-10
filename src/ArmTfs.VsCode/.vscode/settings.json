@@ -1,4 +1,5 @@
 {
     "armTfs.serverExplorer.rootPath": "$/C02_HR_P004_HR门户",
-    "armTfs.branch.scope": "$/C02_HR_P004_HR门户"
+    "armTfs.branch.scope": "$/C02_HR_P004_HR门户",
+    "armTfs.ui.language": "zh-CN"
 }
