@@ -16,6 +16,7 @@ import type {
   LabelShowResponse,
   MergeBaseResponse,
   MergeCandidateResponse,
+  MergeExecuteResponse,
   StatusResponse,
 } from './contracts';
 
@@ -285,7 +286,7 @@ export class ArmTfsCliClient {
     sourcePath: string,
     targetPath: string,
     changesetId: number,
-    options?: { comment?: string; dryRun?: boolean },
+    options?: { comment?: string; dryRun?: boolean; resolutionFile?: string },
     runOptions?: ArmTfsRunOptions,
   ): Promise<string> {
     const args = [
@@ -304,8 +305,43 @@ export class ArmTfsCliClient {
     if (options?.dryRun) {
       args.push('--dry-run');
     }
+    if (options?.resolutionFile) {
+      args.push('--resolution-file', options.resolutionFile);
+    }
 
     return this.executeText(args, runOptions);
+  }
+
+  mergeExecuteJson(
+    sourcePath: string,
+    targetPath: string,
+    changesetId: number,
+    options?: { comment?: string; dryRun?: boolean; resolutionFile?: string },
+    runOptions?: ArmTfsRunOptions,
+  ): Promise<MergeExecuteResponse> {
+    const args = [
+      'merge',
+      'execute',
+      '--source',
+      sourcePath,
+      '--target',
+      targetPath,
+      '--changeset',
+      String(changesetId),
+      '--format',
+      'json',
+    ];
+    if (options?.comment) {
+      args.push('--comment', options.comment);
+    }
+    if (options?.dryRun) {
+      args.push('--dry-run');
+    }
+    if (options?.resolutionFile) {
+      args.push('--resolution-file', options.resolutionFile);
+    }
+
+    return this.executeJson<MergeExecuteResponse>(args, runOptions);
   }
 
   /**

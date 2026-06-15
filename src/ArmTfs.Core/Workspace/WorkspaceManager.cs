@@ -138,9 +138,14 @@ public sealed class WorkspaceManager
     public TrackedFileVersion? GetTrackedVersion(string localPath)
     {
         var file = GetVersionFilePath(localPath);
-        if (!File.Exists(file)) return null;
-        var json = File.ReadAllText(file);
-        return JsonSerializer.Deserialize<TrackedFileVersion>(json, _jsonOptions);
+        if (File.Exists(file))
+        {
+            var json = File.ReadAllText(file);
+            var direct = JsonSerializer.Deserialize<TrackedFileVersion>(json, _jsonOptions);
+            return direct is null ? null : WithCurrentLocalPath(direct, NormalizeLocalPath(localPath));
+        }
+
+        return FindTrackedVersionByNormalizedPath(localPath);
     }
 
     /// <summary>将文件的版本快照序列化写入 .tf/versions/ 目录。</summary>
@@ -262,9 +267,48 @@ public sealed class WorkspaceManager
         return Path.Combine(BaseFilesPath, $"{hash}{extension}");
     }
 
+    private TrackedFileVersion? FindTrackedVersionByNormalizedPath(string localPath)
+    {
+        if (!Directory.Exists(VersionsPath))
+            return null;
+
+        var normalizedLocalPath = NormalizeLocalPath(localPath);
+        foreach (var versionFile in Directory.EnumerateFiles(VersionsPath, "*.json"))
+        {
+            try
+            {
+                var json = File.ReadAllText(versionFile);
+                var candidate = JsonSerializer.Deserialize<TrackedFileVersion>(json, _jsonOptions);
+                if (candidate is null)
+                    continue;
+
+                if (string.Equals(NormalizeLocalPath(candidate.LocalPath), normalizedLocalPath, StringComparison.OrdinalIgnoreCase))
+                    return WithCurrentLocalPath(candidate, normalizedLocalPath);
+            }
+            catch
+            {
+                // Ignore corrupt or partially written version metadata.
+            }
+        }
+
+        return null;
+    }
+
+    private static TrackedFileVersion WithCurrentLocalPath(TrackedFileVersion version, string localPath)
+    {
+        return new TrackedFileVersion
+        {
+            ServerPath = version.ServerPath,
+            LocalPath = localPath,
+            ChangesetId = version.ChangesetId,
+            ContentHash = version.ContentHash,
+            DownloadedAt = version.DownloadedAt,
+        };
+    }
+
     private static string NormalizeLocalPath(string path)
     {
-        var fullPath = Path.GetFullPath(path);
+        var fullPath = Path.GetFullPath(TranslatePlatformSharedPath(path));
 
         if (OperatingSystem.IsMacOS() && fullPath.StartsWith("/private/tmp", StringComparison.Ordinal))
         {
@@ -273,6 +317,43 @@ public sealed class WorkspaceManager
         }
 
         return fullPath;
+    }
+
+    private static string TranslatePlatformSharedPath(string path)
+    {
+        var normalized = path.Replace('\\', '/');
+        var sharedHome = GetPlatformSharedHomeDirectory();
+        if (sharedHome is null)
+            return path;
+
+        foreach (var prefix in new[] { "//Mac/Home/", "/Mac/Home/" })
+        {
+            if (normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                return Path.Combine(sharedHome, normalized[prefix.Length..]);
+        }
+
+        var withoutDrive = normalized.Length >= 3 && char.IsLetter(normalized[0]) && normalized[1] == ':' && normalized[2] == '/'
+            ? normalized[3..]
+            : normalized;
+        if (withoutDrive.StartsWith("Mac/Home/", StringComparison.OrdinalIgnoreCase))
+            return Path.Combine(sharedHome, withoutDrive["Mac/Home/".Length..]);
+
+        return path;
+    }
+
+    private static string? GetPlatformSharedHomeDirectory()
+    {
+        if (OperatingSystem.IsMacOS())
+            return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+        if (OperatingSystem.IsWindows())
+        {
+            const string windowsSharedHome = @"C:\Mac\Home";
+            if (Directory.Exists(windowsSharedHome))
+                return windowsSharedHome;
+        }
+
+        return null;
     }
 
     private void EnsureExists()

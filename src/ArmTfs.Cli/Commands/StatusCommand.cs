@@ -53,7 +53,7 @@ public static class StatusCommand
                         {
                             state = "modifiedNotCheckedOut",
                             serverPath = tracked.ServerPath,
-                            localPath = tracked.LocalPath,
+                            localPath = file,
                             trackedChangesetId = tracked.ChangesetId,
                             downloadedAt = tracked.DownloadedAt,
                         });

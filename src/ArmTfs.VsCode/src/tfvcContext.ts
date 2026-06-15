@@ -119,7 +119,7 @@ export function discoverTfvcMappingForPath(localPath?: string): DiscoveredTfvcMa
             matches.push({
               workspaceRoot: path.dirname(path.dirname(metadataPath)),
               serverPath,
-              localPath: mappedLocalPath,
+              localPath: translatePlatformSharedPath(mappedLocalPath),
             });
           }
         }
@@ -166,7 +166,44 @@ function findWorkspaceRootUpward(startPath?: string): string | undefined {
 }
 
 function normalizeForCompare(targetPath: string): string {
-  return path.resolve(targetPath).toLowerCase();
+  return path.resolve(translatePlatformSharedPath(targetPath)).toLowerCase();
+}
+
+function translatePlatformSharedPath(targetPath: string): string {
+  if (process.platform !== 'darwin' && process.platform !== 'win32') {
+    return targetPath;
+  }
+
+  const normalized = targetPath.replace(/\\/g, '/');
+  const home = getPlatformSharedHomeDirectory();
+  if (!home) {
+    return targetPath;
+  }
+
+  const prefixes = ['//Mac/Home/', '/Mac/Home/'];
+  for (const prefix of prefixes) {
+    if (normalized.toLowerCase().startsWith(prefix.toLowerCase())) {
+      return path.join(home, normalized.slice(prefix.length));
+    }
+  }
+
+  const withoutDrive = /^[A-Za-z]:\//.test(normalized) ? normalized.slice(3) : normalized;
+  const drivePrefix = 'Mac/Home/';
+  if (withoutDrive.toLowerCase().startsWith(drivePrefix.toLowerCase())) {
+    return path.join(home, withoutDrive.slice(drivePrefix.length));
+  }
+
+  return targetPath;
+}
+
+function getPlatformSharedHomeDirectory(): string | undefined {
+  if (process.platform === 'darwin') {
+    return process.env.HOME;
+  }
+  if (process.platform === 'win32' && existsSync('C:\\Mac\\Home')) {
+    return 'C:\\Mac\\Home';
+  }
+  return undefined;
 }
 
 function distanceScore(candidateRoot: string, anchorPath: string): number {

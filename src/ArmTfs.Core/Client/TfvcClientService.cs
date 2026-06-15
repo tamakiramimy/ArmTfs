@@ -463,26 +463,46 @@ public sealed class TfvcClientService
         }
 
         var uniqueFloor = GetSourceUniqueFloor(baseInfo);
-        var candidates = sourceHistory
-            .Select(changeset =>
+        var candidates = new List<MergeCandidateInfo>();
+        foreach (var changeset in sourceHistory)
+        {
+            if (uniqueFloor.HasValue && changeset.ChangesetId <= uniqueFloor.Value)
+                continue;
+
+            var coveringRange = mergedRanges.FirstOrDefault(range => range.Covers(changeset.ChangesetId));
+            if (coveringRange is not null)
+                continue;
+
+            var detail = await GetChangesetAsync(changeset.ChangesetId, ct).ConfigureAwait(false);
+            if (IsChangesetOriginatingFromTarget(detail, sourcePath, targetPath))
+                continue;
+
+            // Branch metadata is not consistently available on every TFS server. As a
+            // fallback, compare the source snapshot with the target's latest content.
+            // This prevents already-synchronized branch creation changesets from being
+            // offered as merge candidates.
+            if (await IsChangesetContentCoveredByTargetAsync(
+                    detail,
+                    sourcePath,
+                    targetPath,
+                    ct).ConfigureAwait(false))
             {
-                var coveringRange = mergedRanges.FirstOrDefault(range => range.Covers(changeset.ChangesetId));
-                return new MergeCandidateInfo
-                {
-                    ChangesetId = changeset.ChangesetId,
-                    CreatedAt = changeset.CreatedDate,
-                    Comment = changeset.Comment,
-                    AuthorDisplayName = changeset.Author?.DisplayName,
-                    AuthorUniqueName = changeset.Author?.UniqueName,
-                    IsMergedToTarget = coveringRange is not null,
-                    CoveredByTargetChangesetId = coveringRange?.TargetChangesetId,
-                    CoveredByRange = coveringRange,
-                };
-            })
-            .Where(candidate => !uniqueFloor.HasValue || candidate.ChangesetId > uniqueFloor.Value)
-            .Where(candidate => !candidate.IsMergedToTarget)
-            .Take(top)
-            .ToList();
+                continue;
+            }
+
+            candidates.Add(new MergeCandidateInfo
+            {
+                ChangesetId = changeset.ChangesetId,
+                CreatedAt = changeset.CreatedDate,
+                Comment = changeset.Comment,
+                AuthorDisplayName = changeset.Author?.DisplayName,
+                AuthorUniqueName = changeset.Author?.UniqueName,
+                IsMergedToTarget = false,
+            });
+
+            if (candidates.Count >= top)
+                break;
+        }
 
         return new MergeCandidateQueryResult
         {
@@ -504,6 +524,7 @@ public sealed class TfvcClientService
         int sourceChangesetId,
         string? comment = null,
         bool dryRun = false,
+        IReadOnlyList<MergeExecutionResolution>? resolutions = null,
         CancellationToken ct = default)
     {
         var normalizedSource = NormalizeServerPath(sourcePath);
@@ -517,6 +538,10 @@ public sealed class TfvcClientService
         var warnings = new List<string>();
         var plannedChanges = new List<MergeExecutionChange>();
         var tfvcChanges = new List<TfvcChange>();
+        var resolutionBySource = (resolutions ?? Array.Empty<MergeExecutionResolution>())
+            .Where(item => !string.IsNullOrWhiteSpace(item.SourceServerPath))
+            .GroupBy(item => NormalizeServerPath(item.SourceServerPath), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Last(), StringComparer.OrdinalIgnoreCase);
 
         foreach (var change in detail.Changes ?? Array.Empty<TfvcChange>())
         {
@@ -529,7 +554,55 @@ public sealed class TfvcClientService
 
             var targetServerPath = RemapServerPath(sourceItemPath, normalizedSource, normalizedTarget);
             var targetExists = await TryGetItemVersionAsync(targetServerPath, ct).ConfigureAwait(false);
+            resolutionBySource.TryGetValue(NormalizeServerPath(sourceItemPath), out var resolution);
+            var resolutionChoice = NormalizeResolutionChoice(resolution?.Choice);
+            if (IsMergeMetadataOnly(change.ChangeType))
+            {
+                plannedChanges.Add(new MergeExecutionChange
+                {
+                    SourceServerPath = sourceItemPath,
+                    TargetServerPath = targetServerPath,
+                    SourceChangesetId = sourceChangesetId,
+                    SourceChangeType = change.ChangeType.ToString(),
+                    TargetChangeType = VersionControlChangeType.None.ToString(),
+                    TargetExists = targetExists.HasValue,
+                    HasContent = false,
+                    Status = "ignored",
+                    Note = "Merge metadata only; no file content change is required.",
+                });
+                continue;
+            }
+
+            if (resolutionChoice == "target")
+            {
+                plannedChanges.Add(new MergeExecutionChange
+                {
+                    SourceServerPath = sourceItemPath,
+                    TargetServerPath = targetServerPath,
+                    SourceChangesetId = sourceChangesetId,
+                    SourceChangeType = change.ChangeType.ToString(),
+                    TargetChangeType = VersionControlChangeType.None.ToString(),
+                    TargetExists = targetExists.HasValue,
+                    HasContent = false,
+                    Status = dryRun ? "plannedTarget" : "resolvedTarget",
+                    Resolution = "target",
+                    Note = "Resolved by keeping the target branch version.",
+                });
+                continue;
+            }
+
             var targetChangeType = ResolveMergeChangeType(change.ChangeType, targetExists.HasValue, out var note);
+            if (resolutionChoice == "manual")
+            {
+                targetChangeType = VersionControlChangeType.Merge | (targetExists.HasValue ? VersionControlChangeType.Edit : VersionControlChangeType.Add);
+                note = "Resolved with manually merged content.";
+            }
+            else if (targetChangeType == VersionControlChangeType.None && resolutionChoice == "source" && CanForceSourceContentMerge(change.ChangeType))
+            {
+                targetChangeType = VersionControlChangeType.Merge | (targetExists.HasValue ? VersionControlChangeType.Edit : VersionControlChangeType.Add);
+                note = "Resolved by taking source branch content.";
+            }
+
             if (targetChangeType == VersionControlChangeType.None)
             {
                 warnings.Add(note ?? $"Skipped unsupported merge change for {sourceItemPath}.");
@@ -543,6 +616,7 @@ public sealed class TfvcClientService
                     TargetExists = targetExists.HasValue,
                     HasContent = false,
                     Status = "skipped",
+                    Resolution = resolutionChoice,
                     Note = note,
                 });
                 continue;
@@ -550,7 +624,11 @@ public sealed class TfvcClientService
 
             byte[]? content = null;
             var requiresContent = targetChangeType.HasFlag(VersionControlChangeType.Add) || targetChangeType.HasFlag(VersionControlChangeType.Edit);
-            if (requiresContent)
+            if (resolutionChoice == "manual")
+            {
+                content = DecodeManualMergeContent(resolution, sourceItemPath);
+            }
+            else if (requiresContent)
             {
                 content = await DownloadFileContentAsync(sourceItemPath, change.Item?.ChangesetVersion ?? sourceChangesetId, ct).ConfigureAwait(false);
             }
@@ -565,6 +643,7 @@ public sealed class TfvcClientService
                 TargetExists = targetExists.HasValue,
                 HasContent = content is not null,
                 Status = dryRun ? "planned" : "ready",
+                Resolution = resolutionChoice,
                 Note = note,
             });
 
@@ -631,6 +710,7 @@ public sealed class TfvcClientService
                 TargetExists = change.TargetExists,
                 HasContent = change.HasContent,
                 Status = "created",
+                Resolution = change.Resolution,
                 Note = change.Note,
             }).ToList(),
             Warnings = warnings,
@@ -754,7 +834,7 @@ public sealed class TfvcClientService
         }
     }
 
-    private async Task<byte[]> DownloadFileContentAsync(string serverPath, int changesetId, CancellationToken ct)
+    private async Task<byte[]> DownloadFileContentAsync(string serverPath, int? changesetId, CancellationToken ct)
     {
         await using var stream = new MemoryStream();
         await DownloadFileAsync(serverPath, stream, changesetId, ct).ConfigureAwait(false);
@@ -784,12 +864,6 @@ public sealed class TfvcClientService
             return VersionControlChangeType.None;
         }
 
-        if (sourceChangeType.HasFlag(VersionControlChangeType.Branch))
-        {
-            note = "Branch-creation merge is not supported in the first execute implementation.";
-            return VersionControlChangeType.None;
-        }
-
         if (sourceChangeType.HasFlag(VersionControlChangeType.Delete))
         {
             if (!targetExists)
@@ -807,8 +881,148 @@ public sealed class TfvcClientService
         if (sourceChangeType.HasFlag(VersionControlChangeType.Edit))
             return VersionControlChangeType.Merge | (targetExists ? VersionControlChangeType.Edit : VersionControlChangeType.Add);
 
+        if (sourceChangeType.HasFlag(VersionControlChangeType.Branch))
+            return VersionControlChangeType.Merge | (targetExists ? VersionControlChangeType.Edit : VersionControlChangeType.Add);
+
         note = $"Unsupported TFVC change type: {sourceChangeType}.";
         return VersionControlChangeType.None;
+    }
+
+    private async Task<bool> IsChangesetContentCoveredByTargetAsync(
+        TfvcChangeset detail,
+        string sourcePath,
+        string targetPath,
+        CancellationToken ct)
+    {
+        var normalizedSource = NormalizeServerPath(sourcePath);
+        var normalizedTarget = NormalizeServerPath(targetPath);
+        var relevantChanges = (detail.Changes ?? Array.Empty<TfvcChange>())
+            .Where(change =>
+                change.Item?.IsFolder != true
+                && !string.IsNullOrEmpty(change.Item?.Path)
+                && IsSameOrDescendantPath(change.Item.Path, normalizedSource))
+            .ToList();
+
+        if (relevantChanges.Count == 0)
+            return true;
+
+        foreach (var change in relevantChanges)
+        {
+            var sourceItemPath = change.Item!.Path!;
+            var targetItemPath = RemapServerPath(sourceItemPath, normalizedSource, normalizedTarget);
+            var targetItem = await TryGetItemSnapshotAsync(targetItemPath, null, ct).ConfigureAwait(false);
+
+            if (change.ChangeType.HasFlag(VersionControlChangeType.Delete))
+            {
+                if (targetItem is not null)
+                    return false;
+                continue;
+            }
+
+            var sourceVersion = change.Item.ChangesetVersion > 0
+                ? change.Item.ChangesetVersion
+                : detail.ChangesetId;
+            var sourceItem = await TryGetItemSnapshotAsync(sourceItemPath, sourceVersion, ct).ConfigureAwait(false);
+            if (sourceItem is null || targetItem is null)
+                return false;
+
+            if (!string.IsNullOrEmpty(sourceItem.HashValue) && !string.IsNullOrEmpty(targetItem.HashValue))
+            {
+                if (!string.Equals(sourceItem.HashValue, targetItem.HashValue, StringComparison.Ordinal))
+                    return false;
+                continue;
+            }
+
+            var sourceContent = await DownloadFileContentAsync(sourceItemPath, sourceVersion, ct).ConfigureAwait(false);
+            var targetContent = await DownloadFileContentAsync(targetItemPath, null, ct).ConfigureAwait(false);
+            if (!sourceContent.AsSpan().SequenceEqual(targetContent))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsChangesetOriginatingFromTarget(
+        TfvcChangeset detail,
+        string sourcePath,
+        string targetPath)
+    {
+        var normalizedSource = NormalizeServerPath(sourcePath);
+        var normalizedTarget = NormalizeServerPath(targetPath);
+        var relevantChanges = (detail.Changes ?? Array.Empty<TfvcChange>())
+            .Where(change =>
+                change.Item?.IsFolder != true
+                && !string.IsNullOrEmpty(change.Item?.Path)
+                && IsSameOrDescendantPath(change.Item.Path, normalizedSource))
+            .ToList();
+
+        return relevantChanges.Count > 0
+            && relevantChanges.All(change =>
+                change.MergeSources?.Any(source =>
+                    !string.IsNullOrEmpty(source.ServerItem)
+                    && IsSameOrDescendantPath(source.ServerItem, normalizedTarget)) == true);
+    }
+
+    private async Task<TfsServerItem?> TryGetItemSnapshotAsync(
+        string serverPath,
+        int? changesetId,
+        CancellationToken ct)
+    {
+        try
+        {
+            return (await GetItemsAsync(
+                    serverPath,
+                    recursive: false,
+                    atChangeset: changesetId,
+                    ct: ct).ConfigureAwait(false))
+                .FirstOrDefault(item => string.Equals(item.ServerPath, serverPath, StringComparison.OrdinalIgnoreCase));
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string NormalizeResolutionChoice(string? choice)
+    {
+        if (string.Equals(choice, "target", StringComparison.OrdinalIgnoreCase))
+            return "target";
+
+        if (string.Equals(choice, "manual", StringComparison.OrdinalIgnoreCase))
+            return "manual";
+
+        return "source";
+    }
+
+    private static bool CanForceSourceContentMerge(VersionControlChangeType sourceChangeType)
+    {
+        if (sourceChangeType.HasFlag(VersionControlChangeType.Delete))
+            return false;
+
+        return sourceChangeType.HasFlag(VersionControlChangeType.Add)
+            || sourceChangeType.HasFlag(VersionControlChangeType.Edit)
+            || sourceChangeType.HasFlag(VersionControlChangeType.Branch);
+    }
+
+    private static bool IsMergeMetadataOnly(VersionControlChangeType sourceChangeType)
+    {
+        var contentFlags = VersionControlChangeType.Add
+            | VersionControlChangeType.Edit
+            | VersionControlChangeType.Delete
+            | VersionControlChangeType.Rename
+            | VersionControlChangeType.SourceRename
+            | VersionControlChangeType.TargetRename
+            | VersionControlChangeType.Branch;
+        return sourceChangeType.HasFlag(VersionControlChangeType.Merge)
+            && (sourceChangeType & contentFlags) == VersionControlChangeType.None;
+    }
+
+    private static byte[] DecodeManualMergeContent(MergeExecutionResolution? resolution, string sourceItemPath)
+    {
+        if (string.IsNullOrWhiteSpace(resolution?.ContentBase64))
+            throw new InvalidOperationException($"Manual merge content is missing for {sourceItemPath}.");
+
+        return Convert.FromBase64String(resolution.ContentBase64);
     }
 
     // ─── Checkin ───────────────────────────────────────────────────────────────

@@ -286,6 +286,32 @@ export interface MergeCandidateResponse extends JsonEnvelope {
   }>;
 }
 
+export interface MergeExecuteResponse extends JsonEnvelope {
+  command: 'merge.execute';
+  result: {
+    sourcePath: string;
+    targetPath: string;
+    sourceChangesetId: number;
+    comment: string;
+    dryRun: boolean;
+    createdChangesetId?: number;
+    mergeBase: MergeBasePayload;
+    changes: Array<{
+      sourceServerPath: string;
+      targetServerPath: string;
+      sourceChangesetId: number;
+      sourceChangeType: string;
+      targetChangeType: string;
+      targetExists: boolean;
+      hasContent: boolean;
+      status: string;
+      resolution?: string;
+      note?: string;
+    }>;
+    warnings: string[];
+  };
+}
+
 export interface ServerItemEntry {
   serverPath: string;
   isFolder: boolean;

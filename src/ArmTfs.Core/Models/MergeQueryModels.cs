@@ -72,7 +72,16 @@ public sealed class MergeExecutionChange
     public bool TargetExists { get; init; }
     public bool HasContent { get; init; }
     public string Status { get; init; } = "planned";
+    public string? Resolution { get; init; }
     public string? Note { get; init; }
+}
+
+public sealed class MergeExecutionResolution
+{
+    public string SourceServerPath { get; init; } = string.Empty;
+    public string TargetServerPath { get; init; } = string.Empty;
+    public string Choice { get; init; } = "source";
+    public string? ContentBase64 { get; init; }
 }
 
 public sealed class MergeExecutionResult

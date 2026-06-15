@@ -1,9 +1,11 @@
+import { existsSync } from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { ArmTfsCliClient, ArmTfsCliError } from './armTfsCliClient';
 import type { BranchRef, ChangesetShowResponse, HistoryItem, MergeBaseResponse, MergeCandidateResponse, ServerItemEntry, StatusResponse } from './contracts';
 import type { ArmTfsHistoryBrowser } from './historyBrowser';
 import { t, translateCliMessage, translateCliText } from './i18n';
+import { ArmTfsMergeWorkbench } from './mergeWorkbench';
 import { checkoutServerPathToLocalFolder } from './serverPathCheckout';
 import { discoverTfvcMappingForPath, findTfvcWorkspaceRoot, findTfvcWorkspaceRootSync, getCommandCwd, isPathWithin } from './tfvcContext';
 import { openServerVersionDiff } from './versionedFiles';
@@ -201,15 +203,15 @@ export class ArmTfsSidebarController implements vscode.Disposable {
         }
       }),
       vscode.commands.registerCommand('armTfs.sidebar.useMergeTarget', async (targetPath: string) => this.useMergeTarget(targetPath)),
-      vscode.commands.registerCommand('armTfs.sidebar.setBranchScope', async (node?: BranchNode) => this.setBranchScope(node?.branch.path)),
-      vscode.commands.registerCommand('armTfs.sidebar.setMergeSource', async (node?: BranchNode) => this.setMergePath(MERGE_SOURCE_KEY, t('sidebar.prompt.mergeSourcePath'), node?.branch.path)),
-      vscode.commands.registerCommand('armTfs.sidebar.setMergeTarget', async (node?: BranchNode) => this.setMergePath(MERGE_TARGET_KEY, t('sidebar.prompt.mergeTargetPath'), node?.branch.path)),
+      vscode.commands.registerCommand('armTfs.sidebar.setBranchScope', async (node?: BranchNode | ServerExplorerNode) => this.setBranchScope(getNodeServerPath(node))),
+      vscode.commands.registerCommand('armTfs.sidebar.setMergeSource', async (node?: BranchNode | ServerExplorerNode) => this.setMergePath(MERGE_SOURCE_KEY, t('sidebar.prompt.mergeSourcePath'), getNodeServerPath(node))),
+      vscode.commands.registerCommand('armTfs.sidebar.setMergeTarget', async (node?: BranchNode | ServerExplorerNode) => this.setMergePath(MERGE_TARGET_KEY, t('sidebar.prompt.mergeTargetPath'), getNodeServerPath(node))),
       vscode.commands.registerCommand('armTfs.sidebar.copyTfvcPath', async (node?: BranchNode | MergeTargetOptionNode | string) => this.copyTfvcPath(node)),
-      vscode.commands.registerCommand('armTfs.sidebar.pullBranch', async (node?: BranchNode) => this.pullBranch(node)),
-      vscode.commands.registerCommand('armTfs.sidebar.checkoutBranch', async (node?: BranchNode) => this.checkoutBranch(node)),
-      vscode.commands.registerCommand('armTfs.sidebar.showBranchHistory', async (node?: BranchNode) => this.showBranchHistory(node)),
-      vscode.commands.registerCommand('armTfs.sidebar.mergeFromBranch', async (node?: BranchNode) => this.mergeFromBranch(node)),
-      vscode.commands.registerCommand('armTfs.sidebar.addBranch', async (node?: BranchNode) => this.addBranch(node)),
+      vscode.commands.registerCommand('armTfs.sidebar.pullBranch', async (node?: BranchNode | ServerExplorerNode) => this.pullBranch(node)),
+      vscode.commands.registerCommand('armTfs.sidebar.checkoutBranch', async (node?: BranchNode | ServerExplorerNode) => this.checkoutBranch(node)),
+      vscode.commands.registerCommand('armTfs.sidebar.showBranchHistory', async (node?: BranchNode | ServerExplorerNode) => this.showBranchHistory(node)),
+      vscode.commands.registerCommand('armTfs.sidebar.mergeFromBranch', async (node?: BranchNode | ServerExplorerNode) => this.mergeFromBranch(node)),
+      vscode.commands.registerCommand('armTfs.sidebar.addBranch', async (node?: BranchNode | ServerExplorerNode) => this.addBranch(node)),
       vscode.commands.registerCommand('armTfs.history.diffPrevious', async (node?: HistoryNode) => this.diffHistoryNodeWithPrevious(node)),
       vscode.commands.registerCommand('armTfs.history.selectForCompare', async (node?: HistoryNode) => this.selectChangesetForCompare(node)),
       vscode.commands.registerCommand('armTfs.history.compareSelected', async (node?: HistoryNode) => this.compareWithSelectedChangeset(node)),
@@ -591,10 +593,13 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     if (!this.workspaceStatus) {
       return undefined;
     }
-    const normalizedAnchor = anchorPath ? path.resolve(anchorPath).toLowerCase() : undefined;
+    const normalizedAnchor = anchorPath ? normalizeForCompare(anchorPath) : undefined;
     const mapping = this.workspaceStatus.workspace.mappings
-      .filter((item) => !normalizedAnchor || normalizedAnchor === path.resolve(item.localPath).toLowerCase()
-        || normalizedAnchor.startsWith(`${path.resolve(item.localPath).toLowerCase()}${path.sep}`))
+      .filter((item) => {
+        const normalizedMapping = normalizeForCompare(item.localPath);
+        return !normalizedAnchor || normalizedAnchor === normalizedMapping
+          || normalizedAnchor.startsWith(`${normalizedMapping}${path.sep}`);
+      })
       .sort((left, right) => right.localPath.length - left.localPath.length)[0];
     return mapping?.serverPath ? cleanServerPath(mapping.serverPath) : undefined;
   }
@@ -619,6 +624,28 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     }
 
     return undefined;
+  }
+
+  private async getMergeTargetBranchPaths(sourcePath: string): Promise<string[]> {
+    try {
+      const response = await this.client.branchShow(sourcePath);
+      const children = response.branch.children
+        ?.map((item) => cleanServerPath(item))
+        .filter((item) => normalizeServerPath(item) !== normalizeServerPath(sourcePath))
+        .sort((left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' })) ?? [];
+
+      if (children.length) {
+        return children;
+      }
+
+      if (response.branch.parentPath) {
+        return [cleanServerPath(response.branch.parentPath)];
+      }
+    } catch (error) {
+      this.output.appendLine(`arm-tfs merge target branch show: ${getErrorMessage(error)}`);
+    }
+
+    return this.getSiblingBranchPaths(sourcePath);
   }
 
   private async getSiblingBranchPaths(sourcePath: string): Promise<string[]> {
@@ -652,13 +679,15 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     await this.refreshMerge();
   }
 
-  private async copyTfvcPath(node?: BranchNode | MergeTargetOptionNode | string): Promise<void> {
+  private async copyTfvcPath(node?: BranchNode | MergeTargetOptionNode | ServerExplorerNode | string): Promise<void> {
     const tfvcPath = typeof node === 'string'
       ? node
       : node instanceof BranchNode
         ? node.branch.path
         : node instanceof MergeTargetOptionNode
           ? node.targetPath
+          : node instanceof ServerExplorerNode
+            ? node.entry.serverPath
           : undefined;
 
     if (!tfvcPath) {
@@ -746,7 +775,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     await this.refreshMerge();
   }
 
-  private async pullBranch(node?: BranchNode): Promise<void> {
+  private async pullBranch(node?: BranchNode | ServerExplorerNode): Promise<void> {
     const mapped = this.resolveMappedBranchPath(node, 'pull');
     if (!mapped) {
       return;
@@ -772,7 +801,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     }
   }
 
-  private async checkoutBranch(node?: BranchNode): Promise<void> {
+  private async checkoutBranch(node?: BranchNode | ServerExplorerNode): Promise<void> {
     const mapped = this.resolveMappedBranchPath(node, 'checkout');
     if (!mapped) {
       return;
@@ -798,25 +827,31 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     }
   }
 
-  private async showBranchHistory(node?: BranchNode): Promise<void> {
-    if (!node) {
+  private async showBranchHistory(node?: BranchNode | ServerExplorerNode): Promise<void> {
+    const branchPath = getNodeServerPath(node);
+    if (!branchPath) {
       void vscode.window.showWarningMessage(t('sidebar.warning.selectBranchFromView'));
       return;
     }
 
-    await this.historyBrowser.open(node.branch.path);
+    await this.historyBrowser.open(branchPath);
   }
 
-  private async mergeFromBranch(node?: BranchNode): Promise<void> {
-    if (!node) {
+  private async mergeFromBranch(node?: BranchNode | ServerExplorerNode): Promise<void> {
+    const sourcePath = getNodeServerPath(node);
+    if (!sourcePath) {
       void vscode.window.showWarningMessage(t('sidebar.warning.selectSourceBranch'));
       return;
     }
 
-    const sourcePath = node.branch.path;
-    const siblingTargets = await this.getSiblingBranchPaths(sourcePath);
+    const targetBranches = await this.getMergeTargetBranchPaths(sourcePath);
+    if (!targetBranches.length) {
+      void vscode.window.showWarningMessage(t('sidebar.merge.noTargets'));
+      return;
+    }
+
     const target = await vscode.window.showQuickPick(
-      siblingTargets.map((targetPath) => ({
+      targetBranches.map((targetPath) => ({
         label: path.posix.basename(targetPath),
         description: targetPath,
         targetPath,
@@ -835,35 +870,28 @@ export class ArmTfsSidebarController implements vscode.Disposable {
         void vscode.window.showInformationMessage(t('sidebar.noMergeCandidates'));
         return;
       }
-      const candidate = await vscode.window.showQuickPick(
-        response.items.map((item) => ({
-          label: `cs${item.changesetId}`,
-          description: buildMergeCandidateDescription(item),
-          item,
-        })),
-        { placeHolder: t('sidebar.merge.pickCandidate') },
-      );
-      if (!candidate) {
-        return;
-      }
-      await this.executeMergeCandidate(new MergeCandidateNode(
+      await ArmTfsMergeWorkbench.open(
+        this.client,
+        this.output,
         sourcePath,
         target.targetPath,
-        candidate.item.changesetId,
-        buildMergeCandidateDescription(candidate.item),
-        `${candidate.item.comment ?? ''}\n${candidate.item.createdAt}\n${candidate.item.author?.displayName ?? ''}`.trim(),
-      ));
+        response,
+        async () => {
+          await this.refreshScm();
+          await this.refreshAll();
+        },
+      );
     } catch (error) {
       this.showError('arm-tfs merge', error);
     }
   }
 
-  private async addBranch(node?: BranchNode): Promise<void> {
-    if (!node) {
+  private async addBranch(node?: BranchNode | ServerExplorerNode): Promise<void> {
+    const sourcePath = getNodeServerPath(node);
+    if (!sourcePath) {
       void vscode.window.showWarningMessage(t('sidebar.warning.selectBranchFromView'));
       return;
     }
-    const sourcePath = node.branch.path;
     const parent = getServerParentPath(sourcePath) ?? '$/';
     const targetPath = await vscode.window.showInputBox({
       prompt: t('sidebar.branch.createTarget'),
@@ -992,8 +1020,9 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     }
   }
 
-  private resolveMappedBranchPath(node: BranchNode | undefined, action: 'pull' | 'checkout'): MappedBranchPath | undefined {
-    if (!node) {
+  private resolveMappedBranchPath(node: BranchNode | ServerExplorerNode | undefined, action: 'pull' | 'checkout'): MappedBranchPath | undefined {
+    const branchPath = getNodeServerPath(node);
+    if (!branchPath) {
       void vscode.window.showWarningMessage(t('sidebar.warning.beforeAction', { action }));
       return undefined;
     }
@@ -1003,9 +1032,9 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       return undefined;
     }
 
-    const mapped = resolveMappedLocalPathForServerPath(node.branch.path, this.workspaceStatus, this.resolvedWorkspaceRoot);
+    const mapped = resolveMappedLocalPathForServerPath(branchPath, this.workspaceStatus, this.resolvedWorkspaceRoot);
     if (!mapped) {
-      void vscode.window.showWarningMessage(t('sidebar.warning.branchNotMapped', { path: node.branch.path }));
+      void vscode.window.showWarningMessage(t('sidebar.warning.branchNotMapped', { path: branchPath }));
       return undefined;
     }
 
@@ -1175,6 +1204,16 @@ function buildMergeCandidateDescription(item: MergeCandidateResponse['items'][nu
   return `${author} | ${item.createdAt.slice(0, 10)}`;
 }
 
+function getNodeServerPath(node: BranchNode | ServerExplorerNode | undefined): string | undefined {
+  if (node instanceof BranchNode) {
+    return node.branch.path;
+  }
+  if (node instanceof ServerExplorerNode) {
+    return node.entry.serverPath;
+  }
+  return undefined;
+}
+
 function samePath(left: string, right: string): boolean {
   return normalizeForCompare(left) === normalizeForCompare(right);
 }
@@ -1186,7 +1225,7 @@ function isSameOrChildPath(candidate: string, parent: string): boolean {
 }
 
 function normalizeForCompare(targetPath: string): string {
-  return path.resolve(targetPath).toLowerCase();
+  return path.resolve(translatePlatformSharedPath(targetPath)).toLowerCase();
 }
 
 function getConfigTarget(): vscode.ConfigurationTarget {
@@ -1213,7 +1252,8 @@ function resolveMappedLocalPathForServerPath(
   for (const mapping of status.workspace.mappings) {
     if (isSameOrChildServerPath(serverPath, mapping.serverPath)) {
       const suffix = getServerPathSuffix(serverPath, mapping.serverPath);
-      const localPath = suffix ? path.join(mapping.localPath, ...suffix.split('/')) : mapping.localPath;
+      const mappingLocalPath = translatePlatformSharedPath(mapping.localPath);
+      const localPath = suffix ? path.join(mappingLocalPath, ...suffix.split('/')) : mappingLocalPath;
       const score = mapping.serverPath.length + 1000;
       if (!bestMatch || score > bestMatch.score) {
         bestMatch = { localPath, score };
@@ -1224,7 +1264,7 @@ function resolveMappedLocalPathForServerPath(
     if (isSameOrChildServerPath(mapping.serverPath, serverPath)) {
       const score = mapping.serverPath.length;
       if (!bestMatch || score > bestMatch.score) {
-        bestMatch = { localPath: mapping.localPath, score };
+        bestMatch = { localPath: translatePlatformSharedPath(mapping.localPath), score };
       }
     }
   }
@@ -1262,6 +1302,42 @@ function cleanServerPath(serverPath: string): string {
 
 function normalizeServerPath(serverPath: string): string {
   return cleanServerPath(serverPath).toLowerCase();
+}
+
+function translatePlatformSharedPath(targetPath: string): string {
+  if (process.platform !== 'darwin' && process.platform !== 'win32') {
+    return targetPath;
+  }
+
+  const normalized = targetPath.replace(/\\/g, '/');
+  const home = getPlatformSharedHomeDirectory();
+  if (!home) {
+    return targetPath;
+  }
+
+  for (const prefix of ['//Mac/Home/', '/Mac/Home/']) {
+    if (normalized.toLowerCase().startsWith(prefix.toLowerCase())) {
+      return path.join(home, normalized.slice(prefix.length));
+    }
+  }
+
+  const withoutDrive = /^[A-Za-z]:\//.test(normalized) ? normalized.slice(3) : normalized;
+  const drivePrefix = 'Mac/Home/';
+  if (withoutDrive.toLowerCase().startsWith(drivePrefix.toLowerCase())) {
+    return path.join(home, withoutDrive.slice(drivePrefix.length));
+  }
+
+  return targetPath;
+}
+
+function getPlatformSharedHomeDirectory(): string | undefined {
+  if (process.platform === 'darwin') {
+    return process.env.HOME;
+  }
+  if (process.platform === 'win32' && existsSync('C:\\Mac\\Home')) {
+    return 'C:\\Mac\\Home';
+  }
+  return undefined;
 }
 
 function getServerParentPath(serverPath: string): string | undefined {

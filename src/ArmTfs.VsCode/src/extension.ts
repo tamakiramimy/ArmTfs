@@ -56,6 +56,22 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     await sidebar.refreshAll();
   };
 
+  let workspaceFileRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  const scheduleWorkspaceFileRefresh = (uri: vscode.Uri) => {
+    if (!shouldRefreshForFileSystemEvent(uri)) {
+      return;
+    }
+
+    if (workspaceFileRefreshTimer) {
+      clearTimeout(workspaceFileRefreshTimer);
+    }
+    workspaceFileRefreshTimer = setTimeout(() => {
+      workspaceFileRefreshTimer = undefined;
+      void refreshUi();
+    }, 800);
+  };
+  const workspaceFileWatcher = vscode.workspace.createFileSystemWatcher('**/*');
+
   const refreshLanguageUi = async () => {
     scm.refreshLabels();
     connections.refreshLabels();
@@ -68,7 +84,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     await refreshUi();
   };
 
-  context.subscriptions.push(output, historyBrowser, scm, sidebar, serverExplorer, connections, vscode.window.registerFileDecorationProvider(scm));
+  context.subscriptions.push(output, historyBrowser, scm, sidebar, serverExplorer, connections, workspaceFileWatcher, vscode.window.registerFileDecorationProvider(scm));
   void (async () => {
     await connections.initialize();
     await scm.initialize();
@@ -108,6 +124,9 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
         void refreshLanguageUi();
       }
     }),
+    workspaceFileWatcher.onDidChange(scheduleWorkspaceFileRefresh),
+    workspaceFileWatcher.onDidCreate(scheduleWorkspaceFileRefresh),
+    workspaceFileWatcher.onDidDelete(scheduleWorkspaceFileRefresh),
   );
 
   const register = (command: string, callback: (input?: CommandInput) => Promise<unknown>) => {
@@ -740,6 +759,13 @@ function parseCommandInput(raw: unknown): CommandInput | undefined {
     };
   }
 
+  if (isServerExplorerNodeLike(raw)) {
+    return {
+      path: raw.entry.serverPath,
+      serverPath: raw.entry.serverPath,
+    };
+  }
+
   return isCommandInput(raw) ? raw : undefined;
 }
 
@@ -750,6 +776,18 @@ function isBranchNodeLike(value: unknown): value is { branch: { path: string } }
 
   const branch = (value as { branch?: unknown }).branch;
   return typeof branch === 'object' && branch !== null && 'path' in branch && typeof (branch as { path: unknown }).path === 'string';
+}
+
+function isServerExplorerNodeLike(value: unknown): value is { entry: { serverPath: string } } {
+  if (typeof value !== 'object' || value === null || !('entry' in value)) {
+    return false;
+  }
+
+  const entry = (value as { entry?: unknown }).entry;
+  return typeof entry === 'object'
+    && entry !== null
+    && 'serverPath' in entry
+    && typeof (entry as { serverPath: unknown }).serverPath === 'string';
 }
 
 function isCommandInput(value: unknown): value is CommandInput {
@@ -817,6 +855,15 @@ function getActivePath(): string | undefined {
 
 function getWorkspaceRoot(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+}
+
+function shouldRefreshForFileSystemEvent(uri: vscode.Uri): boolean {
+  if (uri.scheme !== 'file') {
+    return false;
+  }
+
+  const normalized = uri.fsPath.replace(/\\/g, '/').toLowerCase();
+  return !/(^|\/)(\.git|\.tf|node_modules|bin|obj|out)(\/|$)/.test(normalized);
 }
 
 interface LocalWorkspaceContext {

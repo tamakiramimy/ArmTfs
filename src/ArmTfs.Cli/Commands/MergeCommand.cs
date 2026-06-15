@@ -3,6 +3,7 @@ using ArmTfs.Core.Client;
 using ArmTfs.Core.Config;
 using ArmTfs.Core.Models;
 using ArmTfs.Core.Workspace;
+using System.Text.Json;
 
 namespace ArmTfs.Cli.Commands;
 
@@ -26,6 +27,7 @@ public static class MergeCommand
         var changesetOpt = new Option<int>("--changeset") { Description = "Source changeset ID to merge", IsRequired = true };
         var commentOpt = new Option<string?>("--comment") { Description = "Comment for the created merge changeset" };
         var dryRunOpt = new Option<bool>("--dry-run") { Description = "Show the merge plan without creating a TFVC changeset" };
+        var resolutionFileOpt = new Option<FileInfo?>("--resolution-file") { Description = "JSON file with per-file merge resolutions" };
         var formatOpt = new Option<string>("--format", () => "table") { Description = "Output format: table | json" };
 
         sourceOpt.IsRequired = true;
@@ -36,9 +38,10 @@ public static class MergeCommand
         cmd.AddOption(changesetOpt);
         cmd.AddOption(commentOpt);
         cmd.AddOption(dryRunOpt);
+        cmd.AddOption(resolutionFileOpt);
         cmd.AddOption(formatOpt);
 
-        cmd.SetHandler(async (source, target, changesetId, comment, dryRun, format) =>
+        cmd.SetHandler(async (source, target, changesetId, comment, dryRun, resolutionFile, format) =>
         {
             using var conn = new TfsConnection(config);
             var svc = new TfvcClientService(conn);
@@ -47,7 +50,8 @@ public static class MergeCommand
             {
                 var resolvedSource = ResolveServerPath(source);
                 var resolvedTarget = ResolveServerPath(target);
-                var result = await svc.MergeChangesetAsync(resolvedSource, resolvedTarget, changesetId, comment, dryRun).ConfigureAwait(false);
+                var resolutions = LoadMergeResolutions(resolutionFile);
+                var result = await svc.MergeChangesetAsync(resolvedSource, resolvedTarget, changesetId, comment, dryRun, resolutions).ConfigureAwait(false);
 
                 if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
                 {
@@ -91,7 +95,7 @@ public static class MergeCommand
                 Console.Error.WriteLine($"Error: {ex.Message}");
                 Environment.ExitCode = 1;
             }
-        }, sourceOpt, targetOpt, changesetOpt, commentOpt, dryRunOpt, formatOpt);
+        }, sourceOpt, targetOpt, changesetOpt, commentOpt, dryRunOpt, resolutionFileOpt, formatOpt);
 
         return cmd;
     }
@@ -352,8 +356,27 @@ public static class MergeCommand
             targetExists = change.TargetExists,
             hasContent = change.HasContent,
             status = change.Status,
+            resolution = change.Resolution,
             note = change.Note,
         }),
         warnings = result.Warnings,
     };
+
+    private static IReadOnlyList<MergeExecutionResolution>? LoadMergeResolutions(FileInfo? resolutionFile)
+    {
+        if (resolutionFile is null)
+            return null;
+
+        if (!resolutionFile.Exists)
+            throw new FileNotFoundException("Merge resolution file was not found.", resolutionFile.FullName);
+
+        var json = File.ReadAllText(resolutionFile.FullName);
+        if (string.IsNullOrWhiteSpace(json))
+            return Array.Empty<MergeExecutionResolution>();
+
+        return JsonSerializer.Deserialize<IReadOnlyList<MergeExecutionResolution>>(json, new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true,
+        }) ?? Array.Empty<MergeExecutionResolution>();
+    }
 }

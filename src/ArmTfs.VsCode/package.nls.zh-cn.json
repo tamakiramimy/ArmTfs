@@ -52,7 +52,7 @@
   "command.sidebarPullBranch": "拉取分支",
   "command.sidebarCheckoutBranch": "签出分支",
   "command.sidebarShowBranchHistory": "查看分支历史",
-  "command.sidebarMergeFromBranch": "从该分支发起合并",
+  "command.sidebarMergeFromBranch": "从本分支合并到目标分支",
   "command.sidebarAddBranch": "从此处创建分支",
   "command.historyDiffPrevious": "与上一版本比较",
   "command.historyOpenBrowser": "打开 TFVC 历史浏览器",

@@ -52,7 +52,7 @@
   "command.sidebarPullBranch": "Pull Branch",
   "command.sidebarCheckoutBranch": "Checkout Branch",
   "command.sidebarShowBranchHistory": "Show Branch History",
-  "command.sidebarMergeFromBranch": "Merge From Branch",
+  "command.sidebarMergeFromBranch": "Merge This Branch Into Target Branch",
   "command.sidebarAddBranch": "Create Branch From Here",
   "command.historyDiffPrevious": "Compare With Previous Version",
   "command.historyOpenBrowser": "Open TFVC History Browser",

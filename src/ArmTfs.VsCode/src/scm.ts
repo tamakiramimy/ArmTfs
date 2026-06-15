@@ -464,11 +464,47 @@ function getBaseFilePath(rootPath: string, localPath: string): string {
 }
 
 function normalizeLocalPath(localPath: string): string {
-  const fullPath = path.resolve(localPath);
+  const fullPath = path.resolve(translatePlatformSharedPath(localPath));
   if (process.platform === 'darwin' && fullPath.startsWith('/private/tmp')) {
     return `/tmp${fullPath.slice('/private/tmp'.length)}`;
   }
   return fullPath;
+}
+
+function translatePlatformSharedPath(localPath: string): string {
+  if (process.platform !== 'darwin' && process.platform !== 'win32') {
+    return localPath;
+  }
+
+  const normalized = localPath.replace(/\\/g, '/');
+  const home = getPlatformSharedHomeDirectory();
+  if (!home) {
+    return localPath;
+  }
+
+  for (const prefix of ['//Mac/Home/', '/Mac/Home/']) {
+    if (normalized.toLowerCase().startsWith(prefix.toLowerCase())) {
+      return path.join(home, normalized.slice(prefix.length));
+    }
+  }
+
+  const withoutDrive = /^[A-Za-z]:\//.test(normalized) ? normalized.slice(3) : normalized;
+  const drivePrefix = 'Mac/Home/';
+  if (withoutDrive.toLowerCase().startsWith(drivePrefix.toLowerCase())) {
+    return path.join(home, withoutDrive.slice(drivePrefix.length));
+  }
+
+  return localPath;
+}
+
+function getPlatformSharedHomeDirectory(): string | undefined {
+  if (process.platform === 'darwin') {
+    return process.env.HOME;
+  }
+  if (process.platform === 'win32' && existsSync('C:\\Mac\\Home')) {
+    return 'C:\\Mac\\Home';
+  }
+  return undefined;
 }
 
 function getActivePath(): string | undefined {

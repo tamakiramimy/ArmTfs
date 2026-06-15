@@ -379,11 +379,6 @@
           "group": "navigation@2"
         },
         {
-          "command": "armTfs.checkoutServerPathToFolder",
-          "when": "view == armTfs.branches",
-          "group": "navigation@3"
-        },
-        {
           "command": "armTfs.sidebar.refresh",
           "when": "view == armTfs.historyGraph",
           "group": "navigation@1"
@@ -413,62 +408,87 @@
         {
           "command": "armTfs.serverExplorer.getLatest",
           "when": "view == armTfs.serverExplorer && viewItem =~ /armTfsServer(Folder|File)/",
-          "group": "inline@1"
+          "group": "context@1"
         },
         {
           "command": "armTfs.serverExplorer.checkout",
           "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFile",
-          "group": "inline@2"
+          "group": "context@2"
         },
         {
           "command": "armTfs.serverExplorer.showHistory",
           "when": "view == armTfs.serverExplorer && viewItem =~ /armTfsServer(Folder|File)/",
-          "group": "inline@3"
+          "group": "context@3"
         },
         {
           "command": "armTfs.serverExplorer.setRoot",
           "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
-          "group": "context@1"
+          "group": "context@4"
         },
         {
           "command": "armTfs.serverExplorer.copyPath",
           "when": "view == armTfs.serverExplorer && viewItem =~ /armTfsServer(Folder|File)/",
-          "group": "context@2"
+          "group": "context@5"
+        },
+        {
+          "command": "armTfs.checkoutServerPathToFolder",
+          "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
+          "group": "context@6"
+        },
+        {
+          "command": "armTfs.sidebar.mergeFromBranch",
+          "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
+          "group": "context@7"
+        },
+        {
+          "command": "armTfs.sidebar.addBranch",
+          "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
+          "group": "context@8"
+        },
+        {
+          "command": "armTfs.sidebar.pullBranch",
+          "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
+          "group": "context@9"
+        },
+        {
+          "command": "armTfs.sidebar.checkoutBranch",
+          "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
+          "group": "context@10"
         },
         {
           "command": "armTfs.sidebar.pullBranch",
           "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
-          "group": "inline@1"
+          "group": "context@1"
         },
         {
           "command": "armTfs.sidebar.checkoutBranch",
           "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
-          "group": "inline@2"
+          "group": "context@2"
         },
         {
           "command": "armTfs.sidebar.copyTfvcPath",
           "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
-          "group": "context@1"
+          "group": "context@3"
         },
         {
           "command": "armTfs.sidebar.mergeFromBranch",
           "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
-          "group": "context@2"
+          "group": "context@4"
         },
         {
           "command": "armTfs.sidebar.addBranch",
           "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
-          "group": "context@3"
+          "group": "context@5"
         },
         {
           "command": "armTfs.sidebar.showBranchHistory",
           "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
-          "group": "context@4"
+          "group": "context@6"
         },
         {
           "command": "armTfs.checkoutServerPathToFolder",
           "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
-          "group": "context@5"
+          "group": "context@7"
         },
         {
           "command": "armTfs.history.diffPrevious",
