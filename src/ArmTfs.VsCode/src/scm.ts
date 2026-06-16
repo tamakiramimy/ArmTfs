@@ -133,7 +133,7 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
     }
   }
 
-  async checkout(resource?: ArmTfsResourceState | vscode.Uri): Promise<void> {
+  async checkout(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
     const targetPath = resolveResourcePath(resource) ?? getActivePath();
     if (!targetPath) {
       void vscode.window.showWarningMessage(t('warning.noFile.checkout'));
@@ -149,7 +149,7 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
     await this.runTextCommand('arm-tfs checkout', () => this.client.checkout([targetPath], false, { cwdOverride: getCommandCwd(workspaceRoot, targetPath) }), true);
   }
 
-  async add(resource?: ArmTfsResourceState | vscode.Uri): Promise<void> {
+  async add(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
     const targetPath = resolveResourcePath(resource) ?? getActivePath();
     if (!targetPath) {
       void vscode.window.showWarningMessage(t('warning.noFile.add'));
@@ -163,11 +163,17 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
     }
 
     const cwdOverride = getCommandCwd(workspaceRoot, targetPath);
+    let recursive = false;
+    try {
+      recursive = statSync(targetPath).isDirectory();
+    } catch {
+      recursive = false;
+    }
 
     // Try once; if the CLI reports [NO MAPPING], auto-register using a configured mapping and retry.
     const result = await this.runTextCommand('arm-tfs add', async () => {
       try {
-        return await this.client.add([targetPath], false, { cwdOverride });
+        return await this.client.add([targetPath], recursive, { cwdOverride });
       } catch (error) {
         if (isNoMappingError(error)) {
           const mapped = await tryAutoRegisterMapping(this.client, targetPath);
@@ -175,7 +181,7 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
             void vscode.window.showInformationMessage(
               t('connections.workspaceMappings.autoRegistered', { serverPath: mapped.serverPath, localPath: mapped.localPath }),
             );
-            return this.client.add([targetPath], false, { cwdOverride });
+            return this.client.add([targetPath], recursive, { cwdOverride });
           }
         }
         throw error;
@@ -184,7 +190,7 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
     return result as unknown as void;
   }
 
-  async undo(resource?: ArmTfsResourceState | vscode.Uri): Promise<void> {
+  async undo(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
     const targetPath = resolveResourcePath(resource) ?? getActivePath();
     if (!targetPath) {
       void vscode.window.showWarningMessage(t('warning.noFile.undo'));
@@ -220,7 +226,7 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
     }
   }
 
-  async openDiff(resource?: ArmTfsResourceState | vscode.Uri): Promise<void> {
+  async openDiff(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
     const targetPath = resolveResourcePath(resource) ?? getActivePath();
     if (!targetPath) {
       void vscode.window.showWarningMessage(t('warning.noFile.diff'));
@@ -413,7 +419,7 @@ function collectAffectedUris(
   return [...affected.values()];
 }
 
-function resolveResourcePath(resource: ArmTfsResourceState | vscode.Uri | undefined): string | undefined {
+function resolveResourcePath(resource: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri | undefined): string | undefined {
   if (!resource) {
     return undefined;
   }

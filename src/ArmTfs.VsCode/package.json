@@ -607,13 +607,18 @@
           "group": "inline@3"
         },
         {
+          "command": "armTfs.addResource",
+          "when": "scmProvider == armTfs && scmResourceState == armTfsUntracked",
+          "group": "inline@1"
+        },
+        {
           "command": "armTfs.undoResource",
-          "when": "scmProvider == armTfs && scmResourceState != armTfsModifiedNotCheckedOut",
+          "when": "scmProvider == armTfs && scmResourceState != armTfsModifiedNotCheckedOut && scmResourceState != armTfsUntracked",
           "group": "inline@4"
         },
         {
           "command": "armTfs.showHistory",
-          "when": "scmProvider == armTfs",
+          "when": "scmProvider == armTfs && scmResourceState != armTfsUntracked",
           "group": "context@1"
         }
       ],
