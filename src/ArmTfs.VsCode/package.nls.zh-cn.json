@@ -59,5 +59,6 @@
   "command.historySelectCompare": "选择变更集作为比较基准",
   "command.historyCompareSelected": "与已选变更集比较",
   "command.sidebarSwapMergePaths": "交换合并源和目标",
+  "command.sidebarUseMergeTarget": "用作合并目标",
   "command.sidebarExecuteMergeCandidate": "执行合并候选"
 }

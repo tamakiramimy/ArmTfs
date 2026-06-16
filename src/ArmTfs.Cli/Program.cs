@@ -52,7 +52,15 @@ var parser = new CommandLineBuilder(rootCommand)
     .UseDefaults()
     .Build();
 
-return await parser.InvokeAsync(args);
+// System.CommandLine returns the parser/invocation result as the process exit code.
+// However, command handlers report failures by writing to stderr and setting
+// Environment.ExitCode = 1 (instead of throwing). Because returning an int from the
+// top-level program overrides Environment.ExitCode, a handler failure would otherwise be
+// masked as a successful exit (0). Honor a non-zero Environment.ExitCode so callers (e.g.
+// the VS Code extension) can reliably detect failures rather than treating error output as
+// success.
+var invokeExitCode = await parser.InvokeAsync(args);
+return invokeExitCode != 0 ? invokeExitCode : Environment.ExitCode;
 
 // ─── 扩展方法 ──────────────────────────────────────────────────────────────────
 static class Extensions

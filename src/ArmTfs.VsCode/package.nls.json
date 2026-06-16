@@ -59,5 +59,6 @@
   "command.historySelectCompare": "Select Changeset For Compare",
   "command.historyCompareSelected": "Compare With Selected Changeset",
   "command.sidebarSwapMergePaths": "Swap Merge Source and Target",
+  "command.sidebarUseMergeTarget": "Use as Merge Target",
   "command.sidebarExecuteMergeCandidate": "Execute Merge Candidate"
 }

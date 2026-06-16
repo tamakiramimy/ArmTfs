@@ -4,7 +4,7 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { ArmTfsCliClient } from './armTfsCliClient';
 import type { MergeCandidateResponse, MergeExecuteResponse } from './contracts';
-import { t, translateCliText } from './i18n';
+import { t } from './i18n';
 import { openServerVersionDiff, openServerVersionDiffFromEmpty } from './versionedFiles';
 
 type MergePlanChange = MergeExecuteResponse['result']['changes'][number];
@@ -282,6 +282,8 @@ export class ArmTfsMergeWorkbench {
     }
 
     const outputs: string[] = [];
+    const createdIds: number[] = [];
+    const noChangeIds: number[] = [];
     const resolutionFiles: string[] = [];
     try {
       await vscode.window.withProgress(
@@ -296,7 +298,7 @@ export class ArmTfsMergeWorkbench {
             });
             const resolutionFile = await writeResolutionFile(resolutionItemsByChangeset.get(candidate.changesetId) ?? []);
             resolutionFiles.push(resolutionFile);
-            const result = await this.client.mergeExecute(
+            const response = await this.client.mergeExecuteJson(
               this.state.sourcePath,
               this.state.targetPath,
               candidate.changesetId,
@@ -305,19 +307,44 @@ export class ArmTfsMergeWorkbench {
                 resolutionFile,
               },
             );
-            outputs.push(`cs${candidate.changesetId}\n${result}`);
+            const createdId = response.result.createdChangesetId;
+            if (createdId !== null && createdId !== undefined) {
+              createdIds.push(createdId);
+            } else {
+              noChangeIds.push(candidate.changesetId);
+            }
+            outputs.push(summarizeMergeResponse(response));
           }
         },
       );
 
-      const document = await vscode.workspace.openTextDocument({
-        language: 'text',
-        content: translateCliText(outputs.join('\n\n')),
-      });
-      await vscode.window.showTextDocument(document, { preview: false });
+      // Write the full outcome to the output channel (the "console") instead of opening a
+      // throwaway document, and surface concise toasts that reflect what actually happened.
+      this.output.appendLine('> arm-tfs merge execute');
+      this.output.appendLine(outputs.join('\n\n'));
+      this.output.appendLine('');
+
       await this.refreshAfterExecute();
-      void vscode.window.showInformationMessage(`已执行 ${selected.length} 个 Changeset 的合并。`);
-      this.panel.dispose();
+
+      if (createdIds.length) {
+        void vscode.window.showInformationMessage(
+          t('merge.execute.success', {
+            count: createdIds.length,
+            created: createdIds.map((id) => `cs${id}`).join(', '),
+          }),
+        );
+      }
+      if (noChangeIds.length) {
+        void vscode.window.showWarningMessage(
+          t('merge.execute.noChange', {
+            changesets: noChangeIds.map((id) => `cs${id}`).join(', '),
+          }),
+        );
+      }
+
+      if (createdIds.length) {
+        this.panel.dispose();
+      }
     } catch (error) {
       this.showError('arm-tfs merge execute', error);
     } finally {
@@ -843,6 +870,26 @@ function renderConflict(
         </div>
       </div>
     </article>`;
+}
+
+function summarizeMergeResponse(response: MergeExecuteResponse): string {
+  const result = response.result;
+  const lines: string[] = [];
+  const createdId = result.createdChangesetId;
+  const header = createdId !== null && createdId !== undefined
+    ? `cs${result.sourceChangesetId} -> created cs${createdId}`
+    : `cs${result.sourceChangesetId} -> no changeset created`;
+  lines.push(header);
+  for (const change of result.changes) {
+    lines.push(`  [${change.status}] ${change.targetServerPath} (${change.sourceChangeType} -> ${change.targetChangeType})`);
+    if (change.note) {
+      lines.push(`      note: ${change.note}`);
+    }
+  }
+  for (const warning of result.warnings) {
+    lines.push(`  warning: ${warning}`);
+  }
+  return lines.join('\n');
 }
 
 function findConflicts(candidate: MergeWorkbenchCandidate): MergeConflictView[] {

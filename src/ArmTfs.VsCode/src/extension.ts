@@ -4,13 +4,14 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { spawn } from 'node:child_process';
 import * as vscode from 'vscode';
 import { ArmTfsCliClient, ArmTfsCliError } from './armTfsCliClient';
+import { reportCommandOutput, reportCommandResult } from './commandOutput';
 import { ArmTfsConnectionsController } from './connections';
 import { ArmTfsHistoryBrowser } from './historyBrowser';
-import { getUiLanguage, t, translateCliMessage, translateCliText, type UiLanguage } from './i18n';
+import { getUiLanguage, t, translateCliMessage, type UiLanguage } from './i18n';
 import { checkoutServerPathToLocalFolder } from './serverPathCheckout';
 import { ArmTfsScmController, ArmTfsResourceState } from './scm';
 import { ArmTfsSidebarController, ArmTfsServerExplorerController } from './sidebar';
-import { findTfvcWorkspaceRoot, getCommandCwd } from './tfvcContext';
+import { computeLocalPathForServerPath, discoverTfvcMappingForPath, findTfvcWorkspaceRoot, getCommandCwd } from './tfvcContext';
 import { openServerVersionDiff } from './versionedFiles';
 
 export interface ArmTfsExtensionApi {
@@ -56,6 +57,22 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     await sidebar.refreshAll();
   };
 
+  const syncTfvcContextFromActivePath = async (anchorPath?: string) => {
+    const pathToResolve = anchorPath ?? getActivePath() ?? getWorkspaceRoot();
+    const discovered = discoverTfvcMappingForPath(pathToResolve);
+    if (!discovered) {
+      return;
+    }
+
+    serverExplorer.setRootPath(discovered.serverPath);
+    await sidebar.setActiveServerPath(discovered.serverPath, {
+      branchContext: true,
+      syncBranchScope: true,
+      syncMergeSource: false,
+      refresh: true,
+    });
+  };
+
   let workspaceFileRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   const scheduleWorkspaceFileRefresh = (uri: vscode.Uri) => {
     if (!shouldRefreshForFileSystemEvent(uri)) {
@@ -89,6 +106,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     await connections.initialize();
     await scm.initialize();
     await sidebar.initialize();
+    await syncTfvcContextFromActivePath();
     uiInitialized = true;
     await maybeRunGuiSmoke(client, historyBrowser, output);
   })();
@@ -107,8 +125,11 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
         void sidebar.handleTextChanged(event.document, event.contentChanges.length > 0);
       }
     }),
-    vscode.window.onDidChangeActiveTextEditor(() => {
-      void sidebar.handleActiveEditorChanged();
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      void (async () => {
+        await syncTfvcContextFromActivePath(editor?.document.uri.scheme === 'file' ? editor.document.uri.fsPath : undefined);
+        await sidebar.handleActiveEditorChanged();
+      })();
     }),
     vscode.workspace.onDidCreateFiles(() => {
       void refreshUi();
@@ -247,7 +268,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
       return;
     }
 
-    const localPath = readStringOption(input, 'localPath') ?? readStringOption(input, 'directory') ?? await promptLocalFolder(t('extension.prompt.checkoutDestination'), getWorkspaceRoot());
+    const localPath = readStringOption(input, 'localPath') ?? readStringOption(input, 'directory') ?? await promptLocalFolder(t('extension.prompt.checkoutDestination'), computeLocalPathForServerPath(serverPath) ?? getWorkspaceRoot());
     if (!localPath) {
       return;
     }
@@ -538,18 +559,22 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
 
   registerResourceCommand('armTfs.checkoutResource', async (resource) => {
     await scm.checkout(resource);
+    await refreshUi();
   });
 
   registerResourceCommand('armTfs.addResource', async (resource) => {
     await scm.add(resource);
+    await refreshUi();
   });
 
   registerResourceCommand('armTfs.undoResource', async (resource) => {
     await scm.undo(resource);
+    await refreshUi();
   });
 
   registerResourceCommand('armTfs.checkinFromScm', async () => {
     await scm.checkin();
+    await refreshUi();
   });
 
   return { client };
@@ -560,11 +585,7 @@ export function deactivate(): void {}
 async function runAndShow(title: string, output: vscode.OutputChannel, runner: () => Promise<unknown>): Promise<unknown> {
   try {
     const result = await runner();
-    const document = await vscode.workspace.openTextDocument({
-      language: 'json',
-      content: JSON.stringify(result, null, 2),
-    });
-    await vscode.window.showTextDocument(document, { preview: false });
+    reportCommandResult(output, title, result);
     vscode.window.setStatusBarMessage(t('status.completed', { title }), 2500);
     return result;
   } catch (error) {
@@ -591,11 +612,7 @@ async function runAndShow(title: string, output: vscode.OutputChannel, runner: (
 async function runAndShowText(title: string, output: vscode.OutputChannel, runner: () => Promise<string>): Promise<string | undefined> {
   try {
     const result = await runner();
-    const document = await vscode.workspace.openTextDocument({
-      language: 'text',
-      content: translateCliText(result),
-    });
-    await vscode.window.showTextDocument(document, { preview: false });
+    reportCommandOutput(output, title, result);
     vscode.window.setStatusBarMessage(t('status.completed', { title }), 2500);
     return result;
   } catch (error) {

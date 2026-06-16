@@ -2,12 +2,13 @@ import { existsSync } from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { ArmTfsCliClient, ArmTfsCliError } from './armTfsCliClient';
-import type { BranchRef, ChangesetShowResponse, HistoryItem, MergeBaseResponse, MergeCandidateResponse, ServerItemEntry, StatusResponse } from './contracts';
+import { reportCommandOutput } from './commandOutput';
+import type { BranchRef, ChangesetShowResponse, HistoryItem, MergeBaseResponse, MergeCandidateResponse, MergeExecuteResponse, ServerItemEntry, StatusResponse } from './contracts';
 import type { ArmTfsHistoryBrowser } from './historyBrowser';
-import { t, translateCliMessage, translateCliText } from './i18n';
+import { t, translateCliMessage } from './i18n';
 import { ArmTfsMergeWorkbench } from './mergeWorkbench';
 import { checkoutServerPathToLocalFolder } from './serverPathCheckout';
-import { discoverTfvcMappingForPath, findTfvcWorkspaceRoot, findTfvcWorkspaceRootSync, getCommandCwd, isPathWithin } from './tfvcContext';
+import { computeLocalPathForServerPath, discoverTfvcMappingForPath, findTfvcWorkspaceRoot, findTfvcWorkspaceRootSync, getCommandCwd, isPathWithin } from './tfvcContext';
 import { openServerVersionDiff } from './versionedFiles';
 
 const MERGE_SOURCE_KEY = 'armTfs.merge.sourcePath';
@@ -149,6 +150,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly branchView: vscode.TreeView<ArmTfsTreeNode>;
   private readonly historyView: vscode.TreeView<ArmTfsTreeNode>;
+  private readonly mergeView: vscode.TreeView<ArmTfsTreeNode>;
   private readonly autoCheckoutInFlight = new Set<string>();
   private readonly autoCheckoutSkipped = new Set<string>();
   private resolvedWorkspaceRoot: string | undefined;
@@ -171,11 +173,15 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     this.historyView = vscode.window.createTreeView('armTfs.historyGraph', {
       treeDataProvider: this.historyProvider,
     });
+    this.mergeView = vscode.window.createTreeView('armTfs.merge', {
+      treeDataProvider: this.mergeProvider,
+    });
     this.refreshLabels();
 
     this.disposables.push(
       this.branchView,
       this.historyView,
+      this.mergeView,
       this.branchView.onDidChangeSelection((event) => {
         const branches = event.selection.filter((item): item is BranchNode => item instanceof BranchNode);
         if (branches.length === 2) {
@@ -254,6 +260,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
   refreshLabels(): void {
     this.branchView.title = t('view.branches');
     this.historyView.title = t('view.historyGraph');
+    this.mergeView.title = t('view.merge');
   }
 
   async setActiveServerPath(
@@ -402,7 +409,89 @@ export class ArmTfsSidebarController implements vscode.Disposable {
   }
 
   async refreshMerge(): Promise<void> {
-    return;
+    const sourcePath = this.getMergeSourcePath();
+    const targetPath = await this.getMergeTargetPath(sourcePath);
+    const configNodes: ArmTfsTreeNode[] = [
+      new MergeConfigNode(
+        'merge:source',
+        t('sidebar.mergeSource'),
+        sourcePath ?? t('sidebar.pickSourceAndTarget'),
+        { command: 'armTfs.sidebar.setMergeSource', title: t('sidebar.setMergeSource') },
+      ),
+      new MergeConfigNode(
+        'merge:target',
+        t('sidebar.mergeTarget'),
+        targetPath ?? t('sidebar.pickTargetBranch'),
+        { command: 'armTfs.sidebar.setMergeTarget', title: t('sidebar.setMergeTarget') },
+      ),
+      new MergeConfigNode(
+        'merge:swap',
+        t('sidebar.swapMergePaths'),
+        t('sidebar.swapMergePaths.desc'),
+        { command: 'armTfs.sidebar.swapMergePaths', title: t('sidebar.swapMergePaths.title') },
+      ),
+    ];
+
+    const sections: ArmTfsTreeNode[] = [
+      new SectionNode(t('sidebar.mergeQuery'), undefined, configNodes),
+    ];
+
+    if (!sourcePath) {
+      sections.push(new InfoNode(t('sidebar.pickSourceAndTarget'), undefined, {
+        command: 'armTfs.sidebar.setMergeSource',
+        title: t('sidebar.setMergeSource'),
+      }));
+      this.mergeProvider.setItems(sections);
+      return;
+    }
+
+    const targetOptions = await this.getMergeTargetBranchPaths(sourcePath);
+    if (targetOptions.length) {
+      sections.push(new SectionNode(
+        t('sidebar.targetBranches'),
+        undefined,
+        targetOptions.map((candidate) => new MergeTargetOptionNode(candidate, targetPath ? normalizeServerPath(candidate) === normalizeServerPath(targetPath) : false)),
+      ));
+    }
+
+    if (!targetPath) {
+      sections.push(new InfoNode(t('sidebar.pickTargetBranch'), undefined, {
+        command: 'armTfs.sidebar.setMergeTarget',
+        title: t('sidebar.setMergeTarget'),
+      }));
+      this.mergeProvider.setItems(sections);
+      return;
+    }
+
+    try {
+      const top = vscode.workspace.getConfiguration('armTfs').get<number>('merge.candidateTop', 20);
+      const scan = vscode.workspace.getConfiguration('armTfs').get<number>('merge.candidateScan', 80);
+      const [mergeBase, candidates] = await Promise.all([
+        this.client.mergeBase(sourcePath, targetPath),
+        this.client.mergeCandidates(sourcePath, targetPath, top, scan),
+      ]);
+      this.mergeProvider.setItems([
+        ...sections,
+        new SectionNode(t('sidebar.mergeSummary'), undefined, buildMergeSummaryNodes(mergeBase, candidates)),
+      ]);
+    } catch (error) {
+      const msg = getErrorMessage(error);
+      const isNotFound = msg.includes('ENOENT');
+      this.mergeProvider.setItems([
+        ...sections,
+        new InfoNode(
+          isNotFound ? t('sidebar.cliNotFound') : t('sidebar.mergeQueryUnavailable'),
+          isNotFound ? t('sidebar.cliNotFound.desc') : msg,
+          {
+            command: isNotFound ? 'armTfs.configureCliCommand' : 'armTfs.sidebar.refresh',
+            title: isNotFound ? t('sidebar.configureCli') : t('sidebar.refreshViews'),
+          },
+        ),
+      ]);
+      if (!isNotFound) {
+        this.showError('arm-tfs merge', error);
+      }
+    }
   }
 
   async handleActiveEditorChanged(): Promise<void> {
@@ -585,7 +674,9 @@ export class ArmTfsSidebarController implements vscode.Disposable {
   }
 
   private getCurrentWorkspaceMappingPath(): string | undefined {
-    const anchorPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? this.rootPath;
+    const anchorPath = vscode.window.activeTextEditor?.document.uri.scheme === 'file'
+      ? vscode.window.activeTextEditor.document.uri.fsPath
+      : vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? this.rootPath;
     const discovered = discoverTfvcMappingForPath(anchorPath);
     if (discovered) {
       return cleanServerPath(discovered.serverPath);
@@ -610,16 +701,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       return storedTarget;
     }
 
-    const sourceParent = getServerParentPath(sourcePath);
-    if (!sourceParent || sourceParent === '$/') {
-      return undefined;
-    }
-
-    if (
-      storedTarget
-      && normalizeServerPath(storedTarget) !== normalizeServerPath(sourcePath)
-      && normalizeServerPath(getServerParentPath(storedTarget) ?? '') === normalizeServerPath(sourceParent)
-    ) {
+    if (storedTarget && normalizeServerPath(storedTarget) !== normalizeServerPath(sourcePath)) {
       return storedTarget;
     }
 
@@ -679,16 +761,18 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     await this.refreshMerge();
   }
 
-  private async copyTfvcPath(node?: BranchNode | MergeTargetOptionNode | ServerExplorerNode | string): Promise<void> {
+  private async copyTfvcPath(node?: BranchNode | MergeTargetOptionNode | MergeCandidateNode | ServerExplorerNode | string): Promise<void> {
     const tfvcPath = typeof node === 'string'
       ? node
       : node instanceof BranchNode
         ? node.branch.path
         : node instanceof MergeTargetOptionNode
           ? node.targetPath
-          : node instanceof ServerExplorerNode
-            ? node.entry.serverPath
-          : undefined;
+          : node instanceof MergeCandidateNode
+            ? node.targetPath
+            : node instanceof ServerExplorerNode
+              ? node.entry.serverPath
+              : undefined;
 
     if (!tfvcPath) {
       void vscode.window.showWarningMessage(t('sidebar.warning.selectBranch'));
@@ -792,8 +876,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
         }),
       );
 
-      const document = await vscode.workspace.openTextDocument({ language: 'text', content: translateCliText(result) });
-      await vscode.window.showTextDocument(document, { preview: false });
+      reportCommandOutput(this.output, `arm-tfs pull ${mapped.serverPath}`, result);
       await this.refreshScm();
       await this.refreshAll();
     } catch (error) {
@@ -818,8 +901,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
         }),
       );
 
-      const document = await vscode.workspace.openTextDocument({ language: 'text', content: translateCliText(result) });
-      await vscode.window.showTextDocument(document, { preview: false });
+      reportCommandOutput(this.output, `arm-tfs checkout ${mapped.serverPath}`, result);
       await this.refreshScm();
       await this.refreshAll();
     } catch (error) {
@@ -1069,23 +1151,48 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     }
 
     try {
-      const result = await vscode.window.withProgress(
+      const isDryRun = mode.value === 'dryRun';
+      const response = await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
           title: `arm-tfs merge execute cs${node.changesetId}`,
         },
-        () => this.client.mergeExecute(node.sourcePath, node.targetPath, node.changesetId, {
+        () => this.client.mergeExecuteJson(node.sourcePath, node.targetPath, node.changesetId, {
           comment: comment.trim() || undefined,
-          dryRun: mode.value === 'dryRun',
+          dryRun: isDryRun,
         }),
       );
 
-      const document = await vscode.workspace.openTextDocument({ language: 'text', content: translateCliText(result) });
-      await vscode.window.showTextDocument(document, { preview: false });
-      if (mode.value !== 'dryRun') {
-        await this.refreshScm();
-        await this.refreshAll();
+      const title = `arm-tfs merge execute cs${node.changesetId}`;
+      const createdId = response.result.createdChangesetId;
+      const warnings = response.result.warnings ?? [];
+
+      if (isDryRun) {
+        reportCommandOutput(this.output, title, formatMergeOutcome(response), {
+          summary: t('merge.execute.dryRun', { count: 1 }),
+        });
+        return;
       }
+
+      if (createdId === null || createdId === undefined) {
+        // Exit code was 0 but no changeset was actually created: surface this as a problem
+        // instead of a misleading success message.
+        this.output.appendLine(`> ${title}`);
+        this.output.appendLine(formatMergeOutcome(response));
+        this.output.appendLine('');
+        void vscode.window.showWarningMessage(
+          warnings[0]
+            ? translateCliMessage(warnings[0])
+            : t('merge.execute.noChange', { changesets: `cs${node.changesetId}` }),
+        );
+        return;
+      }
+
+      reportCommandOutput(this.output, title, formatMergeOutcome(response), {
+        summary: t('merge.execute.success', { count: 1, created: `cs${createdId}` }),
+      });
+      await this.refreshScm();
+      await this.refreshAll();
     } catch (error) {
       this.showError('arm-tfs merge execute', error);
     }
@@ -1109,6 +1216,31 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     this.output.appendLine(message);
     void vscode.window.showErrorMessage(t('error.failed', { title, message }));
   }
+}
+
+function formatMergeOutcome(response: MergeExecuteResponse): string {
+  const result = response.result;
+  const lines: string[] = [];
+  lines.push(`Source    : ${result.sourcePath}`);
+  lines.push(`Target    : ${result.targetPath}`);
+  lines.push(`Changeset : cs${result.sourceChangesetId}`);
+  lines.push(`Mode      : ${result.dryRun ? 'dry-run' : 'execute'}`);
+  if (result.createdChangesetId !== null && result.createdChangesetId !== undefined) {
+    lines.push(`Created   : cs${result.createdChangesetId}`);
+  }
+  for (const change of result.changes) {
+    lines.push(`  [${change.status}] ${change.targetServerPath} (${change.sourceChangeType} -> ${change.targetChangeType})`);
+    if (change.note) {
+      lines.push(`      note: ${change.note}`);
+    }
+  }
+  if (result.warnings.length) {
+    lines.push('Warnings:');
+    for (const warning of result.warnings) {
+      lines.push(`  - ${warning}`);
+    }
+  }
+  return lines.join('\n');
 }
 
 function buildBranchTree(branches: BranchRef[]): BranchNode[] {
@@ -1195,13 +1327,17 @@ function buildMergeSummaryNodes(mergeBase: MergeBaseResponse, candidates: MergeC
 
 function buildHistoryDescription(item: HistoryItem): string {
   const author = item.author?.displayName ?? item.checkedInBy?.displayName;
-  const parts = [author, item.createdAt.slice(0, 10)].filter(Boolean);
+  const comment = item.comment?.replace(/\s+/g, ' ').trim();
+  const shortComment = comment && comment.length > 40 ? `${comment.slice(0, 39)}…` : comment;
+  const parts = [author, item.createdAt.slice(0, 10), shortComment].filter(Boolean);
   return parts.join(' | ');
 }
 
 function buildMergeCandidateDescription(item: MergeCandidateResponse['items'][number]): string {
   const author = item.author?.displayName ?? 'unknown';
-  return `${author} | ${item.createdAt.slice(0, 10)}`;
+  const comment = item.comment?.replace(/\s+/g, ' ').trim();
+  const shortComment = comment && comment.length > 40 ? `${comment.slice(0, 39)}…` : comment;
+  return [author, item.createdAt.slice(0, 10), shortComment].filter(Boolean).join(' | ');
 }
 
 function getNodeServerPath(node: BranchNode | ServerExplorerNode | undefined): string | undefined {
@@ -1597,9 +1733,10 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
         }
 
         const serverPath = node.entry.serverPath;
+        const computedPath = computeLocalPathForServerPath(serverPath);
         const localPath = await vscode.window.showInputBox({
           prompt: t('serverExplorer.prompt.downloadPath', { path: serverPath }),
-          value: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '.',
+          value: computedPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '.',
           ignoreFocusOut: true,
         });
         if (!localPath) {
@@ -1611,8 +1748,7 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
             { location: vscode.ProgressLocation.Notification, title: t('serverExplorer.progress.get', { path: serverPath }) },
             () => checkoutServerPathToLocalFolder(this.client, serverPath, localPath),
           );
-          const doc = await vscode.workspace.openTextDocument({ language: 'text', content: translateCliText(result) });
-          await vscode.window.showTextDocument(doc, { preview: false });
+          reportCommandOutput(this.output, t('serverExplorer.progress.get', { path: serverPath }), result);
           await this.refreshScm();
           await this.provider.refresh();
         } catch (error) {
@@ -1634,8 +1770,7 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
             { location: vscode.ProgressLocation.Notification, title: t('serverExplorer.progress.checkout', { path: serverPath }) },
             () => this.client.checkout([serverPath]),
           );
-          const doc = await vscode.workspace.openTextDocument({ language: 'text', content: translateCliText(result) });
-          await vscode.window.showTextDocument(doc, { preview: false });
+          reportCommandOutput(this.output, t('serverExplorer.progress.checkout', { path: serverPath }), result);
           await this.refreshScm();
         } catch (error) {
           void vscode.window.showErrorMessage(t('error.failed', {

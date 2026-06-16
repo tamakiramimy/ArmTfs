@@ -538,6 +538,8 @@ public sealed class TfvcClientService
         var warnings = new List<string>();
         var plannedChanges = new List<MergeExecutionChange>();
         var tfvcChanges = new List<TfvcChange>();
+        var expectedContentByTarget = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        var expectedDeletes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var resolutionBySource = (resolutions ?? Array.Empty<MergeExecutionResolution>())
             .Where(item => !string.IsNullOrWhiteSpace(item.SourceServerPath))
             .GroupBy(item => NormalizeServerPath(item.SourceServerPath), StringComparer.OrdinalIgnoreCase)
@@ -594,12 +596,12 @@ public sealed class TfvcClientService
             var targetChangeType = ResolveMergeChangeType(change.ChangeType, targetExists.HasValue, out var note);
             if (resolutionChoice == "manual")
             {
-                targetChangeType = VersionControlChangeType.Merge | (targetExists.HasValue ? VersionControlChangeType.Edit : VersionControlChangeType.Add);
+                targetChangeType = targetExists.HasValue ? VersionControlChangeType.Edit : VersionControlChangeType.Add;
                 note = "Resolved with manually merged content.";
             }
             else if (targetChangeType == VersionControlChangeType.None && resolutionChoice == "source" && CanForceSourceContentMerge(change.ChangeType))
             {
-                targetChangeType = VersionControlChangeType.Merge | (targetExists.HasValue ? VersionControlChangeType.Edit : VersionControlChangeType.Add);
+                targetChangeType = targetExists.HasValue ? VersionControlChangeType.Edit : VersionControlChangeType.Add;
                 note = "Resolved by taking source branch content.";
             }
 
@@ -650,21 +652,22 @@ public sealed class TfvcClientService
             if (dryRun)
                 continue;
 
+            // The REST changeset API does not accept merge change types or merge sources, so we
+            // push a plain Add/Edit/Delete carrying the source content instead of merge metadata.
             tfvcChanges.Add(BuildTfvcChange(
                 targetServerPath,
                 targetChangeType,
                 content,
-                targetExists,
-                new[]
-                {
-                    new TfvcMergeSource
-                    {
-                        ServerItem = sourceItemPath,
-                        VersionFrom = sourceChangesetId,
-                        VersionTo = sourceChangesetId,
-                        IsRename = change.ChangeType.HasFlag(VersionControlChangeType.SourceRename),
-                    }
-                }));
+                targetExists));
+
+            if (targetChangeType.HasFlag(VersionControlChangeType.Delete))
+            {
+                expectedDeletes.Add(targetServerPath);
+            }
+            else if (content is not null)
+            {
+                expectedContentByTarget[targetServerPath] = content;
+            }
         }
 
         if (dryRun || tfvcChanges.Count == 0)
@@ -685,11 +688,20 @@ public sealed class TfvcClientService
             };
         }
 
+        warnings.Add("Changes were applied as a direct check-in (take-source). TFVC merge history is not recorded because the REST changeset API does not support merge change types.");
+
         var created = await _connection.GetTfvcClient().CreateChangesetAsync(new TfvcChangeset
         {
             Comment = effectiveComment,
             Changes = tfvcChanges,
         }, cancellationToken: ct).ConfigureAwait(false);
+
+        await VerifyMergeChangesetAppliedAsync(
+            created.ChangesetId,
+            tfvcChanges.Select(change => change.Item?.Path).Where(path => !string.IsNullOrEmpty(path)).Cast<string>().ToArray(),
+            expectedContentByTarget,
+            expectedDeletes,
+            ct).ConfigureAwait(false);
 
         return new MergeExecutionResult
         {
@@ -715,6 +727,40 @@ public sealed class TfvcClientService
             }).ToList(),
             Warnings = warnings,
         };
+    }
+
+    private async Task VerifyMergeChangesetAppliedAsync(
+        int createdChangesetId,
+        IReadOnlyCollection<string> expectedTargetPaths,
+        IReadOnlyDictionary<string, byte[]> expectedContentByTarget,
+        IReadOnlySet<string> expectedDeletes,
+        CancellationToken ct)
+    {
+        var createdDetail = await GetChangesetAsync(createdChangesetId, ct).ConfigureAwait(false);
+        var changedPaths = (createdDetail.Changes ?? Array.Empty<TfvcChange>())
+            .Select(change => change.Item?.Path)
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(path => NormalizeServerPath(path!))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var missingPaths = expectedTargetPaths
+            .Where(path => !changedPaths.Contains(NormalizeServerPath(path)))
+            .ToList();
+        if (missingPaths.Count > 0)
+            throw new InvalidOperationException($"Merge verification failed: created changeset cs#{createdChangesetId} did not contain expected target path(s): {string.Join(", ", missingPaths)}.");
+
+        foreach (var (targetPath, expectedContent) in expectedContentByTarget)
+        {
+            var actualContent = await DownloadFileContentAsync(targetPath, null, ct).ConfigureAwait(false);
+            if (!actualContent.AsSpan().SequenceEqual(expectedContent))
+                throw new InvalidOperationException($"Merge verification failed: target file '{targetPath}' content does not match the source content after cs#{createdChangesetId}.");
+        }
+
+        foreach (var targetPath in expectedDeletes)
+        {
+            if (await TryGetItemVersionAsync(targetPath, ct).ConfigureAwait(false) is not null)
+                throw new InvalidOperationException($"Merge verification failed: target file '{targetPath}' still exists after delete merge cs#{createdChangesetId}.");
+        }
     }
 
     private async Task<TfvcBranch?> TryResolveBranchAsync(string path, CancellationToken ct)
@@ -864,6 +910,13 @@ public sealed class TfvcClientService
             return VersionControlChangeType.None;
         }
 
+        // NOTE: The REST "create changeset" (push) API used by CreateChangesetAsync does not
+        // support the TFVC `Merge` change-type flag — the server rejects any combination such as
+        // "Add, Merge" or "Branch, Merge" with "unsupported change type". Merge metadata (the
+        // server-side merge history link) therefore cannot be recorded through this endpoint. To
+        // make the merge actually land, we apply the source content to the target as a plain
+        // check-in: Edit when the file already exists in the target, Add when it is new, and Delete
+        // when the source removed it. The merge lineage is not recorded (callers are warned).
         if (sourceChangeType.HasFlag(VersionControlChangeType.Delete))
         {
             if (!targetExists)
@@ -872,17 +925,15 @@ public sealed class TfvcClientService
                 return VersionControlChangeType.None;
             }
 
-            return VersionControlChangeType.Merge | VersionControlChangeType.Delete;
+            return VersionControlChangeType.Delete;
         }
 
-        if (sourceChangeType.HasFlag(VersionControlChangeType.Add))
-            return VersionControlChangeType.Merge | (targetExists ? VersionControlChangeType.Edit : VersionControlChangeType.Add);
-
-        if (sourceChangeType.HasFlag(VersionControlChangeType.Edit))
-            return VersionControlChangeType.Merge | (targetExists ? VersionControlChangeType.Edit : VersionControlChangeType.Add);
-
-        if (sourceChangeType.HasFlag(VersionControlChangeType.Branch))
-            return VersionControlChangeType.Merge | (targetExists ? VersionControlChangeType.Edit : VersionControlChangeType.Add);
+        if (sourceChangeType.HasFlag(VersionControlChangeType.Add)
+            || sourceChangeType.HasFlag(VersionControlChangeType.Edit)
+            || sourceChangeType.HasFlag(VersionControlChangeType.Branch))
+        {
+            return targetExists ? VersionControlChangeType.Edit : VersionControlChangeType.Add;
+        }
 
         note = $"Unsupported TFVC change type: {sourceChangeType}.";
         return VersionControlChangeType.None;

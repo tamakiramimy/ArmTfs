@@ -17,6 +17,7 @@
     "onView:armTfs.connections",
     "onView:armTfs.branches",
     "onView:armTfs.historyGraph",
+    "onView:armTfs.merge",
     "onCommand:armTfs.configurePat",
     "onCommand:armTfs.configureCliCommand",
     "onCommand:armTfs.switchLanguage"
@@ -48,6 +49,10 @@
         {
           "id": "armTfs.historyGraph",
           "name": "%view.historyGraph%"
+        },
+        {
+          "id": "armTfs.merge",
+          "name": "%view.merge%"
         }
       ]
     },
@@ -336,6 +341,11 @@
         "category": "arm-tfs"
       },
       {
+        "command": "armTfs.sidebar.useMergeTarget",
+        "title": "%command.sidebarUseMergeTarget%",
+        "category": "arm-tfs"
+      },
+      {
         "command": "armTfs.sidebar.executeMergeCandidate",
         "title": "%command.sidebarExecuteMergeCandidate%",
         "category": "arm-tfs"
@@ -387,6 +397,26 @@
           "command": "armTfs.history.openBrowser",
           "when": "view == armTfs.historyGraph",
           "group": "navigation@2"
+        },
+        {
+          "command": "armTfs.sidebar.refresh",
+          "when": "view == armTfs.merge",
+          "group": "navigation@1"
+        },
+        {
+          "command": "armTfs.sidebar.setMergeSource",
+          "when": "view == armTfs.merge",
+          "group": "navigation@2"
+        },
+        {
+          "command": "armTfs.sidebar.setMergeTarget",
+          "when": "view == armTfs.merge",
+          "group": "navigation@3"
+        },
+        {
+          "command": "armTfs.sidebar.swapMergePaths",
+          "when": "view == armTfs.merge",
+          "group": "navigation@4"
         }
       ],
       "view/item/context": [
@@ -504,6 +534,21 @@
           "command": "armTfs.history.selectForCompare",
           "when": "view == armTfs.historyGraph && viewItem == armTfsSidebarChangeset",
           "group": "context@1"
+        },
+        {
+          "command": "armTfs.sidebar.useMergeTarget",
+          "when": "view == armTfs.merge && viewItem == armTfsMergeTargetOption",
+          "group": "context@1"
+        },
+        {
+          "command": "armTfs.sidebar.copyTfvcPath",
+          "when": "view == armTfs.merge && viewItem =~ /armTfs(MergeTargetOption|SidebarMergeCandidate)/",
+          "group": "context@2"
+        },
+        {
+          "command": "armTfs.sidebar.executeMergeCandidate",
+          "when": "view == armTfs.merge && viewItem == armTfsSidebarMergeCandidate",
+          "group": "context@3"
         }
       ],
       "scm/title": [
@@ -630,6 +675,16 @@
           "type": "string",
           "default": "",
           "description": "Optional absolute path to the real arm-tfs workspace root when the VS Code folder itself is not the TFVC workspace root."
+        },
+        "armTfs.tfsRootDirectory": {
+          "type": "string",
+          "default": "",
+          "description": "Top-level local TFS root directory used to auto-compute branch checkout folders. Example: C:\\TFS maps $/C02_PTL_P090_BussinessCommon/Main to C:\\TFS\\C02_PTL_P090_BussinessCommon\\Main."
+        },
+        "armTfs.localRootDirectory": {
+          "type": "string",
+          "default": "",
+          "description": "Deprecated alias for armTfs.tfsRootDirectory. Local root directory used to auto-compute where TFVC branches/folders are saved."
         },
         "armTfs.ui.language": {
           "type": "string",
