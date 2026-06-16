@@ -124,6 +124,18 @@
         "category": "arm-tfs"
       },
       {
+        "command": "armTfs.workspaceMappings.add",
+        "title": "%command.workspaceMappingsAdd%",
+        "category": "arm-tfs",
+        "icon": "$(add)"
+      },
+      {
+        "command": "armTfs.workspaceMappings.delete",
+        "title": "%command.workspaceMappingsDelete%",
+        "category": "arm-tfs",
+        "icon": "$(trash)"
+      },
+      {
         "command": "armTfs.runGet",
         "title": "%command.runGet%",
         "category": "arm-tfs"
@@ -364,9 +376,14 @@
           "group": "navigation@2"
         },
         {
-          "command": "armTfs.switchLanguage",
+          "command": "armTfs.workspaceMappings.add",
           "when": "view == armTfs.connections",
           "group": "navigation@3"
+        },
+        {
+          "command": "armTfs.switchLanguage",
+          "when": "view == armTfs.connections",
+          "group": "navigation@4"
         },
         {
           "command": "armTfs.serverExplorer.refresh",
@@ -434,6 +451,11 @@
           "command": "armTfs.connections.select",
           "when": "view == armTfs.connections && viewItem == armTfsConnectionProfile",
           "group": "context@1"
+        },
+        {
+          "command": "armTfs.workspaceMappings.delete",
+          "when": "view == armTfs.connections && viewItem == armTfsWorkspaceMapping",
+          "group": "inline@1"
         },
         {
           "command": "armTfs.serverExplorer.getLatest",
@@ -743,6 +765,25 @@
           "default": 80,
           "minimum": 1,
           "description": "How many history entries to scan when computing merge candidates."
+        },
+        "armTfs.workspaceMappings": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object",
+            "required": ["serverPath", "localPath"],
+            "properties": {
+              "serverPath": {
+                "type": "string",
+                "description": "TFVC server path (e.g. $/ or $/MyProject)"
+              },
+              "localPath": {
+                "type": "string",
+                "description": "Absolute local directory path (e.g. /Users/me/tfs or C:\\TFS)"
+              }
+            }
+          },
+          "description": "[Deprecated] Use the per-connection 'Workspace Mappings' UI instead. Each TFS connection profile now stores its own mappings. This setting is kept as a fallback when no profile is active."
         }
       }
     }

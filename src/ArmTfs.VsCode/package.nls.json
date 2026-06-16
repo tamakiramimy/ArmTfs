@@ -19,6 +19,8 @@
   "command.checkoutServerPathToFolder": "Checkout Server Path To Folder",
   "command.showWorkspace": "Show Workspace",
   "command.addWorkspaceMapping": "Add Workspace Mapping",
+  "command.workspaceMappingsAdd": "Add Workspace Mapping",
+  "command.workspaceMappingsDelete": "Remove Workspace Mapping",
   "command.runGet": "Get Latest",
   "command.checkout": "Checkout",
   "command.add": "Add Pending File",

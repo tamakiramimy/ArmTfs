@@ -1,4 +1,5 @@
 using ArmTfs.Core.Models;
+using ArmTfs.Core.Workspace;
 using Microsoft.TeamFoundation.SourceControl.WebApi;
 using System.Text;
 
@@ -14,12 +15,15 @@ namespace ArmTfs.Core.Client;
 public sealed class TfvcClientService
 {
     private readonly TfsConnection _connection;
+    private readonly WorkspaceManager? _workspaceManager;
 
     /// <summary>初始化服务。</summary>
     /// <param name="connection">已创建的连接对象，生命周期由调用方管理</param>
-    public TfvcClientService(TfsConnection connection)
+    /// <param name="workspaceManager">可选的本地工作区管理器，用于合并历史追踪</param>
+    public TfvcClientService(TfsConnection connection, WorkspaceManager? workspaceManager = null)
     {
         _connection = connection;
+        _workspaceManager = workspaceManager;
     }
 
     // ─── 条目查询 ──────────────────────────────────────────────────────────────
@@ -425,6 +429,7 @@ public sealed class TfvcClientService
         string targetPath,
         int top = 20,
         int scan = 80,
+        IReadOnlySet<int>? locallyMergedIds = null,
         CancellationToken ct = default)
     {
         var baseInfo = await ResolveMergeBaseAsync(sourcePath, targetPath, ct).ConfigureAwait(false);
@@ -434,9 +439,21 @@ public sealed class TfvcClientService
         var mergedRanges = new List<MergeSourceRange>();
         var sourceMatchPath = baseInfo.SourceBranchPath ?? sourcePath;
 
+        // Collect comment-marker-tracked merges (REST merges that don't write server merge history).
+        var commentTrackedIds = new HashSet<int>();
         foreach (var targetChangeset in targetHistory)
         {
             var detail = await GetChangesetAsync(targetChangeset.ChangesetId, ct).ConfigureAwait(false);
+
+            var marker = MergeCommentMarker.Parse(detail.Comment);
+            if (marker is not null
+                && marker.SourceChangesetId > 0
+                && IsSameOrDescendantPath(sourcePath, marker.SourcePath)
+                && IsSameOrDescendantPath(targetPath, marker.TargetPath))
+            {
+                commentTrackedIds.Add(marker.SourceChangesetId);
+            }
+
             if (detail.Changes is null)
                 continue;
 
@@ -471,6 +488,14 @@ public sealed class TfvcClientService
 
             var coveringRange = mergedRanges.FirstOrDefault(range => range.Covers(changeset.ChangesetId));
             if (coveringRange is not null)
+                continue;
+
+            // Filter: merged via arm-tfs comment marker in target history
+            if (commentTrackedIds.Contains(changeset.ChangesetId))
+                continue;
+
+            // Filter: merged via local .tf/merge-history.json
+            if (locallyMergedIds?.Contains(changeset.ChangesetId) == true)
                 continue;
 
             var detail = await GetChangesetAsync(changeset.ChangesetId, ct).ConfigureAwait(false);
@@ -690,9 +715,14 @@ public sealed class TfvcClientService
 
         warnings.Add("Changes were applied as a direct check-in (take-source). TFVC merge history is not recorded because the REST changeset API does not support merge change types.");
 
+        // Embed a structured marker so the candidate filter can detect this merge cross-workspace.
+        var commentWithMarker = effectiveComment.TrimEnd()
+            + " "
+            + MergeCommentMarker.Build(normalizedSource, sourceChangesetId, normalizedTarget);
+
         var created = await _connection.GetTfvcClient().CreateChangesetAsync(new TfvcChangeset
         {
-            Comment = effectiveComment,
+            Comment = commentWithMarker,
             Changes = tfvcChanges,
         }, cancellationToken: ct).ConfigureAwait(false);
 
@@ -703,12 +733,24 @@ public sealed class TfvcClientService
             expectedDeletes,
             ct).ConfigureAwait(false);
 
+        // Record in local merge-history so the candidate list clears immediately,
+        // even before the target history scan picks up the comment marker.
+        _workspaceManager?.RecordMerge(new MergeRecord
+        {
+            SourceChangesetId = sourceChangesetId,
+            SourcePath = normalizedSource,
+            TargetPath = normalizedTarget,
+            TargetChangesetId = created.ChangesetId,
+            MergedAtUtc = DateTime.UtcNow,
+            Method = "rest-takesource",
+        });
+
         return new MergeExecutionResult
         {
             SourcePath = normalizedSource,
             TargetPath = normalizedTarget,
             SourceChangesetId = sourceChangesetId,
-            Comment = effectiveComment,
+            Comment = commentWithMarker,
             DryRun = false,
             CreatedChangesetId = created.ChangesetId,
             BaseInfo = mergeBase,
@@ -743,14 +785,51 @@ public sealed class TfvcClientService
             .Select(path => NormalizeServerPath(path!))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+        // TFS REST CreateChangeset silently drops files whose content is identical to the
+        // current target version (server-side dedup). For those paths, verify that the
+        // target now has the expected content instead of failing the whole merge.
         var missingPaths = expectedTargetPaths
             .Where(path => !changedPaths.Contains(NormalizeServerPath(path)))
             .ToList();
-        if (missingPaths.Count > 0)
-            throw new InvalidOperationException($"Merge verification failed: created changeset cs#{createdChangesetId} did not contain expected target path(s): {string.Join(", ", missingPaths)}.");
+
+        var trulyMissing = new List<string>();
+        foreach (var missingPath in missingPaths)
+        {
+            if (expectedContentByTarget.TryGetValue(missingPath, out var expectedContent))
+            {
+                // Server dedup: file was not written because it already has the right content.
+                // Confirm by downloading the current target version.
+                try
+                {
+                    var actual = await DownloadFileContentAsync(missingPath, null, ct).ConfigureAwait(false);
+                    if (!actual.AsSpan().SequenceEqual(expectedContent))
+                        trulyMissing.Add(missingPath);
+                    // else: target already has exact content — dedup is fine, skip
+                }
+                catch
+                {
+                    trulyMissing.Add(missingPath);
+                }
+            }
+            else if (expectedDeletes.Contains(missingPath))
+            {
+                // Delete paths are checked separately below; skip here.
+            }
+            else
+            {
+                trulyMissing.Add(missingPath);
+            }
+        }
+
+        if (trulyMissing.Count > 0)
+            throw new InvalidOperationException($"Merge verification failed: created changeset cs#{createdChangesetId} did not contain expected target path(s): {string.Join(", ", trulyMissing)}.");
 
         foreach (var (targetPath, expectedContent) in expectedContentByTarget)
         {
+            // Already verified above as part of server-dedup check — skip re-download.
+            if (!changedPaths.Contains(NormalizeServerPath(targetPath)))
+                continue;
+
             var actualContent = await DownloadFileContentAsync(targetPath, null, ct).ConfigureAwait(false);
             if (!actualContent.AsSpan().SequenceEqual(expectedContent))
                 throw new InvalidOperationException($"Merge verification failed: target file '{targetPath}' content does not match the source content after cs#{createdChangesetId}.");

@@ -22,6 +22,67 @@ export function getConfiguredLocalRootDirectory(): string | undefined {
   return configured ? path.resolve(configured) : undefined;
 }
 
+export interface ConfiguredWorkspaceMapping {
+  serverPath: string;
+  localPath: string;
+}
+
+export type WorkspaceMappingsProvider = () => ConfiguredWorkspaceMapping[];
+
+let mappingsProvider: WorkspaceMappingsProvider | undefined;
+
+/**
+ * Register a provider that supplies the workspace mappings to use for path resolution.
+ * Typically the ConnectionsController registers itself so the active profile's mappings
+ * are used. Falls back to the legacy global `armTfs.workspaceMappings` setting.
+ */
+export function setWorkspaceMappingsProvider(provider: WorkspaceMappingsProvider | undefined): void {
+  mappingsProvider = provider;
+}
+
+/**
+ * Return workspace mappings from the registered provider (e.g. the active TFS profile).
+ * Falls back to the legacy global `armTfs.workspaceMappings` setting for backward compatibility.
+ */
+export function getConfiguredWorkspaceMappings(): ConfiguredWorkspaceMapping[] {
+  const fromProvider = mappingsProvider?.();
+  if (fromProvider && fromProvider.length) {
+    return fromProvider
+      .filter((entry) => entry.serverPath?.startsWith('$/') && entry.localPath?.trim())
+      .map((entry) => ({
+        serverPath: entry.serverPath.trim(),
+        localPath: path.resolve(entry.localPath.trim()),
+      }));
+  }
+
+  const legacy = vscode.workspace.getConfiguration('armTfs').get<Array<{ serverPath?: string; localPath?: string }>>('workspaceMappings', []);
+  return legacy
+    .filter((entry) => entry.serverPath?.startsWith('$/') && entry.localPath?.trim())
+    .map((entry) => ({
+      serverPath: entry.serverPath!.trim(),
+      localPath: path.resolve(entry.localPath!.trim()),
+    }));
+}
+
+/**
+ * Given a local file/directory path, find the most-specific configured workspace mapping
+ * that covers it. Returns undefined if no configured mapping applies.
+ */
+export function findConfiguredMappingForLocalPath(localPath: string): ConfiguredWorkspaceMapping | undefined {
+  const normalized = normalizeForCompare(localPath);
+  const mappings = getConfiguredWorkspaceMappings();
+  let best: ConfiguredWorkspaceMapping | undefined;
+  for (const mapping of mappings) {
+    const mappingNorm = normalizeForCompare(mapping.localPath);
+    if (normalized === mappingNorm || normalized.startsWith(`${mappingNorm}${path.sep}`)) {
+      if (!best || mapping.localPath.length > best.localPath.length) {
+        best = mapping;
+      }
+    }
+  }
+  return best;
+}
+
 /**
  * Convert a TFVC server path (e.g. `$/Project/Branch/sub`) into a path segment relative to the
  * server root, using the host platform's path separator.
@@ -68,6 +129,14 @@ export function findTfvcWorkspaceRootSync(anchorPath?: string): string | undefin
     }
   }
 
+  // Fallback: use the root of a configured workspace mapping that covers the anchor path
+  if (anchorPath) {
+    const configuredMapping = findConfiguredMappingForLocalPath(anchorPath);
+    if (configuredMapping) {
+      return configuredMapping.localPath;
+    }
+  }
+
   return undefined;
 }
 
@@ -79,6 +148,13 @@ export async function findTfvcWorkspaceRoot(anchorPath?: string): Promise<string
 
   const metadataFiles = await vscode.workspace.findFiles(`**/${WORKSPACE_METADATA_PATH}`, SEARCH_EXCLUDES, 20);
   if (metadataFiles.length === 0) {
+    // Final fallback: configured mappings (no .tf/workspace.json found anywhere)
+    if (anchorPath) {
+      const configuredMapping = findConfiguredMappingForLocalPath(anchorPath);
+      if (configuredMapping) {
+        return configuredMapping.localPath;
+      }
+    }
     return undefined;
   }
 
@@ -158,6 +234,28 @@ export function discoverTfvcMappingForPath(localPath?: string): DiscoveredTfvcMa
       return matches.sort((left, right) => right.localPath.length - left.localPath.length)[0];
     }
   }
+
+  // Strategy 3 (configured mappings): use mappings from armTfs.workspaceMappings settings.
+  // These are defined by the user and don't require .tf/workspace.json to be present at the
+  // target path. We compute the server path from the configured mapping, using the same
+  // relative-offset logic as the workspace metadata parser.
+  const configuredMapping = findConfiguredMappingForLocalPath(localPath);
+  if (configuredMapping) {
+    const mappingNorm = normalizeForCompare(configuredMapping.localPath);
+    const localNorm = normalizeForCompare(localPath);
+    let serverPath = configuredMapping.serverPath;
+    if (localNorm !== mappingNorm) {
+      const relative = path.relative(configuredMapping.localPath, path.resolve(localPath));
+      const serverRelative = relative.split(path.sep).join('/');
+      serverPath = `${configuredMapping.serverPath.replace(/\/+$/, '')}/${serverRelative}`;
+    }
+    return {
+      workspaceRoot: configuredMapping.localPath,
+      serverPath,
+      localPath: configuredMapping.localPath,
+    };
+  }
+
   return undefined;
 }
 

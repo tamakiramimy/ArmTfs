@@ -43,8 +43,9 @@ public static class MergeCommand
 
         cmd.SetHandler(async (source, target, changesetId, comment, dryRun, resolutionFile, format) =>
         {
+            var ws = WorkspaceManager.FindWorkspace(Directory.GetCurrentDirectory());
             using var conn = new TfsConnection(config);
-            var svc = new TfvcClientService(conn);
+            var svc = new TfvcClientService(conn, ws);
 
             try
             {
@@ -120,14 +121,16 @@ public static class MergeCommand
 
         cmd.SetHandler(async (source, target, top, scan, format) =>
         {
+            var ws = WorkspaceManager.FindWorkspace(Directory.GetCurrentDirectory());
             using var conn = new TfsConnection(config);
-            var svc = new TfvcClientService(conn);
+            var svc = new TfvcClientService(conn, ws);
 
             try
             {
                 var resolvedSource = ResolveServerPath(source);
                 var resolvedTarget = ResolveServerPath(target);
-                var result = await svc.GetMergeCandidatesAsync(resolvedSource, resolvedTarget, top, scan).ConfigureAwait(false);
+                var locallyMerged = ws?.GetLocallyMergedChangesetIds(resolvedSource, resolvedTarget);
+                var result = await svc.GetMergeCandidatesAsync(resolvedSource, resolvedTarget, top, scan, locallyMerged).ConfigureAwait(false);
 
                 if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
                 {

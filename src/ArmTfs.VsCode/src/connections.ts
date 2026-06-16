@@ -1,6 +1,9 @@
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { ArmTfsCliClient, ArmTfsConnectionEnvironment } from './armTfsCliClient';
 import { t } from './i18n';
+import type { ConfiguredWorkspaceMapping } from './tfvcContext';
+import { getConfiguredWorkspaceMappings, setWorkspaceMappingsProvider } from './tfvcContext';
 
 const PROFILES_KEY = 'armTfs.connections';
 const ACTIVE_PROFILE_KEY = 'armTfs.activeConnection';
@@ -12,6 +15,7 @@ export interface TfsConnectionProfile {
   serverUrl: string;
   rootPath: string;
   displayName?: string;
+  mappings?: ConfiguredWorkspaceMapping[];
 }
 
 class ConnectionTreeItem extends vscode.TreeItem {
@@ -43,6 +47,36 @@ class ProfileTreeItem extends ConnectionTreeItem {
   }
 }
 
+class WorkspaceMappingsSectionItem extends ConnectionTreeItem {
+  constructor(activeProfileName: string | undefined, count: number) {
+    const description = activeProfileName
+      ? (count
+        ? t('connections.workspaceMappings.countForProfile', { name: activeProfileName, count })
+        : t('connections.workspaceMappings.noneForProfile', { name: activeProfileName }))
+      : t('connections.workspaceMappings.noActiveProfile');
+    super(
+      t('connections.workspaceMappings'),
+      'armTfsWorkspaceMappingsSection',
+      description,
+      activeProfileName ? { command: 'armTfs.workspaceMappings.add', title: t('connections.workspaceMappings.add') } : undefined,
+      'link',
+    );
+  }
+}
+
+class WorkspaceMappingTreeItem extends ConnectionTreeItem {
+  constructor(public readonly mapping: ConfiguredWorkspaceMapping) {
+    super(
+      mapping.serverPath,
+      'armTfsWorkspaceMapping',
+      path.normalize(mapping.localPath),
+      undefined,
+      'folder',
+    );
+    this.tooltip = `${mapping.serverPath} → ${mapping.localPath}`;
+  }
+}
+
 class ConnectionsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   private readonly emitter = new vscode.EventEmitter<void>();
   readonly onDidChangeTreeData = this.emitter.event;
@@ -60,7 +94,9 @@ class ConnectionsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   getChildren(): vscode.TreeItem[] {
     const invocation = this.controller.getCliDescription();
     const profiles = this.controller.getProfiles();
-    const activeId = this.controller.getActiveProfile()?.id;
+    const activeProfile = this.controller.getActiveProfile();
+    const activeId = activeProfile?.id;
+    const mappings = this.controller.getActiveProfileMappings();
     return [
       new ConnectionTreeItem(
         t('connections.cli'),
@@ -77,6 +113,8 @@ class ConnectionsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
         'add',
       ),
       ...profiles.map((profile) => new ProfileTreeItem(profile, profile.id === activeId)),
+      new WorkspaceMappingsSectionItem(activeProfile?.name, mappings.length),
+      ...mappings.map((mapping) => new WorkspaceMappingTreeItem(mapping)),
     ];
   }
 }
@@ -97,12 +135,20 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
       treeDataProvider: this.provider,
     });
     this.refreshLabels();
+    setWorkspaceMappingsProvider(() => this.getActiveProfileMappings());
     this.disposables.push(
       this.treeView,
       vscode.commands.registerCommand('armTfs.connections.add', () => this.addProfile()),
       vscode.commands.registerCommand('armTfs.connections.edit', (node?: ProfileTreeItem | TfsConnectionProfile) => this.editProfile(this.unwrap(node))),
       vscode.commands.registerCommand('armTfs.connections.delete', (node?: ProfileTreeItem | TfsConnectionProfile) => this.deleteProfile(this.unwrap(node))),
       vscode.commands.registerCommand('armTfs.connections.select', (node?: ProfileTreeItem | TfsConnectionProfile) => this.selectProfile(this.unwrap(node))),
+      vscode.commands.registerCommand('armTfs.workspaceMappings.add', () => this.addWorkspaceMapping()),
+      vscode.commands.registerCommand('armTfs.workspaceMappings.delete', (node?: WorkspaceMappingTreeItem) => this.deleteWorkspaceMapping(node?.mapping)),
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration('armTfs.workspaceMappings')) {
+          this.provider.refresh();
+        }
+      }),
     );
   }
 
@@ -118,6 +164,7 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
   }
 
   dispose(): void {
+    setWorkspaceMappingsProvider(undefined);
     vscode.Disposable.from(...this.disposables).dispose();
   }
 
@@ -132,6 +179,29 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
 
   getCliDescription(): string {
     return this.cliDescription;
+  }
+
+  /**
+   * Return the workspace mappings of the currently active TFS connection profile.
+   * Empty array when there is no active profile.
+   */
+  getActiveProfileMappings(): ConfiguredWorkspaceMapping[] {
+    const active = this.getActiveProfile();
+    if (!active?.mappings) {
+      return [];
+    }
+    return active.mappings.filter((m) => m.serverPath?.startsWith('$/') && m.localPath?.trim());
+  }
+
+  /**
+   * Persist a new mappings array on the given profile and broadcast the change.
+   */
+  private async updateProfileMappings(profileId: string, mappings: ConfiguredWorkspaceMapping[]): Promise<void> {
+    const profiles = this.getProfiles().map((profile) =>
+      profile.id === profileId ? { ...profile, mappings } : profile,
+    );
+    await this.context.globalState.update(PROFILES_KEY, profiles);
+    this.provider.refresh();
   }
 
   refresh(): void {
@@ -330,4 +400,96 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
       pat: pat.trim() || existingPat!,
     };
   }
+
+  private async addWorkspaceMapping(): Promise<void> {
+    const active = this.getActiveProfile();
+    if (!active) {
+      void vscode.window.showWarningMessage(t('connections.workspaceMappings.noActiveProfile'));
+      return;
+    }
+
+    const serverPath = await vscode.window.showInputBox({
+      prompt: t('connections.workspaceMappings.prompt.serverPath', { name: active.name }),
+      value: '$/',
+      ignoreFocusOut: true,
+      validateInput: (value) => value.trim().startsWith('$/') ? undefined : t('connections.workspaceMappings.validate.serverPath'),
+    });
+    if (!serverPath) {
+      return;
+    }
+
+    const localPath = await vscode.window.showInputBox({
+      prompt: t('connections.workspaceMappings.prompt.localPath', { name: active.name }),
+      ignoreFocusOut: true,
+      validateInput: (value) => {
+        const trimmed = value.trim();
+        return (trimmed.startsWith('/') || trimmed.startsWith('~') || /^[A-Za-z]:[/\\]/.test(trimmed))
+          ? undefined
+          : t('connections.workspaceMappings.validate.localPath');
+      },
+    });
+    if (!localPath) {
+      return;
+    }
+
+    const expandedLocal = expandHome(localPath.trim());
+    const trimmedServer = serverPath.trim();
+    const existing = active.mappings ?? [];
+    const duplicate = existing.find(
+      (m) => m.serverPath === trimmedServer || m.localPath.toLowerCase() === expandedLocal.toLowerCase(),
+    );
+    if (duplicate) {
+      void vscode.window.showWarningMessage(
+        t('error.localFolderMapped', { localPath: duplicate.localPath, serverPath: duplicate.serverPath }),
+      );
+      return;
+    }
+
+    const updated = [...existing, { serverPath: trimmedServer, localPath: expandedLocal }];
+    await this.updateProfileMappings(active.id, updated);
+
+    // Also register the mapping with the TFS workspace immediately
+    try {
+      await this.client.workspaceMap(trimmedServer, expandedLocal);
+      void vscode.window.showInformationMessage(
+        t('connections.workspaceMappings.registered', { serverPath: trimmedServer, localPath: expandedLocal }),
+      );
+    } catch {
+      // Mapping is saved on the profile; CLI registration may fail if no workspace exists yet
+    }
+  }
+
+  private async deleteWorkspaceMapping(mapping?: ConfiguredWorkspaceMapping): Promise<void> {
+    if (!mapping) {
+      return;
+    }
+    const active = this.getActiveProfile();
+    if (!active) {
+      return;
+    }
+
+    const confirmed = await vscode.window.showWarningMessage(
+      t('connections.workspaceMappings.delete.confirm', { serverPath: mapping.serverPath, localPath: mapping.localPath }),
+      { modal: true },
+      t('connections.workspaceMappings.delete'),
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    const remaining = (active.mappings ?? []).filter(
+      (m) => !(m.serverPath === mapping.serverPath && m.localPath === mapping.localPath),
+    );
+    await this.updateProfileMappings(active.id, remaining);
+  }
+}
+
+function expandHome(value: string): string {
+  if (value.startsWith('~/') || value === '~') {
+    const home = process.env.HOME ?? process.env.USERPROFILE;
+    if (home) {
+      return path.resolve(value === '~' ? home : path.join(home, value.slice(2)));
+    }
+  }
+  return path.resolve(value);
 }

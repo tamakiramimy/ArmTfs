@@ -1,6 +1,6 @@
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import * as vscode from 'vscode';
 import { ArmTfsCliClient, ArmTfsCliError } from './armTfsCliClient';
@@ -9,7 +9,7 @@ import { ArmTfsConnectionsController } from './connections';
 import { ArmTfsHistoryBrowser } from './historyBrowser';
 import { getUiLanguage, t, translateCliMessage, type UiLanguage } from './i18n';
 import { checkoutServerPathToLocalFolder } from './serverPathCheckout';
-import { ArmTfsScmController, ArmTfsResourceState } from './scm';
+import { ArmTfsScmController, ArmTfsResourceState, isNoMappingError, tryAutoRegisterMapping } from './scm';
 import { ArmTfsSidebarController, ArmTfsServerExplorerController } from './sidebar';
 import { computeLocalPathForServerPath, discoverTfvcMappingForPath, findTfvcWorkspaceRoot, getCommandCwd } from './tfvcContext';
 import { openServerVersionDiff } from './versionedFiles';
@@ -361,13 +361,40 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
       return;
     }
 
-    const recursive = readBooleanOption(input, 'recursive') ?? await promptBoolean(t('extension.prompt.includeSubfiles'), false);
-    if (recursive === undefined) {
-      return;
+    // Smart default: when invoked from explorer/SCM (path is provided), recurse into directories
+    // and act on a single file when it's a file. Only show the prompt when the user invoked the
+    // command from the palette and explicitly wants control.
+    const explicitRecursive = readBooleanOption(input, 'recursive');
+    let recursive: boolean;
+    if (explicitRecursive !== undefined) {
+      recursive = explicitRecursive;
+    } else if (readStringOption(input, 'path')) {
+      recursive = isDirectorySafe(targetPath);
+    } else {
+      const prompted = await promptBoolean(t('extension.prompt.includeSubfiles'), isDirectorySafe(targetPath));
+      if (prompted === undefined) {
+        return;
+      }
+      recursive = prompted;
     }
 
     const result = await runAndShowText(t('extension.operation.add'), output, async () =>
-      withLocalWorkspace(targetPath, (localContext) => client.add([targetPath], recursive, { cwdOverride: localContext.commandCwd })),
+      withLocalWorkspace(targetPath, async (localContext) => {
+        try {
+          return await client.add([targetPath], recursive, { cwdOverride: localContext.commandCwd });
+        } catch (error) {
+          if (isNoMappingError(error)) {
+            const mapped = await tryAutoRegisterMapping(client, targetPath);
+            if (mapped) {
+              void vscode.window.showInformationMessage(
+                t('connections.workspaceMappings.autoRegistered', { serverPath: mapped.serverPath, localPath: mapped.localPath }),
+              );
+              return client.add([targetPath], recursive, { cwdOverride: localContext.commandCwd });
+            }
+          }
+          throw error;
+        }
+      }),
     );
     await refreshUi();
     return result;
@@ -872,6 +899,14 @@ function getActivePath(): string | undefined {
 
 function getWorkspaceRoot(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+}
+
+function isDirectorySafe(targetPath: string): boolean {
+  try {
+    return statSync(targetPath).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function shouldRefreshForFileSystemEvent(uri: vscode.Uri): boolean {

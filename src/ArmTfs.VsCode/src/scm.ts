@@ -1,11 +1,11 @@
 import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { ArmTfsCliClient, ArmTfsCliError } from './armTfsCliClient';
 import type { StatusItem } from './contracts';
 import { t, translateChangeType, translateStatusLabel } from './i18n';
-import { findTfvcWorkspaceRoot, findTfvcWorkspaceRootSync, getCommandCwd } from './tfvcContext';
+import { findConfiguredMappingForLocalPath, findTfvcWorkspaceRoot, findTfvcWorkspaceRootSync, getCommandCwd } from './tfvcContext';
 import { openLocalWorkingDiff } from './versionedFiles';
 
 export class ArmTfsResourceState implements vscode.SourceControlResourceState {
@@ -30,11 +30,38 @@ export class ArmTfsResourceState implements vscode.SourceControlResourceState {
   }
 }
 
+/**
+ * Resource state for a local file that exists on disk but is unknown to TFS.
+ * Surfaced in the "Untracked" group so the user can add it to TFS with one click,
+ * preventing the file from being picked up by git's source control instead.
+ */
+export class ArmTfsUntrackedResourceState implements vscode.SourceControlResourceState {
+  readonly resourceUri: vscode.Uri;
+  readonly command: vscode.Command;
+  readonly decorations: vscode.SourceControlResourceDecorations;
+  readonly contextValue: string = 'armTfsUntracked';
+
+  constructor(public readonly localPath: string) {
+    this.resourceUri = vscode.Uri.file(localPath);
+    this.command = {
+      command: 'vscode.open',
+      title: 'Open',
+      arguments: [this.resourceUri],
+    };
+    this.decorations = {
+      tooltip: t('scm.tooltip.untracked'),
+      strikeThrough: false,
+      faded: true,
+    };
+  }
+}
+
 export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecorationProvider, vscode.QuickDiffProvider {
   private readonly sourceControl: vscode.SourceControl;
   private readonly changesGroup: vscode.SourceControlResourceGroup;
   private readonly localChangesGroup: vscode.SourceControlResourceGroup;
   private readonly conflictsGroup: vscode.SourceControlResourceGroup;
+  private readonly untrackedGroup: vscode.SourceControlResourceGroup;
   private readonly disposables: vscode.Disposable[] = [];
   private readonly onDidChangeDecorationsEmitter = new vscode.EventEmitter<vscode.Uri[] | undefined>();
   private resourcesByPath = new Map<string, ArmTfsResourceState>();
@@ -63,6 +90,7 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
     this.changesGroup = this.sourceControl.createResourceGroup('changes', t('scm.group.changes'));
     this.localChangesGroup = this.sourceControl.createResourceGroup('localChanges', t('scm.group.localChanges'));
     this.conflictsGroup = this.sourceControl.createResourceGroup('conflicts', t('scm.group.conflicts'));
+    this.untrackedGroup = this.sourceControl.createResourceGroup('untracked', t('scm.group.untracked'));
   }
 
   dispose(): void {
@@ -84,6 +112,7 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
     this.changesGroup.label = t('scm.group.changes');
     this.localChangesGroup.label = t('scm.group.localChanges');
     this.conflictsGroup.label = t('scm.group.conflicts');
+    this.untrackedGroup.label = t('scm.group.untracked');
   }
 
   async refresh(): Promise<void> {
@@ -133,7 +162,26 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
       return;
     }
 
-    await this.runTextCommand('arm-tfs add', () => this.client.add([targetPath], false, { cwdOverride: getCommandCwd(workspaceRoot, targetPath) }), true);
+    const cwdOverride = getCommandCwd(workspaceRoot, targetPath);
+
+    // Try once; if the CLI reports [NO MAPPING], auto-register using a configured mapping and retry.
+    const result = await this.runTextCommand('arm-tfs add', async () => {
+      try {
+        return await this.client.add([targetPath], false, { cwdOverride });
+      } catch (error) {
+        if (isNoMappingError(error)) {
+          const mapped = await tryAutoRegisterMapping(this.client, targetPath);
+          if (mapped) {
+            void vscode.window.showInformationMessage(
+              t('connections.workspaceMappings.autoRegistered', { serverPath: mapped.serverPath, localPath: mapped.localPath }),
+            );
+            return this.client.add([targetPath], false, { cwdOverride });
+          }
+        }
+        throw error;
+      }
+    }, true);
+    return result as unknown as void;
   }
 
   async undo(resource?: ArmTfsResourceState | vscode.Uri): Promise<void> {
@@ -263,13 +311,30 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
         .filter((item) => item.state.toLowerCase().includes('conflict'))
         .map((item) => new ArmTfsResourceState(item));
 
+      // Build a set of all paths the CLI already knows about so we don't double-count them
+      // when scanning for untracked files.
+      const knownPaths = new Set<string>();
+      for (const item of status.items) {
+        if (item.localPath) {
+          knownPaths.add(normalizeLocalPath(item.localPath));
+        }
+      }
+
+      const untracked = await scanUntrackedFiles(workspaceRoot, knownPaths);
+      const untrackedStates = untracked.map((filePath) => new ArmTfsUntrackedResourceState(filePath));
+
       this.changesGroup.resourceStates = pending;
       this.localChangesGroup.resourceStates = localChanges;
       this.conflictsGroup.resourceStates = conflicts;
-      this.sourceControl.count = pending.length + localChanges.length + conflicts.length;
+      this.untrackedGroup.resourceStates = untrackedStates;
+      this.sourceControl.count = pending.length + localChanges.length + conflicts.length + untrackedStates.length;
 
       const nextResources = [...pending, ...localChanges, ...conflicts];
       const affectedUris = collectAffectedUris(this.resourcesByPath, nextResources);
+      // Also notify decorations for untracked files
+      for (const u of untrackedStates) {
+        affectedUris.push(u.resourceUri);
+      }
       this.resourcesByPath = new Map(nextResources.map((resource) => [normalizeLocalPath(resource.resourceUri.fsPath), resource]));
       this.onDidChangeDecorationsEmitter.fire(affectedUris);
     } catch (error) {
@@ -283,6 +348,7 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
     this.changesGroup.resourceStates = [];
     this.localChangesGroup.resourceStates = [];
     this.conflictsGroup.resourceStates = [];
+    this.untrackedGroup.resourceStates = [];
     this.sourceControl.count = 0;
     this.onDidChangeDecorationsEmitter.fire(affectedUris);
   }
@@ -505,6 +571,101 @@ function getPlatformSharedHomeDirectory(): string | undefined {
     return 'C:\\Mac\\Home';
   }
   return undefined;
+}
+
+/**
+ * Walk the workspace root looking for files that exist locally but TFS does not know
+ * about (i.e. not in `arm-tfs status` results). Excludes well-known noise directories
+ * (.tf/.git/node_modules/bin/obj/out/dist), and caps the result to keep the scan cheap.
+ *
+ * This is what makes new files show up in the arm-tfs SCM panel before the user runs
+ * `add`. Without it, the file falls through to git's source control panel instead.
+ */
+export async function scanUntrackedFiles(
+  workspaceRoot: string,
+  knownPaths: Set<string>,
+  options?: { maxResults?: number; maxDepth?: number },
+): Promise<string[]> {
+  const maxResults = options?.maxResults ?? 500;
+  const maxDepth = options?.maxDepth ?? 12;
+  const results: string[] = [];
+  const exclude = new Set(['.tf', '.git', 'node_modules', 'bin', 'obj', 'out', 'dist', '.vs', '.idea', '.next', 'target', '.gradle']);
+
+  const walk = (directory: string, depth: number): boolean => {
+    if (depth > maxDepth || results.length >= maxResults) {
+      return results.length >= maxResults;
+    }
+    let entries;
+    try {
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch {
+      return false;
+    }
+    for (const entry of entries) {
+      if (results.length >= maxResults) {
+        return true;
+      }
+      if (entry.name.startsWith('.') && entry.name !== '.editorconfig' && entry.name !== '.gitignore') {
+        // Skip hidden files/dirs (incl. .git, .tf, .vscode, .DS_Store, etc.)
+        // .editorconfig and .gitignore are useful committed config — keep them visible.
+        if (entry.name !== '.vscode') {
+          continue;
+        }
+      }
+      if (entry.isDirectory()) {
+        if (exclude.has(entry.name)) {
+          continue;
+        }
+        if (walk(path.join(directory, entry.name), depth + 1)) {
+          return true;
+        }
+      } else if (entry.isFile()) {
+        const fullPath = path.join(directory, entry.name);
+        if (!knownPaths.has(normalizeLocalPath(fullPath))) {
+          results.push(fullPath);
+        }
+      }
+    }
+    return false;
+  };
+
+  walk(workspaceRoot, 0);
+  return results;
+}
+
+/**
+ * Returns true when the CLI error output contains the [NO MAPPING] marker, which
+ * means the target file's local path is not covered by any registered workspace mapping.
+ */
+export function isNoMappingError(error: unknown): boolean {
+  if (error instanceof ArmTfsCliError) {
+    return error.stdout.includes('[NO MAPPING]') || error.stderr.includes('[NO MAPPING]') || error.message.includes('[NO MAPPING]');
+  }
+  if (error instanceof Error) {
+    return error.message.includes('[NO MAPPING]');
+  }
+  return false;
+}
+
+/**
+ * When arm-tfs reports [NO MAPPING] for a local file, look up a matching entry in
+ * `armTfs.workspaceMappings` and call `workspace map` to register it with the TFS
+ * workspace. Returns the mapping that was registered, or undefined if none applies.
+ */
+export async function tryAutoRegisterMapping(
+  client: ArmTfsCliClient,
+  targetPath: string,
+): Promise<{ serverPath: string; localPath: string } | undefined> {
+  const mapping = findConfiguredMappingForLocalPath(targetPath);
+  if (!mapping) {
+    return undefined;
+  }
+  try {
+    await client.workspaceMap(mapping.serverPath, mapping.localPath);
+    return mapping;
+  } catch {
+    return undefined;
+  }
 }
 
 function getActivePath(): string | undefined {

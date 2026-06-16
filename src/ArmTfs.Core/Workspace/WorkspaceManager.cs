@@ -22,6 +22,7 @@ public sealed class WorkspaceManager
     private const string TfDir = ".tf";
     private const string WorkspaceFile = "workspace.json";
     private const string PendingFile = "pending.json";
+    private const string MergeHistoryFile = "merge-history.json";
     private const string BaseDir = "base";
     private const string VersionsDir = "versions";
 
@@ -44,6 +45,7 @@ public sealed class WorkspaceManager
     private string TfPath => Path.Combine(_rootPath, TfDir);
     private string WorkspacePath => Path.Combine(TfPath, WorkspaceFile);
     private string PendingPath => Path.Combine(TfPath, PendingFile);
+    private string MergeHistoryPath => Path.Combine(TfPath, MergeHistoryFile);
     private string BaseFilesPath => Path.Combine(TfPath, BaseDir);
     private string VersionsPath => Path.Combine(TfPath, VersionsDir);
 
@@ -191,6 +193,57 @@ public sealed class WorkspaceManager
         var file = GetBaseFilePath(localPath);
         if (File.Exists(file)) File.Delete(file);
     }
+
+    // ─── 合并追踪 ──────────────────────────────────────────────────────────────
+
+    /// <summary>加载本地合并历史记录；文件不存在时返回空记录。</summary>
+    public MergeHistory LoadMergeHistory()
+    {
+        if (!File.Exists(MergeHistoryPath))
+            return new MergeHistory();
+
+        try
+        {
+            var json = File.ReadAllText(MergeHistoryPath);
+            return JsonSerializer.Deserialize<MergeHistory>(json, _jsonOptions) ?? new MergeHistory();
+        }
+        catch
+        {
+            return new MergeHistory();
+        }
+    }
+
+    /// <summary>保存合并历史记录到 .tf/merge-history.json。</summary>
+    public void SaveMergeHistory(MergeHistory history)
+    {
+        Directory.CreateDirectory(TfPath);
+        File.WriteAllText(MergeHistoryPath, JsonSerializer.Serialize(history, _jsonOptions));
+    }
+
+    /// <summary>记录一次 REST merge 执行结果。</summary>
+    public void RecordMerge(MergeRecord record)
+    {
+        var history = LoadMergeHistory();
+        history.Merges.Add(record);
+        SaveMergeHistory(history);
+    }
+
+    /// <summary>
+    /// 查询指定源/目标路径对下，已通过 REST 方式合并的源 changeset ID 集合。
+    /// 用于过滤合并候选列表。
+    /// </summary>
+    public HashSet<int> GetLocallyMergedChangesetIds(string sourcePath, string targetPath)
+    {
+        var history = LoadMergeHistory();
+        return history.Merges
+            .Where(m =>
+                string.Equals(NormalizeTfvcPath(m.SourcePath), NormalizeTfvcPath(sourcePath), StringComparison.OrdinalIgnoreCase)
+                && string.Equals(NormalizeTfvcPath(m.TargetPath), NormalizeTfvcPath(targetPath), StringComparison.OrdinalIgnoreCase))
+            .Select(m => m.SourceChangesetId)
+            .ToHashSet();
+    }
+
+    private static string NormalizeTfvcPath(string path) => path.TrimEnd('/');
 
     // ─── 映射辅助 ──────────────────────────────────────────────────────────────
 

@@ -19,6 +19,8 @@
   "command.checkoutServerPathToFolder": "将 TFVC 路径签出到本地目录",
   "command.showWorkspace": "显示工作区",
   "command.addWorkspaceMapping": "添加工作区映射",
+  "command.workspaceMappingsAdd": "添加工作区路径映射",
+  "command.workspaceMappingsDelete": "删除工作区路径映射",
   "command.runGet": "获取最新",
   "command.checkout": "签出",
   "command.add": "添加待提交文件",
