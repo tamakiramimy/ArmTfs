@@ -10,6 +10,7 @@ import { ArmTfsHistoryBrowser } from './historyBrowser';
 import { getUiLanguage, t, translateCliMessage, type UiLanguage } from './i18n';
 import { checkoutServerPathToLocalFolder } from './serverPathCheckout';
 import { ArmTfsScmController, ArmTfsResourceState, isNoMappingError, tryAutoRegisterMapping } from './scm';
+import { ArmTfsChangesViewController } from './changesView';
 import { ArmTfsSidebarController, ArmTfsServerExplorerController } from './sidebar';
 import { computeLocalPathForServerPath, discoverTfvcMappingForPath, findTfvcWorkspaceRoot, getCommandCwd } from './tfvcContext';
 import { openServerVersionDiff } from './versionedFiles';
@@ -23,6 +24,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   const client = new ArmTfsCliClient(output);
   const historyBrowser = new ArmTfsHistoryBrowser(client, output);
   const scm = new ArmTfsScmController(client, output, getWorkspaceRoot());
+  const changesView = new ArmTfsChangesViewController(scm);
   const sidebar = new ArmTfsSidebarController(client, output, getWorkspaceRoot(), async () => scm.refresh(), historyBrowser);
   let connections: ArmTfsConnectionsController;
   let uiInitialized = false;
@@ -30,7 +32,11 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     client,
     output,
     async () => scm.refresh(),
-    async (serverPath, options) => sidebar.setActiveServerPath(serverPath, options),
+    // Server Explorer is purely a TFVC-tree browser. Selecting / clicking nodes here must NOT
+    // hijack the active branch — that is solely driven by the workspace folder's .tf/workspace.json.
+    // Keeping the two views independent avoids the bugs we kept hitting where browsing a folder
+    // accidentally re-pointed the branch view at $/ or some unrelated server path.
+    async () => undefined,
     async (serverPath) => connections.updateActiveRootPath(serverPath),
     historyBrowser,
   );
@@ -39,12 +45,21 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
       return;
     }
     if (profile) {
+      // Server Explorer follows the connection's configured rootPath only — its tree
+      // is independent of the workspace's branch mapping.
       serverExplorer.setRootPath(profile.rootPath);
-      await sidebar.setActiveServerPath(profile.rootPath, {
+      // Branches view follows the workspace folder's .tf/workspace.json when available;
+      // otherwise falls back to the connection's rootPath.
+      const anchorPath = getActivePath() ?? getWorkspaceRoot();
+      const discovered = anchorPath ? discoverTfvcMappingForPath(anchorPath) : undefined;
+      const branchTarget = discovered?.serverPath ?? profile.rootPath;
+      await sidebar.setActiveServerPath(branchTarget, {
         branchContext: true,
         syncBranchScope: true,
         syncMergeSource: false,
       });
+      // Reset the items-list cache so untracked detection re-fetches against the new connection.
+      scm.invalidateTrackedCache();
     } else {
       serverExplorer.refresh();
       await sidebar.refreshAll();
@@ -53,6 +68,10 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   client.setConnectionEnvironmentProvider(() => connections.getActiveEnvironment());
 
   const refreshUi = async () => {
+    // Re-discover the active branch mapping from .tf/workspace.json before refreshing.
+    // Without this, opening or modifying a file (which triggers refreshUi) can leave
+    // the sidebar pointing at $/ even though the workspace clearly maps to a specific branch.
+    await syncTfvcContextFromActivePath();
     await scm.refresh();
     await sidebar.refreshAll();
   };
@@ -64,7 +83,10 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
       return;
     }
 
-    serverExplorer.setRootPath(discovered.serverPath);
+    // Branches view follows the workspace's .tf/workspace.json mapping. Server Explorer
+    // is intentionally *not* touched here — it is a standalone TFVC tree browser whose
+    // root is controlled by the user via "Set Root Path". Coupling them caused the
+    // explorer to keep snapping back to the auto-discovered branch on every refresh.
     await sidebar.setActiveServerPath(discovered.serverPath, {
       branchContext: true,
       syncBranchScope: true,
@@ -94,6 +116,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     connections.refreshLabels();
     serverExplorer.refreshLabels();
     sidebar.refreshLabels();
+    changesView.refreshLabels();
     await connections.refreshCliDescription();
     connections.refresh();
     serverExplorer.refresh();
@@ -101,7 +124,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     await refreshUi();
   };
 
-  context.subscriptions.push(output, historyBrowser, scm, sidebar, serverExplorer, connections, workspaceFileWatcher, vscode.window.registerFileDecorationProvider(scm));
+  context.subscriptions.push(output, historyBrowser, scm, changesView, sidebar, serverExplorer, connections, workspaceFileWatcher, vscode.window.registerFileDecorationProvider(scm));
   void (async () => {
     await connections.initialize();
     await scm.initialize();
@@ -129,6 +152,17 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
       void (async () => {
         await syncTfvcContextFromActivePath(editor?.document.uri.scheme === 'file' ? editor.document.uri.fsPath : undefined);
         await sidebar.handleActiveEditorChanged();
+      })();
+    }),
+    vscode.workspace.onDidChangeWorkspaceFolders((event) => {
+      void (async () => {
+        // When the user opens a folder, drags one in, or VS Code restores a workspace,
+        // re-resolve the TFVC mapping so the active server path / branch scope / change list
+        // all align with the newly visible workspace root.
+        const newRoot = event.added[0]?.uri.fsPath ?? getWorkspaceRoot();
+        scm.invalidateTrackedCache();
+        await syncTfvcContextFromActivePath(newRoot);
+        await refreshUi();
       })();
     }),
     vscode.workspace.onDidCreateFiles(() => {

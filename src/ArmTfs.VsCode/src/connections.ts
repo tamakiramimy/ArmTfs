@@ -328,12 +328,18 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
 
   private async activateProfile(profile: TfsConnectionProfile | undefined): Promise<void> {
     if (profile) {
+      // Only seed serverExplorer.rootPath as a fallback when nothing else is set.
+      // We deliberately do NOT touch branch.scope here — the active branch must come from
+      // the workspace's .tf/workspace.json (auto-discovery), not from the profile's root.
+      // Otherwise opening a specific branch checkout would silently get re-pointed to '$/'.
       const target = vscode.workspace.workspaceFolders?.length
         ? vscode.ConfigurationTarget.Workspace
         : vscode.ConfigurationTarget.Global;
       const config = vscode.workspace.getConfiguration('armTfs');
-      await config.update('serverExplorer.rootPath', profile.rootPath, target);
-      await config.update('branch.scope', profile.rootPath, target);
+      const currentRoot = config.get<string>('serverExplorer.rootPath')?.trim();
+      if (!currentRoot) {
+        await config.update('serverExplorer.rootPath', profile.rootPath, target);
+      }
     }
     this.provider.refresh();
     await this.onConnectionChanged(profile);
@@ -389,13 +395,50 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
       return undefined;
     }
 
+    // Local root mapping for the connection's rootPath. Asked here in the same flow as URL/PAT
+    // so the user does not have to set it up separately every time. Persisted as the first
+    // entry of profile.mappings.
+    const existingRootMapping = existing?.mappings?.find((m) => m.serverPath === (existing.rootPath ?? rootPath));
+    const localRoot = await vscode.window.showInputBox({
+      prompt: t('connections.prompt.localRoot', { name: name.trim() }),
+      placeHolder: t('connections.prompt.localRoot.placeholder'),
+      value: existingRootMapping?.localPath ?? '',
+      ignoreFocusOut: true,
+      validateInput: (value) => {
+        const trimmed = value.trim();
+        if (!trimmed) {
+          // Allow empty — user may want to set it up later via the standalone tree command.
+          return undefined;
+        }
+        return (trimmed.startsWith('/') || trimmed.startsWith('~') || /^[A-Za-z]:[/\\]/.test(trimmed))
+          ? undefined
+          : t('connections.workspaceMappings.validate.localPath');
+      },
+    });
+    if (localRoot === undefined) {
+      return undefined;
+    }
+
+    const trimmedRoot = rootPath.trim();
+    const trimmedLocal = localRoot.trim();
+    let mappings = existing?.mappings ?? [];
+    if (trimmedLocal) {
+      const expanded = expandHome(trimmedLocal);
+      // Replace any existing mapping for the connection's rootPath with the new local root.
+      mappings = [
+        { serverPath: trimmedRoot, localPath: expanded },
+        ...mappings.filter((m) => m.serverPath !== trimmedRoot && m.serverPath !== existing?.rootPath),
+      ];
+    }
+
     return {
       metadata: {
         id: existing?.id ?? `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
         name: name.trim(),
         serverUrl: serverUrl.trim().replace(/\/+$/, ''),
-        rootPath: rootPath.trim(),
+        rootPath: trimmedRoot,
         displayName: displayName.trim() || undefined,
+        mappings,
       },
       pat: pat.trim() || existingPat!,
     };

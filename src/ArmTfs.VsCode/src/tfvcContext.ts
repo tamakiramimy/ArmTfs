@@ -96,17 +96,51 @@ export function serverPathToRelative(serverPath: string): string {
 }
 
 /**
- * Compute the default local checkout path for a TFVC server path based on the configured
- * `armTfs.localRootDirectory`. Returns undefined when no root directory is configured, so callers
- * can fall back to their previous default. The returned path is only a suggestion: callers should
- * still let the user review/edit it.
+ * Compute the default local path for a TFVC server path. Priority:
+ *  1. Configured workspace mappings (active TFS profile or global setting). The most-specific
+ *     mapping that is an ancestor of the server path wins.
+ *  2. Fallback to `armTfs.tfsRootDirectory` (legacy single-root setting).
+ * Returns undefined when neither source has a usable mapping. The result is a suggestion —
+ * callers should still let the user review/edit it.
  */
 export function computeLocalPathForServerPath(serverPath: string): string | undefined {
+  const trimmedServer = serverPath.trim();
+  const normalizedServer = trimmedServer.replace(/\/+$/, '');
+
+  // Strategy 1: configured workspace mappings — pick the deepest one that is an ancestor
+  // of the requested server path.
+  const mappings = getConfiguredWorkspaceMappings();
+  let best: { mapping: ConfiguredWorkspaceMapping; matchLen: number } | undefined;
+  for (const mapping of mappings) {
+    const mappingServerNorm = mapping.serverPath.replace(/\/+$/, '');
+    if (normalizedServer === mappingServerNorm
+      || normalizedServer.startsWith(`${mappingServerNorm}/`)
+      || mappingServerNorm === '$') {
+      const len = mappingServerNorm.length;
+      if (!best || len > best.matchLen) {
+        best = { mapping, matchLen: len };
+      }
+    }
+  }
+  if (best) {
+    const mappingServerNorm = best.mapping.serverPath.replace(/\/+$/, '');
+    let suffix = '';
+    if (mappingServerNorm === '$' || mappingServerNorm === '$/') {
+      suffix = normalizedServer.replace(/^\$\/?/, '');
+    } else if (normalizedServer.startsWith(`${mappingServerNorm}/`)) {
+      suffix = normalizedServer.slice(mappingServerNorm.length + 1);
+    }
+    return suffix
+      ? path.join(best.mapping.localPath, ...suffix.split('/').filter(Boolean))
+      : best.mapping.localPath;
+  }
+
+  // Strategy 2: legacy tfsRootDirectory.
   const localRoot = getConfiguredLocalRootDirectory();
   if (!localRoot) {
     return undefined;
   }
-  const relative = serverPathToRelative(serverPath);
+  const relative = serverPathToRelative(trimmedServer);
   return relative ? path.join(localRoot, relative) : localRoot;
 }
 
@@ -361,34 +395,63 @@ function normalizeForCompare(targetPath: string): string {
   return path.resolve(translatePlatformSharedPath(targetPath)).toLowerCase();
 }
 
+/**
+ * Translate a workspace mapping's local path between macOS and Windows when the user runs the
+ * VM (Parallels Desktop) and the same TFS workspace is opened from both sides.
+ *
+ * Equivalence (Parallels shared volume):
+ *   macOS:    /Users/<user>/<rest>
+ *   Windows:  C:\Mac\Home\<user>\<rest>     (drive-letter form)
+ *   Windows:  \\Mac\Home\<user>\<rest>      (UNC form)
+ *
+ * The function takes a path written by either side and returns the equivalent path on the
+ * current platform, so that mapping comparisons (string-prefix checks) work correctly.
+ *
+ * Important: it must not depend on process.env.HOME — that includes the username and would
+ * collide with the username already present in the mapping. We use literal "/Users" and
+ * "C:\\Mac\\Home" as the platform anchors instead.
+ */
 function translatePlatformSharedPath(targetPath: string): string {
   if (process.platform !== 'darwin' && process.platform !== 'win32') {
     return targetPath;
   }
 
   const normalized = targetPath.replace(/\\/g, '/');
-  const home = getPlatformSharedHomeDirectory();
-  if (!home) {
-    return targetPath;
-  }
 
-  const prefixes = ['//Mac/Home/', '/Mac/Home/'];
-  for (const prefix of prefixes) {
+  // Win UNC or drive-stripped form: //Mac/Home/<user>/... or /Mac/Home/<user>/...
+  for (const prefix of ['//Mac/Home/', '/Mac/Home/']) {
     if (normalized.toLowerCase().startsWith(prefix.toLowerCase())) {
-      return path.join(home, normalized.slice(prefix.length));
+      const rest = normalized.slice(prefix.length);
+      return process.platform === 'darwin'
+        ? path.join('/Users', rest)
+        : path.join('C:\\Mac\\Home', ...rest.split('/'));
     }
   }
 
-  const withoutDrive = /^[A-Za-z]:\//.test(normalized) ? normalized.slice(3) : normalized;
-  const drivePrefix = 'Mac/Home/';
-  if (withoutDrive.toLowerCase().startsWith(drivePrefix.toLowerCase())) {
-    return path.join(home, withoutDrive.slice(drivePrefix.length));
+  // Win drive-letter form: C:/Mac/Home/<user>/...  (any drive letter)
+  const driveMatch = normalized.match(/^[A-Za-z]:\/(.*)$/);
+  if (driveMatch) {
+    const withoutDrive = driveMatch[1];
+    if (withoutDrive.toLowerCase().startsWith('mac/home/')) {
+      const rest = withoutDrive.slice('mac/home/'.length);
+      return process.platform === 'darwin'
+        ? path.join('/Users', rest)
+        : path.join('C:\\Mac\\Home', ...rest.split('/'));
+    }
+  }
+
+  // macOS path written from the macOS side, opened on Windows: /Users/<user>/... → C:\Mac\Home\<user>\...
+  if (process.platform === 'win32' && normalized.toLowerCase().startsWith('/users/')) {
+    const rest = normalized.slice('/Users/'.length);
+    return path.join('C:\\Mac\\Home', ...rest.split('/'));
   }
 
   return targetPath;
 }
 
 function getPlatformSharedHomeDirectory(): string | undefined {
+  // Kept for backward compatibility with any external import. Internally
+  // translatePlatformSharedPath no longer relies on it.
   if (process.platform === 'darwin') {
     return process.env.HOME;
   }

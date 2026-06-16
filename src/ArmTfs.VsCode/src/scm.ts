@@ -56,63 +56,53 @@ export class ArmTfsUntrackedResourceState implements vscode.SourceControlResourc
   }
 }
 
-export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecorationProvider, vscode.QuickDiffProvider {
-  private readonly sourceControl: vscode.SourceControl;
-  private readonly changesGroup: vscode.SourceControlResourceGroup;
-  private readonly localChangesGroup: vscode.SourceControlResourceGroup;
-  private readonly conflictsGroup: vscode.SourceControlResourceGroup;
-  private readonly untrackedGroup: vscode.SourceControlResourceGroup;
+export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecorationProvider {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly onDidChangeDecorationsEmitter = new vscode.EventEmitter<vscode.Uri[] | undefined>();
+  private readonly onDidChangeChangesEmitter = new vscode.EventEmitter<void>();
   private resourcesByPath = new Map<string, ArmTfsResourceState>();
   private refreshInFlight: Promise<void> | undefined;
   private refreshQueued = false;
 
+  // Public, read-only snapshot of the latest scan. Subscribed by the changes view.
+  pendingChanges: ArmTfsResourceState[] = [];
+  localChanges: ArmTfsResourceState[] = [];
+  conflicts: ArmTfsResourceState[] = [];
+  untrackedFiles: ArmTfsUntrackedResourceState[] = [];
+  lastWorkspaceRoot: string | undefined;
+  /** Cached set of TFS-tracked local paths. Invalidated on workspace switch and after add/checkin/undo. */
+  private knownPathsCache: Set<string> | undefined;
+
   readonly onDidChangeFileDecorations = this.onDidChangeDecorationsEmitter.event;
+  /** Fires whenever pendingChanges/localChanges/conflicts/untrackedFiles is replaced. */
+  readonly onDidChangeChanges = this.onDidChangeChangesEmitter.event;
 
   constructor(
     private readonly client: ArmTfsCliClient,
     private readonly output: vscode.OutputChannel,
     private readonly rootPath: string | undefined,
   ) {
-    this.sourceControl = vscode.scm.createSourceControl(
-      'armTfs',
-      'arm-tfs',
-      this.rootPath ? vscode.Uri.file(this.rootPath) : undefined,
-    );
-    this.sourceControl.inputBox.placeholder = t('scm.input.placeholder');
-    this.sourceControl.acceptInputCommand = {
-      command: 'armTfs.checkinFromScm',
-      title: t('command.checkIn'),
-    };
-    this.sourceControl.quickDiffProvider = this;
-
-    this.changesGroup = this.sourceControl.createResourceGroup('changes', t('scm.group.changes'));
-    this.localChangesGroup = this.sourceControl.createResourceGroup('localChanges', t('scm.group.localChanges'));
-    this.conflictsGroup = this.sourceControl.createResourceGroup('conflicts', t('scm.group.conflicts'));
-    this.untrackedGroup = this.sourceControl.createResourceGroup('untracked', t('scm.group.untracked'));
+    // arm-tfs intentionally does NOT register a vscode.SourceControl. All TFS changes are
+    // surfaced inside the TFS activity-bar (armTfsHub) tree view, not in VS Code's built-in
+    // Source Control panel — keeping arm-tfs separate from git so the two never collide.
   }
 
   dispose(): void {
     this.onDidChangeDecorationsEmitter.dispose();
-    vscode.Disposable.from(this.sourceControl, ...this.disposables).dispose();
+    this.onDidChangeChangesEmitter.dispose();
+    vscode.Disposable.from(...this.disposables).dispose();
   }
 
   async initialize(): Promise<void> {
-    this.refreshLabels();
     await this.refresh();
   }
 
+  /**
+   * Used to be the SCM resource-group label refresher. Kept for callers but is now a no-op
+   * because all label rendering moved to the TreeView under armTfsHub.
+   */
   refreshLabels(): void {
-    this.sourceControl.inputBox.placeholder = t('scm.input.placeholder');
-    this.sourceControl.acceptInputCommand = {
-      command: 'armTfs.checkinFromScm',
-      title: t('command.checkIn'),
-    };
-    this.changesGroup.label = t('scm.group.changes');
-    this.localChangesGroup.label = t('scm.group.localChanges');
-    this.conflictsGroup.label = t('scm.group.conflicts');
-    this.untrackedGroup.label = t('scm.group.untracked');
+    // intentionally empty
   }
 
   async refresh(): Promise<void> {
@@ -206,24 +196,24 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
     await this.runTextCommand('arm-tfs undo', () => this.client.undo([targetPath], false, { cwdOverride: getCommandCwd(workspaceRoot, targetPath) }), true);
   }
 
-  async checkin(): Promise<void> {
+  async checkin(comment?: string): Promise<void> {
     const workspaceRoot = await findTfvcWorkspaceRoot(this.rootPath);
     if (!workspaceRoot) {
       void vscode.window.showWarningMessage(t('warning.noWorkspace.general'));
       return;
     }
 
-    const comment = this.sourceControl.inputBox.value.trim();
-    if (!comment) {
-      void vscode.window.showWarningMessage(t('warning.checkin.comment'));
+    const finalComment = (comment ?? await vscode.window.showInputBox({
+      prompt: t('extension.prompt.checkinComment'),
+      ignoreFocusOut: true,
+      validateInput: (value) => value.trim() ? undefined : t('warning.checkin.comment'),
+    }))?.trim();
+    if (!finalComment) {
       return;
     }
 
     const targetPath = workspaceRoot;
-    const result = await this.runTextCommand('arm-tfs checkin', () => this.client.checkin(comment, [targetPath], false, false, { cwdOverride: workspaceRoot }), true);
-    if (result) {
-      this.sourceControl.inputBox.value = '';
-    }
+    await this.runTextCommand('arm-tfs checkin', () => this.client.checkin(finalComment, [targetPath], false, false, { cwdOverride: workspaceRoot }), true);
   }
 
   async openDiff(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
@@ -258,7 +248,7 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
 
       await vscode.window.withProgress(
         {
-          location: vscode.ProgressLocation.SourceControl,
+          location: vscode.ProgressLocation.Window,
           title: `arm-tfs diff ${path.basename(targetPath)}`,
         },
         () => openLocalWorkingDiff(
@@ -291,6 +281,8 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
   }
 
   provideOriginalResource(uri: vscode.Uri): vscode.ProviderResult<vscode.Uri> {
+    // No longer wired to a SCM QuickDiffProvider. Kept as a utility for the diff command
+    // so editor diff lookups can still locate the cached base file when needed.
     const workspaceRoot = findTfvcWorkspaceRootSync(uri.fsPath) ?? (this.rootPath ? findTfvcWorkspaceRootSync(this.rootPath) : undefined);
     if (!workspaceRoot) {
       return undefined;
@@ -306,6 +298,11 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
       this.clearResources();
       return;
     }
+    // Invalidate the items-list cache when the workspace root changes.
+    if (this.lastWorkspaceRoot && this.lastWorkspaceRoot !== workspaceRoot) {
+      this.knownPathsCache = undefined;
+    }
+    this.lastWorkspaceRoot = workspaceRoot;
 
     try {
       const status = await this.client.status(workspaceRoot, true, { cwdOverride: workspaceRoot });
@@ -317,53 +314,107 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
         .filter((item) => item.state.toLowerCase().includes('conflict'))
         .map((item) => new ArmTfsResourceState(item));
 
-      // Build a set of all paths the CLI already knows about so we don't double-count them
-      // when scanning for untracked files.
+      // Build the set of paths the CLI knows about. Start with everything `status` returned
+      // (those have changes) plus every file the workspace's items list returns (those are
+      // already tracked but unchanged — without this we'd misclassify them as untracked).
       const knownPaths = new Set<string>();
       for (const item of status.items) {
         if (item.localPath) {
           knownPaths.add(normalizeLocalPath(item.localPath));
         }
       }
+      const trackedPaths = await this.getTrackedPaths(workspaceRoot, status.workspace.mappings);
+      for (const p of trackedPaths) {
+        knownPaths.add(p);
+      }
 
       const untracked = await scanUntrackedFiles(workspaceRoot, knownPaths);
       const untrackedStates = untracked.map((filePath) => new ArmTfsUntrackedResourceState(filePath));
 
-      this.changesGroup.resourceStates = pending;
-      this.localChangesGroup.resourceStates = localChanges;
-      this.conflictsGroup.resourceStates = conflicts;
-      this.untrackedGroup.resourceStates = untrackedStates;
-      this.sourceControl.count = pending.length + localChanges.length + conflicts.length + untrackedStates.length;
+      this.pendingChanges = pending;
+      this.localChanges = localChanges;
+      this.conflicts = conflicts;
+      this.untrackedFiles = untrackedStates;
 
       const nextResources = [...pending, ...localChanges, ...conflicts];
       const affectedUris = collectAffectedUris(this.resourcesByPath, nextResources);
-      // Also notify decorations for untracked files
       for (const u of untrackedStates) {
         affectedUris.push(u.resourceUri);
       }
       this.resourcesByPath = new Map(nextResources.map((resource) => [normalizeLocalPath(resource.resourceUri.fsPath), resource]));
       this.onDidChangeDecorationsEmitter.fire(affectedUris);
+      this.onDidChangeChangesEmitter.fire();
     } catch (error) {
       this.showError('arm-tfs status', error);
     }
   }
 
+  /**
+   * Returns every local path the TFS workspace tracks. Pulled via `arm-tfs items list --recursive`
+   * for each mapping and translated server-path → local-path. Cached per workspace root to avoid
+   * re-fetching the entire tree on every status refresh; invalidate via {@link invalidateTrackedCache}
+   * when add/checkin succeeds.
+   */
+  private async getTrackedPaths(
+    workspaceRoot: string,
+    mappings: Array<{ serverPath: string; localPath: string }>,
+  ): Promise<Set<string>> {
+    if (this.knownPathsCache) {
+      return this.knownPathsCache;
+    }
+
+    const result = new Set<string>();
+    for (const mapping of mappings) {
+      if (!mapping.serverPath || !mapping.localPath) {
+        continue;
+      }
+      try {
+        const listing = await this.client.itemsList(mapping.serverPath, true, { cwdOverride: workspaceRoot });
+        const serverRoot = mapping.serverPath.replace(/\/+$/, '');
+        for (const entry of listing.items) {
+          if (entry.isFolder) {
+            continue;
+          }
+          // Translate server path to local path: serverPath - serverRoot → relative → join localPath
+          const relative = entry.serverPath.startsWith(serverRoot + '/')
+            ? entry.serverPath.slice(serverRoot.length + 1)
+            : entry.serverPath.replace(/^\$\//, '');
+          const localFile = path.join(mapping.localPath, ...relative.split('/'));
+          result.add(normalizeLocalPath(localFile));
+        }
+      } catch (error) {
+        // Network/CLI errors should not break status; we'll just see more "untracked" files.
+        this.output.appendLine(`arm-tfs items list ${mapping.serverPath}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    this.knownPathsCache = result;
+    return result;
+  }
+
+  /**
+   * Drop the cached items list. Call after operations that change the set of tracked files
+   * (add, checkin, undo of a pending add).
+   */
+  invalidateTrackedCache(): void {
+    this.knownPathsCache = undefined;
+  }
+
   private clearResources(): void {
     const affectedUris = [...this.resourcesByPath.values()].map((resource) => resource.resourceUri);
     this.resourcesByPath.clear();
-    this.changesGroup.resourceStates = [];
-    this.localChangesGroup.resourceStates = [];
-    this.conflictsGroup.resourceStates = [];
-    this.untrackedGroup.resourceStates = [];
-    this.sourceControl.count = 0;
+    this.pendingChanges = [];
+    this.localChanges = [];
+    this.conflicts = [];
+    this.untrackedFiles = [];
     this.onDidChangeDecorationsEmitter.fire(affectedUris);
+    this.onDidChangeChangesEmitter.fire();
   }
 
   private async runTextCommand(title: string, runner: () => Promise<string>, refreshAfter: boolean): Promise<string | undefined> {
     try {
       const result = await vscode.window.withProgress(
         {
-          location: vscode.ProgressLocation.SourceControl,
+          location: vscode.ProgressLocation.Window,
           title,
         },
         () => runner(),
@@ -375,6 +426,9 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
 
       vscode.window.setStatusBarMessage(t('status.completed', { title }), 2500);
       if (refreshAfter) {
+        // Operations like add/checkin/undo can change the set of tracked files; drop the cache
+        // so the next status pass re-fetches the items list.
+        this.invalidateTrackedCache();
         await this.refresh();
       }
 
@@ -549,27 +603,40 @@ function translatePlatformSharedPath(localPath: string): string {
   }
 
   const normalized = localPath.replace(/\\/g, '/');
-  const home = getPlatformSharedHomeDirectory();
-  if (!home) {
-    return localPath;
-  }
 
+  // Win UNC or drive-stripped form: //Mac/Home/<user>/... or /Mac/Home/<user>/...
   for (const prefix of ['//Mac/Home/', '/Mac/Home/']) {
     if (normalized.toLowerCase().startsWith(prefix.toLowerCase())) {
-      return path.join(home, normalized.slice(prefix.length));
+      const rest = normalized.slice(prefix.length);
+      return process.platform === 'darwin'
+        ? path.join('/Users', rest)
+        : path.join('C:\\Mac\\Home', ...rest.split('/'));
     }
   }
 
-  const withoutDrive = /^[A-Za-z]:\//.test(normalized) ? normalized.slice(3) : normalized;
-  const drivePrefix = 'Mac/Home/';
-  if (withoutDrive.toLowerCase().startsWith(drivePrefix.toLowerCase())) {
-    return path.join(home, withoutDrive.slice(drivePrefix.length));
+  // Win drive-letter form: C:/Mac/Home/<user>/... (any drive letter)
+  const driveMatch = normalized.match(/^[A-Za-z]:\/(.*)$/);
+  if (driveMatch) {
+    const withoutDrive = driveMatch[1];
+    if (withoutDrive.toLowerCase().startsWith('mac/home/')) {
+      const rest = withoutDrive.slice('mac/home/'.length);
+      return process.platform === 'darwin'
+        ? path.join('/Users', rest)
+        : path.join('C:\\Mac\\Home', ...rest.split('/'));
+    }
+  }
+
+  // macOS path written from the macOS side, opened on Windows
+  if (process.platform === 'win32' && normalized.toLowerCase().startsWith('/users/')) {
+    const rest = normalized.slice('/Users/'.length);
+    return path.join('C:\\Mac\\Home', ...rest.split('/'));
   }
 
   return localPath;
 }
 
 function getPlatformSharedHomeDirectory(): string | undefined {
+  // Kept for backward compatibility. Internally translatePlatformSharedPath no longer relies on it.
   if (process.platform === 'darwin') {
     return process.env.HOME;
   }

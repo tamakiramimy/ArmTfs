@@ -39,6 +39,10 @@
           "name": "%view.connections%"
         },
         {
+          "id": "armTfs.changes",
+          "name": "%view.changes%"
+        },
+        {
           "id": "armTfs.serverExplorer",
           "name": "%view.serverExplorer%"
         },
@@ -206,6 +210,54 @@
         "category": "arm-tfs"
       },
       {
+        "command": "armTfs.changes.refresh",
+        "title": "%command.changesRefresh%",
+        "category": "arm-tfs",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "armTfs.changes.checkin",
+        "title": "%command.changesCheckin%",
+        "category": "arm-tfs",
+        "icon": "$(check)"
+      },
+      {
+        "command": "armTfs.changes.add",
+        "title": "%command.changesAdd%",
+        "category": "arm-tfs",
+        "icon": "$(add)"
+      },
+      {
+        "command": "armTfs.changes.checkout",
+        "title": "%command.changesCheckout%",
+        "category": "arm-tfs",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "armTfs.changes.undo",
+        "title": "%command.changesUndo%",
+        "category": "arm-tfs",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "armTfs.changes.openDiff",
+        "title": "%command.changesOpenDiff%",
+        "category": "arm-tfs",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "armTfs.changes.openFile",
+        "title": "%command.changesOpenFile%",
+        "category": "arm-tfs",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "armTfs.changes.deleteUntracked",
+        "title": "%command.changesDeleteUntracked%",
+        "category": "arm-tfs",
+        "icon": "$(trash)"
+      },
+      {
         "command": "armTfs.openResourceDiff",
         "title": "%command.openResourceDiff%",
         "category": "arm-tfs"
@@ -241,6 +293,18 @@
         "title": "%command.serverExplorerRefresh%",
         "category": "arm-tfs",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "armTfs.serverExplorer.setFilter",
+        "title": "%command.serverExplorerSetFilter%",
+        "category": "arm-tfs",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "armTfs.serverExplorer.clearFilter",
+        "title": "%command.serverExplorerClearFilter%",
+        "category": "arm-tfs",
+        "icon": "$(filter-filled)"
       },
       {
         "command": "armTfs.serverExplorer.setRoot",
@@ -391,9 +455,29 @@
           "group": "navigation@1"
         },
         {
-          "command": "armTfs.serverExplorer.setRoot",
+          "command": "armTfs.serverExplorer.setFilter",
           "when": "view == armTfs.serverExplorer",
           "group": "navigation@2"
+        },
+        {
+          "command": "armTfs.serverExplorer.clearFilter",
+          "when": "view == armTfs.serverExplorer",
+          "group": "navigation@3"
+        },
+        {
+          "command": "armTfs.changes.checkin",
+          "when": "view == armTfs.changes",
+          "group": "navigation@1"
+        },
+        {
+          "command": "armTfs.changes.refresh",
+          "when": "view == armTfs.changes",
+          "group": "navigation@2"
+        },
+        {
+          "command": "armTfs.serverExplorer.setRoot",
+          "when": "view == armTfs.serverExplorer",
+          "group": "navigation@4"
         },
         {
           "command": "armTfs.sidebar.refresh",
@@ -437,6 +521,41 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "armTfs.changes.add",
+          "when": "view == armTfs.changes && viewItem == armTfsChangeFile.untracked",
+          "group": "inline@1"
+        },
+        {
+          "command": "armTfs.changes.deleteUntracked",
+          "when": "view == armTfs.changes && viewItem == armTfsChangeFile.untracked",
+          "group": "inline@2"
+        },
+        {
+          "command": "armTfs.changes.openFile",
+          "when": "view == armTfs.changes && viewItem == armTfsChangeFile.untracked",
+          "group": "inline@3"
+        },
+        {
+          "command": "armTfs.changes.openDiff",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|localChanges|conflicts)/",
+          "group": "inline@1"
+        },
+        {
+          "command": "armTfs.changes.checkout",
+          "when": "view == armTfs.changes && viewItem == armTfsChangeFile.localChanges",
+          "group": "inline@2"
+        },
+        {
+          "command": "armTfs.changes.add",
+          "when": "view == armTfs.changes && viewItem == armTfsChangeFile.localChanges",
+          "group": "inline@3"
+        },
+        {
+          "command": "armTfs.changes.undo",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|conflicts)/",
+          "group": "inline@2"
+        },
         {
           "command": "armTfs.connections.edit",
           "when": "view == armTfs.connections && viewItem == armTfsConnectionProfile",

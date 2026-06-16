@@ -871,9 +871,11 @@ export class ArmTfsSidebarController implements vscode.Disposable {
           location: vscode.ProgressLocation.Notification,
           title: `arm-tfs pull ${mapped.serverPath}`,
         },
-        () => this.client.get(mapped.localPath, { recursive: true }, {
-          cwdOverride: getCommandCwd(mapped.workspaceRoot, mapped.localPath),
-        }),
+        // checkoutServerPathToLocalFolder ensures .tf/workspace.json exists (via workspaceNew
+        // when nothing is there yet, or workspaceMap if a parent workspace exists). Without
+        // this, `arm-tfs get` would fetch files but never write the workspace metadata —
+        // re-opening the folder later would have no .tf/ to discover the mapping from.
+        () => checkoutServerPathToLocalFolder(this.client, mapped.serverPath, mapped.localPath),
       );
 
       reportCommandOutput(this.output, `arm-tfs pull ${mapped.serverPath}`, result);
@@ -896,9 +898,9 @@ export class ArmTfsSidebarController implements vscode.Disposable {
           location: vscode.ProgressLocation.Notification,
           title: `arm-tfs checkout ${mapped.serverPath}`,
         },
-        () => this.client.checkout([mapped.localPath], true, {
-          cwdOverride: getCommandCwd(mapped.workspaceRoot, mapped.localPath),
-        }),
+        // Same reasoning as pullBranch: ensure .tf/workspace.json before any get/checkout, so
+        // the user can re-open the folder later and have the extension auto-detect the branch.
+        () => checkoutServerPathToLocalFolder(this.client, mapped.serverPath, mapped.localPath),
       );
 
       reportCommandOutput(this.output, `arm-tfs checkout ${mapped.serverPath}`, result);
@@ -1116,7 +1118,16 @@ export class ArmTfsSidebarController implements vscode.Disposable {
 
     const mapped = resolveMappedLocalPathForServerPath(branchPath, this.workspaceStatus, this.resolvedWorkspaceRoot);
     if (!mapped) {
-      void vscode.window.showWarningMessage(t('sidebar.warning.branchNotMapped', { path: branchPath }));
+      // Tell the user exactly what's missing: a root mapping under their active TFS connection.
+      // Offer a button that takes them straight to the place where they can add it.
+      void vscode.window.showWarningMessage(
+        t('sidebar.warning.noRootMapping', { path: branchPath }),
+        t('sidebar.warning.openMappingsView'),
+      ).then((choice) => {
+        if (choice === t('sidebar.warning.openMappingsView')) {
+          void vscode.commands.executeCommand('armTfs.workspaceMappings.add');
+        }
+      });
       return undefined;
     }
 
@@ -1405,6 +1416,16 @@ function resolveMappedLocalPathForServerPath(
     }
   }
 
+  // Fallback to the user's configured root mapping (profile workspaceMappings or
+  // armTfs.tfsRootDirectory). Lets `pull branch` / `checkout branch` auto-derive a sensible
+  // path instead of erroring 'Branch not mapped, run Checkout Server Path To Folder first'.
+  if (!bestMatch) {
+    const computed = computeLocalPathForServerPath(serverPath);
+    if (computed) {
+      return { workspaceRoot, serverPath, localPath: computed };
+    }
+  }
+
   return bestMatch
     ? {
         workspaceRoot,
@@ -1571,6 +1592,15 @@ class ServerExplorerProvider implements vscode.TreeDataProvider<vscode.TreeItem>
   private readonly childCache = new Map<string, vscode.TreeItem[]>();
   private rootPath: string | undefined;
 
+  /** Active filter pattern (case-insensitive). Empty/undefined means no filter. */
+  private filterPattern: string | undefined;
+  /**
+   * When filtering, we recursively load the entire subtree once and store the surviving nodes
+   * grouped by their parent server path. Tree expansion then reads from this map instead of
+   * issuing a fresh itemsList per directory.
+   */
+  private filteredChildrenByParent: Map<string, ServerItemEntry[]> | undefined;
+
   constructor(private readonly client: ArmTfsCliClient, private readonly output: vscode.OutputChannel) {
     this.rootPath = vscode.workspace.getConfiguration('armTfs').get<string>('serverExplorer.rootPath')?.trim() || undefined;
   }
@@ -1578,11 +1608,79 @@ class ServerExplorerProvider implements vscode.TreeDataProvider<vscode.TreeItem>
   setRootPath(rootPath: string): void {
     this.rootPath = rootPath;
     this.childCache.clear();
+    // Filter is anchored to a root — invalidate it whenever the root changes.
+    this.filteredChildrenByParent = undefined;
     this.onDidChangeTreeDataEmitter.fire();
   }
 
   refresh(): void {
     this.childCache.clear();
+    this.filteredChildrenByParent = undefined;
+    this.onDidChangeTreeDataEmitter.fire();
+  }
+
+  getActiveFilter(): string | undefined {
+    return this.filterPattern;
+  }
+
+  /**
+   * Apply a name filter. Pass empty/undefined to clear. The filter only matches folders /
+   * branches — files inside branches are never searched. Matching folders show with their
+   * full ancestor chain so the user can see where each match lives.
+   */
+  async setFilter(pattern: string | undefined): Promise<void> {
+    const trimmed = pattern?.trim();
+    if (!trimmed) {
+      this.filterPattern = undefined;
+      this.filteredChildrenByParent = undefined;
+      this.onDidChangeTreeDataEmitter.fire();
+      return;
+    }
+    if (!this.rootPath) {
+      return;
+    }
+
+    this.filterPattern = trimmed;
+    try {
+      const response = await this.client.itemsList(this.rootPath, true);
+      const lowered = trimmed.toLowerCase();
+      const folders = response.items.filter((item) => item.isFolder
+        && item.serverPath.toLowerCase() !== this.rootPath!.toLowerCase());
+      const surviving = new Set<string>();
+      for (const folder of folders) {
+        const name = folder.serverPath.split('/').filter(Boolean).pop() ?? folder.serverPath;
+        if (name.toLowerCase().includes(lowered)) {
+          // Keep this folder and every ancestor up to the root so the path stays visible.
+          let current = folder.serverPath;
+          while (current && current.toLowerCase() !== this.rootPath!.toLowerCase()) {
+            surviving.add(current);
+            const parent = current.split('/').slice(0, -1).join('/');
+            if (!parent || parent === current) {
+              break;
+            }
+            current = parent;
+          }
+        }
+      }
+      const grouped = new Map<string, ServerItemEntry[]>();
+      for (const folder of folders) {
+        if (!surviving.has(folder.serverPath)) {
+          continue;
+        }
+        const parent = folder.serverPath.split('/').slice(0, -1).join('/');
+        const list = grouped.get(parent) ?? [];
+        list.push(folder);
+        grouped.set(parent, list);
+      }
+      // Sort each parent's children for consistent presentation.
+      for (const list of grouped.values()) {
+        list.sort(compareServerExplorerEntries);
+      }
+      this.filteredChildrenByParent = grouped;
+    } catch (error) {
+      this.output.appendLine(`arm-tfs server explorer filter: ${error instanceof Error ? error.message : String(error)}`);
+      this.filteredChildrenByParent = new Map();
+    }
     this.onDidChangeTreeDataEmitter.fire();
   }
 
@@ -1597,6 +1695,11 @@ class ServerExplorerProvider implements vscode.TreeDataProvider<vscode.TreeItem>
         return [new ServerExplorerUnconfiguredNode()];
       }
 
+      if (this.filteredChildrenByParent) {
+        const entries = this.filteredChildrenByParent.get(this.rootPath) ?? [];
+        return entries.map((item) => new ServerExplorerNode(item));
+      }
+
       const cached = this.childCache.get(this.rootPath);
       if (cached) {
         return cached;
@@ -1606,6 +1709,11 @@ class ServerExplorerProvider implements vscode.TreeDataProvider<vscode.TreeItem>
     }
 
     if (element instanceof ServerExplorerNode && element.entry.isFolder) {
+      if (this.filteredChildrenByParent) {
+        const entries = this.filteredChildrenByParent.get(element.entry.serverPath) ?? [];
+        return entries.map((item) => new ServerExplorerNode(item));
+      }
+
       const cached = this.childCache.get(element.entry.serverPath);
       if (cached) {
         return cached;
@@ -1689,18 +1797,34 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
 
     this.disposables.push(
       this.treeView,
-      this.treeView.onDidChangeSelection((event) => {
-        const selected = event.selection[0];
-        if (selected instanceof ServerExplorerNode) {
-          void this.onActiveServerPathChanged?.(selected.entry.serverPath, {
-            branchContext: selected.entry.isFolder,
-            syncBranchScope: selected.entry.isFolder,
-            syncMergeSource: false,
-          });
-        }
-      }),
+      // Selection in server explorer used to push the path into the branches view, but that
+      // coupled two unrelated concerns: explorer is a pure TFVC tree browser, branches comes
+      // from the workspace folder's .tf/workspace.json. Keep them independent.
 
       vscode.commands.registerCommand('armTfs.serverExplorer.refresh', () => this.provider.refresh()),
+
+      vscode.commands.registerCommand('armTfs.serverExplorer.setFilter', async () => {
+        const current = this.provider.getActiveFilter() ?? '';
+        const value = await vscode.window.showInputBox({
+          prompt: t('serverExplorer.prompt.filter'),
+          placeHolder: t('serverExplorer.prompt.filter.placeholder'),
+          value: current,
+          ignoreFocusOut: true,
+        });
+        if (value === undefined) {
+          return;
+        }
+        await vscode.window.withProgress(
+          { location: { viewId: 'armTfs.serverExplorer' } },
+          () => this.provider.setFilter(value),
+        );
+        this.refreshLabels();
+      }),
+
+      vscode.commands.registerCommand('armTfs.serverExplorer.clearFilter', async () => {
+        await this.provider.setFilter(undefined);
+        this.refreshLabels();
+      }),
 
       vscode.commands.registerCommand('armTfs.serverExplorer.setRoot', async (node?: ServerExplorerNode) => {
         const current = node?.entry.serverPath
@@ -1720,11 +1844,7 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
         await vscode.workspace.getConfiguration('armTfs').update('serverExplorer.rootPath', trimmed, getConfigTarget());
         await this.onRootPathChanged?.(trimmed);
         this.provider.setRootPath(trimmed);
-        await this.onActiveServerPathChanged?.(trimmed, {
-          branchContext: true,
-          syncBranchScope: true,
-          syncMergeSource: false,
-        });
+        // Note: setting the explorer root no longer affects the branches view.
       }),
 
       vscode.commands.registerCommand('armTfs.serverExplorer.getLatest', async (node?: ServerExplorerNode) => {
@@ -1801,7 +1921,10 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
   }
 
   refreshLabels(): void {
-    this.treeView.title = t('view.serverExplorer');
+    const filter = this.provider.getActiveFilter();
+    this.treeView.title = filter
+      ? t('view.serverExplorer.filtered', { pattern: filter })
+      : t('view.serverExplorer');
   }
 
   dispose(): void {
