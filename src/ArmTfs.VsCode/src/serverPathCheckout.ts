@@ -1,8 +1,11 @@
 import * as path from 'node:path';
+import { existsSync } from 'node:fs';
 import * as vscode from 'vscode';
 import { ArmTfsCliClient } from './armTfsCliClient';
 import { t } from './i18n';
 import { findTfvcWorkspaceRoot, getCommandCwd } from './tfvcContext';
+
+const WORKSPACE_METADATA_PATH = path.join('.tf', 'workspace.json');
 
 export async function checkoutServerPathToLocalFolder(
   client: ArmTfsCliClient,
@@ -15,10 +18,19 @@ export async function checkoutServerPathToLocalFolder(
 
   await vscode.workspace.fs.createDirectory(vscode.Uri.file(normalizedLocalPath));
 
-  const workspaceRoot = await findTfvcWorkspaceRoot(normalizedLocalPath);
+  // Determine whether the target localPath already has its own workspace metadata.
+  // We check ONLY the target directory itself — never a parent or sibling directory.
+  // This prevents the common mistake of "polluting" an unrelated project's workspace.json
+  // by adding mappings to it every time a new branch is checked out nearby.
+  const ownWorkspaceMetadata = path.join(normalizedLocalPath, WORKSPACE_METADATA_PATH);
+  const hasOwnWorkspace = existsSync(ownWorkspaceMetadata);
+
   const steps: string[] = [];
 
-  if (workspaceRoot) {
+  if (hasOwnWorkspace) {
+    // The target directory already has a workspace — reuse it.
+    // Only add a mapping if the server path isn't already mapped.
+    const workspaceRoot = normalizedLocalPath;
     const commandCwd = getCommandCwd(workspaceRoot, normalizedLocalPath);
     const status = await client.status(workspaceRoot, false, { cwdOverride: workspaceRoot });
     const existingMapping = status.workspace.mappings.find((mapping) => sameLocalPath(mapping.localPath, normalizedLocalPath));
@@ -42,6 +54,8 @@ export async function checkoutServerPathToLocalFolder(
     return steps.join('\n\n');
   }
 
+  // No workspace in the target directory — create a fresh one scoped exactly to this path.
+  // Do NOT search parent directories; every branch/project gets its own isolated workspace.
   const workspaceName = buildWorkspaceName(normalizedServerPath, normalizedLocalPath);
   steps.push(await client.workspaceNew(workspaceName, normalizedServerPath, normalizedLocalPath, normalizedLocalPath, { cwdOverride: normalizedLocalPath }));
   steps.push(await client.get(normalizedLocalPath, { version: options?.version }, { cwdOverride: normalizedLocalPath }));

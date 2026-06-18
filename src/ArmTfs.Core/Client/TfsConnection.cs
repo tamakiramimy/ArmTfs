@@ -18,7 +18,7 @@ namespace ArmTfs.Core.Client;
 /// <c>Microsoft.VisualStudio.Services.Client</c> 包中，该包没有 netstandard2.0 目标，無法在非 Windows 平台编译。
 /// </para>
 /// </summary>
-public sealed class TfsConnection : IDisposable
+public class TfsConnection : IDisposable
 {
     private VssConnection? _connection;
     private TfvcHttpClient? _tfvcClient;
@@ -86,6 +86,27 @@ public sealed class TfsConnection : IDisposable
         var client = GetTfvcClient();
         // 用最小请求验证连接是否可用
         await client.GetBranchesAsync(cancellationToken: ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 创建一个带有 TFS 认证头的 <see cref="HttpClient"/>，用于 SOAP 或其他非 REST 调用。
+    /// </summary>
+    public virtual HttpClient CreateHttpClient()
+    {
+        var client = new HttpClient();
+        if (!string.IsNullOrEmpty(_config.PersonalAccessToken))
+        {
+            var token = Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes($":{_config.PersonalAccessToken}"));
+            client.DefaultRequestHeaders.Authorization =
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", token);
+        }
+        else if (!string.IsNullOrEmpty(_config.Username))
+        {
+            var token = Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes($"{_config.Username}:{_config.Password}"));
+            client.DefaultRequestHeaders.Authorization =
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", token);
+        }
+        return client;
     }
 
     public void Dispose()

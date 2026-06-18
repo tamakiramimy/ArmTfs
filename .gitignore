@@ -6,3 +6,9 @@ src/ArmTfs.VsCode/node_modules/*
 src/ArmTfs.VsCode/out/*
 tests/*/bin/*
 tests/*/obj/*
+.kiro/specs/tfvc-merge-workspace-fixes/design.md
+.kiro/specs/tfvc-merge-workspace-fixes/tasks.md
+.gitignore
+.gitignore
+.codebuddy/memory/2025-06-17.md
+.codebuddy/memory/MEMORY.md

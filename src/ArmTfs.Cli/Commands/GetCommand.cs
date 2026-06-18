@@ -19,17 +19,50 @@ public static class GetCommand
         var forceOpt = new Option<bool>(new[] { "--force", "-f" }) { Description = "Overwrite even if local file appears up-to-date" };
         var recursiveOpt = new Option<bool>(new[] { "--recursive", "-r" }, getDefaultValue: () => true) { Description = "Get all files recursively (default: true)" };
         var dryRunOpt = new Option<bool>("--dry-run") { Description = "Show what would be downloaded without writing files" };
+        var localPathOpt = new Option<string?>("--local-path") { Description = "Local directory override when auto-creating a workspace from a server path" };
 
         cmd.AddArgument(pathArg);
         cmd.AddOption(versionOpt);
         cmd.AddOption(forceOpt);
         cmd.AddOption(recursiveOpt);
         cmd.AddOption(dryRunOpt);
+        cmd.AddOption(localPathOpt);
 
-        cmd.SetHandler(async (path, version, force, recursive, dryRun) =>
+        cmd.SetHandler(async (path, version, force, recursive, dryRun, localPathOverride) =>
         {
             var ws = WorkspaceManager.FindWorkspace(Directory.GetCurrentDirectory());
-            if (ws is null) { Console.Error.WriteLine("No workspace found. Run 'arm-tfs workspace new' first."); Environment.ExitCode = 1; return; }
+
+            // ── 自动工作区创建 ─────────────────────────────────────────────────────
+            // 如果没找到工作区，且传入的是服务器路径（$/…），则尝试根据 WorkspaceRoot
+            // 映射规则自动推导本地路径并创建工作区，无需手动 workspace new。
+            if (ws is null && path.StartsWith("$/", StringComparison.Ordinal))
+            {
+                var (autoWs, created) = WorkspaceAutoCreate.EnsureWorkspace(path, config, localPathOverride);
+                if (autoWs is not null)
+                {
+                    ws = autoWs;
+                    if (created)
+                    {
+                        var localPath = WorkspaceAutoCreate.ResolveLocalPath(path, config, localPathOverride)!;
+                        Console.WriteLine($"Auto-created workspace at '{localPath}' → {path}");
+                    }
+                }
+                else
+                {
+                    Console.Error.WriteLine(
+                        "No workspace found and cannot auto-create one.\n" +
+                        "Either run 'arm-tfs workspace new' first, or configure a workspace root:\n" +
+                        "  arm-tfs configure --workspace-root /your/local/tfs/root");
+                    Environment.ExitCode = 1;
+                    return;
+                }
+            }
+            else if (ws is null)
+            {
+                Console.Error.WriteLine("No workspace found. Run 'arm-tfs workspace new' first.");
+                Environment.ExitCode = 1;
+                return;
+            }
 
             var meta = ws.LoadMetadata();
 
@@ -131,7 +164,7 @@ public static class GetCommand
             Console.WriteLine($"Downloaded: {downloaded}  Skipped (up-to-date): {skipped}  Errors: {errors}");
 
             if (errors > 0) Environment.ExitCode = 1;
-        }, pathArg, versionOpt, forceOpt, recursiveOpt, dryRunOpt);
+        }, pathArg, versionOpt, forceOpt, recursiveOpt, dryRunOpt, localPathOpt);
 
         return cmd;
     }

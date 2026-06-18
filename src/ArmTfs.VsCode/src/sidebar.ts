@@ -1111,27 +1111,37 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       return undefined;
     }
 
-    if (!this.workspaceStatus || !this.resolvedWorkspaceRoot) {
-      void vscode.window.showWarningMessage(t('sidebar.warning.openWorkspaceFirst'));
-      return undefined;
+    // If we have workspace status, use the full mapping resolution (preferred path).
+    if (this.workspaceStatus && this.resolvedWorkspaceRoot) {
+      const mapped = resolveMappedLocalPathForServerPath(branchPath, this.workspaceStatus, this.resolvedWorkspaceRoot);
+      if (!mapped) {
+        // Tell the user exactly what's missing: a root mapping under their active TFS connection.
+        // Offer a button that takes them straight to the place where they can add it.
+        void vscode.window.showWarningMessage(
+          t('sidebar.warning.noRootMapping', { path: branchPath }),
+          t('sidebar.warning.openMappingsView'),
+        ).then((choice) => {
+          if (choice === t('sidebar.warning.openMappingsView')) {
+            void vscode.commands.executeCommand('armTfs.workspaceMappings.add');
+          }
+        });
+        return undefined;
+      }
+      return mapped;
     }
 
-    const mapped = resolveMappedLocalPathForServerPath(branchPath, this.workspaceStatus, this.resolvedWorkspaceRoot);
-    if (!mapped) {
-      // Tell the user exactly what's missing: a root mapping under their active TFS connection.
-      // Offer a button that takes them straight to the place where they can add it.
-      void vscode.window.showWarningMessage(
-        t('sidebar.warning.noRootMapping', { path: branchPath }),
-        t('sidebar.warning.openMappingsView'),
-      ).then((choice) => {
-        if (choice === t('sidebar.warning.openMappingsView')) {
-          void vscode.commands.executeCommand('armTfs.workspaceMappings.add');
-        }
-      });
-      return undefined;
+    // No workspace yet — try to auto-derive a local path from configured mappings or
+    // tfsRootDirectory so the user can pull a brand-new branch without creating a workspace first.
+    const computed = computeLocalPathForServerPath(branchPath);
+    if (computed) {
+      // Use the computed local path as both the workspace root and the target.
+      // checkoutServerPathToLocalFolder will create .tf/workspace.json if needed.
+      return { workspaceRoot: computed, serverPath: branchPath, localPath: computed };
     }
 
-    return mapped;
+    // Nothing we can do — ask the user to configure a mapping root first.
+    void vscode.window.showWarningMessage(t('sidebar.warning.openWorkspaceFirst'));
+    return undefined;
   }
 
   private async executeMergeCandidate(node?: MergeCandidateNode): Promise<void> {

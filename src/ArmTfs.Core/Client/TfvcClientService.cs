@@ -1,3 +1,4 @@
+using ArmTfs.Core.Client.Soap;
 using ArmTfs.Core.Models;
 using ArmTfs.Core.Workspace;
 using Microsoft.TeamFoundation.SourceControl.WebApi;
@@ -178,6 +179,10 @@ public sealed class TfvcClientService
         return changeset;
     }
 
+    /// <summary>
+    /// 通过 SOAP Repository.asmx CreateBranch 接口创建 TFVC 分支。
+    /// REST Changeset API 不支持 Branch 变更类型，必须使用旧版 SOAP 接口。
+    /// </summary>
     public async Task<TfvcChangesetRef> CreateBranchAsync(
         string sourcePath,
         string targetPath,
@@ -190,31 +195,30 @@ public sealed class TfvcClientService
         if (string.Equals(normalizedSource, normalizedTarget, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("Source and target branch paths must be different.");
 
-        var sourceVersion = sourceChangesetId ?? await TryGetItemVersionAsync(normalizedSource, ct).ConfigureAwait(false)
-            ?? throw new InvalidOperationException($"Source branch '{normalizedSource}' does not exist.");
-        if (await TryGetItemVersionAsync(normalizedTarget, ct).ConfigureAwait(false) is not null)
-            throw new InvalidOperationException($"Target branch '{normalizedTarget}' already exists.");
+        // Verify source exists
+        if (await TryGetItemVersionAsync(normalizedSource, ct).ConfigureAwait(false) is null)
+            throw new InvalidOperationException($"Source branch '{normalizedSource}' does not exist.");
 
-        var change = new TfvcChange
-        {
-            ChangeType = VersionControlChangeType.Branch,
-            SourceServerItem = normalizedSource,
-            Item = new TfvcItem
-            {
-                Path = normalizedTarget,
-                ChangesetVersion = sourceVersion,
-                IsBranch = true,
-                IsFolder = true,
-            },
-        };
+        var effectiveComment = string.IsNullOrWhiteSpace(comment)
+            ? $"Branch {normalizedTarget} from {normalizedSource}"
+            : comment.Trim();
 
-        return await _connection.GetTfvcClient().CreateChangesetAsync(new TfvcChangeset
-        {
-            Comment = string.IsNullOrWhiteSpace(comment)
-                ? $"Branch {normalizedTarget} from {normalizedSource} at cs#{sourceVersion}"
-                : comment.Trim(),
-            Changes = new[] { change },
-        }, cancellationToken: ct).ConfigureAwait(false);
+        var changesetId = await CreateBranchViaSoapAsync(
+            normalizedSource, normalizedTarget, sourceChangesetId, effectiveComment, ct).ConfigureAwait(false);
+
+        return new TfvcChangesetRef { ChangesetId = changesetId };
+    }
+
+    private async Task<int> CreateBranchViaSoapAsync(
+        string sourcePath,
+        string targetPath,
+        int? sourceChangesetId,
+        string comment,
+        CancellationToken ct)
+    {
+        // TFS REST API does not support Branch change type; use legacy SOAP endpoint.
+        var soap = new TfvcSoapClient(_connection);
+        return await soap.CreateBranchAsync(sourcePath, targetPath, sourceChangesetId, comment, ct).ConfigureAwait(false);
     }
 
     /// <summary>查询 TFVC Label 列表。</summary>
@@ -550,10 +554,26 @@ public sealed class TfvcClientService
         string? comment = null,
         bool dryRun = false,
         IReadOnlyList<MergeExecutionResolution>? resolutions = null,
+        string mergeMode = "rest",
+        string? soapOwner = null,
         CancellationToken ct = default)
     {
         var normalizedSource = NormalizeServerPath(sourcePath);
         var normalizedTarget = NormalizeServerPath(targetPath);
+
+        // SOAP path: lets the server record real merge history (REST cannot).
+        // Skip it for dry-run (we still want a plan preview via REST logic).
+        if (string.Equals(mergeMode, "soap", StringComparison.OrdinalIgnoreCase) && !dryRun)
+        {
+            return await MergeChangesetViaSoapAsync(
+                normalizedSource,
+                normalizedTarget,
+                sourceChangesetId,
+                comment,
+                soapOwner,
+                ct).ConfigureAwait(false);
+        }
+
         var mergeBase = await ResolveMergeBaseAsync(normalizedSource, normalizedTarget, ct).ConfigureAwait(false);
         var detail = await GetChangesetAsync(sourceChangesetId, ct).ConfigureAwait(false);
         var effectiveComment = string.IsNullOrWhiteSpace(comment)
@@ -770,6 +790,136 @@ public sealed class TfvcClientService
             Warnings = warnings,
         };
     }
+
+    /// <summary>
+    /// 走 TFVC SOAP 协议执行合并：CreateWorkspace → PendMerge → CheckIn → DeleteWorkspace。
+    /// 服务器会写入真实的 merge history（含 MergeSources 元数据），TFS Web UI / tf merges 可见。
+    /// </summary>
+    private async Task<MergeExecutionResult> MergeChangesetViaSoapAsync(
+        string normalizedSource,
+        string normalizedTarget,
+        int sourceChangesetId,
+        string? comment,
+        string? soapOwner,
+        CancellationToken ct)
+    {
+        var owner = soapOwner ?? throw new InvalidOperationException(
+            "SOAP merge requires --soap-owner (DOMAIN\\\\user or user@domain) so the temporary server workspace can be created.");
+
+        var mergeBase = await ResolveMergeBaseAsync(normalizedSource, normalizedTarget, ct).ConfigureAwait(false);
+        var effectiveComment = string.IsNullOrWhiteSpace(comment)
+            ? $"Merge cs#{sourceChangesetId} from {normalizedSource} to {normalizedTarget}"
+            : comment.Trim();
+
+        // Embed comment marker so candidate filter still works alongside server merge history.
+        var commentWithMarker = effectiveComment.TrimEnd()
+            + " "
+            + Models.MergeCommentMarker.Build(normalizedSource, sourceChangesetId, normalizedTarget);
+
+        var soap = new Soap.TfvcSoapClient(_connection);
+        var workspaceName = $"arm-tfs-soap-merge-{Guid.NewGuid():N}";
+        var computer = Environment.MachineName;
+        var warnings = new List<string>();
+        SoapWorkspaceCreated? createdWs = null;
+
+        try
+        {
+            await soap.CreateWorkspaceAsync(workspaceName, owner, computer, "arm-tfs SOAP merge", ct).ConfigureAwait(false);
+            createdWs = new SoapWorkspaceCreated(workspaceName, owner);
+
+            var ops = await soap.PendMergeAsync(
+                workspaceName, owner,
+                normalizedSource, normalizedTarget,
+                sourceChangesetId, sourceChangesetId,
+                ct).ConfigureAwait(false);
+
+            if (ops.Count == 0)
+            {
+                warnings.Add("Server returned no merge operations — nothing to commit. The source changeset may already be merged.");
+                return new MergeExecutionResult
+                {
+                    SourcePath = normalizedSource,
+                    TargetPath = normalizedTarget,
+                    SourceChangesetId = sourceChangesetId,
+                    Comment = commentWithMarker,
+                    DryRun = false,
+                    CreatedChangesetId = null,
+                    BaseInfo = mergeBase,
+                    Changes = Array.Empty<MergeExecutionChange>(),
+                    Warnings = warnings,
+                };
+            }
+
+            var pendingChanges = ops.Select(op => new Models.Soap.SoapPendingChange
+            {
+                ItemId = op.ItemId,
+                ServerItem = op.TargetServerItem,
+                ChangeType = string.IsNullOrEmpty(op.ChangeType) ? "Merge" : op.ChangeType,
+                SourceServerItem = op.SourceServerItem,
+                VersionFrom = op.VersionFrom ?? sourceChangesetId,
+                VersionTo = op.VersionTo ?? sourceChangesetId,
+            }).ToList();
+
+            var newChangesetId = await soap.CheckInAsync(
+                workspaceName, owner,
+                commentWithMarker,
+                pendingChanges,
+                ct).ConfigureAwait(false);
+
+            _workspaceManager?.RecordMerge(new Models.MergeRecord
+            {
+                SourceChangesetId = sourceChangesetId,
+                SourcePath = normalizedSource,
+                TargetPath = normalizedTarget,
+                TargetChangesetId = newChangesetId,
+                MergedAtUtc = DateTime.UtcNow,
+                Method = "soap-merge",
+            });
+
+            var executionChanges = ops.Select(op => new MergeExecutionChange
+            {
+                SourceServerPath = op.SourceServerItem,
+                TargetServerPath = op.TargetServerItem,
+                SourceChangesetId = sourceChangesetId,
+                SourceChangeType = op.ChangeType,
+                TargetChangeType = op.ChangeType,
+                TargetExists = true,
+                HasContent = false,
+                Status = "created",
+                Note = "SOAP merge — server-recorded merge history",
+            }).ToList();
+
+            return new MergeExecutionResult
+            {
+                SourcePath = normalizedSource,
+                TargetPath = normalizedTarget,
+                SourceChangesetId = sourceChangesetId,
+                Comment = commentWithMarker,
+                DryRun = false,
+                CreatedChangesetId = newChangesetId,
+                BaseInfo = mergeBase,
+                Changes = executionChanges,
+                Warnings = warnings,
+            };
+        }
+        finally
+        {
+            if (createdWs is not null)
+            {
+                try
+                {
+                    await soap.DeleteWorkspaceAsync(createdWs.Name, createdWs.Owner, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    // Workspace cleanup failure is non-fatal — log to stderr but don't mask the original error.
+                    Console.Error.WriteLine($"warning: failed to delete temp SOAP workspace '{createdWs.Name}': {ex.Message}");
+                }
+            }
+        }
+    }
+
+    private sealed record SoapWorkspaceCreated(string Name, string Owner);
 
     private async Task VerifyMergeChangesetAppliedAsync(
         int createdChangesetId,

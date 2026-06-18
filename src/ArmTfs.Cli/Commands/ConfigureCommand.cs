@@ -15,6 +15,7 @@ public static class ConfigureCommand
         var userOpt = new Option<string?>("--username") { Description = "Windows username (NTLM, alternative to PAT)" };
         var passOpt = new Option<string?>("--password") { Description = "Windows password (NTLM, alternative to PAT)" };
         var displayOpt = new Option<string?>("--display-name") { Description = "Your display name for checkin attribution" };
+        var workspaceRootOpt = new Option<string?>("--workspace-root") { Description = "Local root directory for auto-created workspaces (e.g. /Users/foo/tfs). Server path $/A/B maps to <workspace-root>/A/B." };
         var showOpt = new Option<bool>("--show") { Description = "Show current configuration" };
 
         cmd.AddOption(urlOpt);
@@ -22,16 +23,18 @@ public static class ConfigureCommand
         cmd.AddOption(userOpt);
         cmd.AddOption(passOpt);
         cmd.AddOption(displayOpt);
+        cmd.AddOption(workspaceRootOpt);
         cmd.AddOption(showOpt);
 
-        cmd.SetHandler((url, pat, user, pass, display, show) =>
+        cmd.SetHandler((url, pat, user, pass, display, workspaceRoot, show) =>
         {
             if (show)
             {
-                Console.WriteLine($"Config file : {TfsConfig.DefaultConfigPath}");
-                Console.WriteLine($"Server URL  : {config.ServerUrl ?? "(not set)"}");
-                Console.WriteLine($"Auth        : {(string.IsNullOrEmpty(config.PersonalAccessToken) ? (string.IsNullOrEmpty(config.Username) ? "none" : $"Username: {config.Username}") : "PAT (set)")}");
-                Console.WriteLine($"Display Name: {config.UserDisplayName ?? "(not set)"}");
+                Console.WriteLine($"Config file    : {TfsConfig.DefaultConfigPath}");
+                Console.WriteLine($"Server URL     : {config.ServerUrl ?? "(not set)"}");
+                Console.WriteLine($"Auth           : {(string.IsNullOrEmpty(config.PersonalAccessToken) ? (string.IsNullOrEmpty(config.Username) ? "none" : $"Username: {config.Username}") : "PAT (set)")}");
+                Console.WriteLine($"Display Name   : {config.UserDisplayName ?? "(not set)"}");
+                Console.WriteLine($"Workspace Root : {config.WorkspaceRoot ?? "(not set)"}");
                 return;
             }
 
@@ -40,10 +43,11 @@ public static class ConfigureCommand
             if (user is not null) config.Username = user;
             if (pass is not null) config.Password = pass;
             if (display is not null) config.UserDisplayName = display;
+            if (workspaceRoot is not null) config.WorkspaceRoot = workspaceRoot;
 
             config.Save();
             Console.WriteLine($"Configuration saved to {TfsConfig.DefaultConfigPath}");
-        }, urlOpt, patOpt, userOpt, passOpt, displayOpt, showOpt);
+        }, urlOpt, patOpt, userOpt, passOpt, displayOpt, workspaceRootOpt, showOpt);
 
         return cmd;
     }

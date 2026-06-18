@@ -29,6 +29,8 @@ public static class MergeCommand
         var dryRunOpt = new Option<bool>("--dry-run") { Description = "Show the merge plan without creating a TFVC changeset" };
         var resolutionFileOpt = new Option<FileInfo?>("--resolution-file") { Description = "JSON file with per-file merge resolutions" };
         var formatOpt = new Option<string>("--format", () => "table") { Description = "Output format: table | json" };
+        var modeOpt = new Option<string>("--mode", () => "rest") { Description = "Merge protocol: rest (default, take-source) | soap (real merge history via Repository.asmx)" };
+        var soapOwnerOpt = new Option<string?>("--soap-owner") { Description = "Owner identity (DOMAIN\\\\user or user@domain) for the temporary SOAP workspace. Required when --mode soap." };
 
         sourceOpt.IsRequired = true;
         targetOpt.IsRequired = true;
@@ -40,9 +42,21 @@ public static class MergeCommand
         cmd.AddOption(dryRunOpt);
         cmd.AddOption(resolutionFileOpt);
         cmd.AddOption(formatOpt);
+        cmd.AddOption(modeOpt);
+        cmd.AddOption(soapOwnerOpt);
 
-        cmd.SetHandler(async (source, target, changesetId, comment, dryRun, resolutionFile, format) =>
+        cmd.SetHandler(async (System.CommandLine.Invocation.InvocationContext ctx) =>
         {
+            var source = ctx.ParseResult.GetValueForOption(sourceOpt)!;
+            var target = ctx.ParseResult.GetValueForOption(targetOpt)!;
+            var changesetId = ctx.ParseResult.GetValueForOption(changesetOpt);
+            var comment = ctx.ParseResult.GetValueForOption(commentOpt);
+            var dryRun = ctx.ParseResult.GetValueForOption(dryRunOpt);
+            var resolutionFile = ctx.ParseResult.GetValueForOption(resolutionFileOpt);
+            var format = ctx.ParseResult.GetValueForOption(formatOpt) ?? "table";
+            var mode = ctx.ParseResult.GetValueForOption(modeOpt) ?? "rest";
+            var soapOwner = ctx.ParseResult.GetValueForOption(soapOwnerOpt) ?? config.Username;
+
             var ws = WorkspaceManager.FindWorkspace(Directory.GetCurrentDirectory());
             using var conn = new TfsConnection(config);
             var svc = new TfvcClientService(conn, ws);
@@ -52,7 +66,10 @@ public static class MergeCommand
                 var resolvedSource = ResolveServerPath(source);
                 var resolvedTarget = ResolveServerPath(target);
                 var resolutions = LoadMergeResolutions(resolutionFile);
-                var result = await svc.MergeChangesetAsync(resolvedSource, resolvedTarget, changesetId, comment, dryRun, resolutions).ConfigureAwait(false);
+                var result = await svc.MergeChangesetAsync(
+                    resolvedSource, resolvedTarget, changesetId, comment, dryRun, resolutions,
+                    mergeMode: mode,
+                    soapOwner: soapOwner).ConfigureAwait(false);
 
                 if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
                 {
@@ -96,7 +113,7 @@ public static class MergeCommand
                 Console.Error.WriteLine($"Error: {ex.Message}");
                 Environment.ExitCode = 1;
             }
-        }, sourceOpt, targetOpt, changesetOpt, commentOpt, dryRunOpt, resolutionFileOpt, formatOpt);
+        });
 
         return cmd;
     }

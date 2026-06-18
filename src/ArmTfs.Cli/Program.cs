@@ -47,6 +47,7 @@ rootCommand.AddCommand(LabelCommand.Build(config));
 rootCommand.AddCommand(HistoryCommand.Build(config));
 rootCommand.AddCommand(ShelvesetCommand.Build(config));
 rootCommand.AddCommand(ItemsCommand.Build(config));
+rootCommand.AddCommand(SoapTestCommand.Build(config));
 
 var parser = new CommandLineBuilder(rootCommand)
     .UseDefaults()

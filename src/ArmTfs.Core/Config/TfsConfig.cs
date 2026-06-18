@@ -35,6 +35,13 @@ public sealed class TfsConfig
     /// <summary>输出格式：plain（默认）或 json</summary>
     public string OutputFormat { get; set; } = "plain";
 
+    /// <summary>
+    /// 本地工作区根目录。用于自动工作区创建时推导分支的本地路径。
+    /// 规则：服务器路径 $/A/B 映射到 &lt;WorkspaceRoot&gt;/A/B。
+    /// 例如：WorkspaceRoot = /Users/foo/tfs，服务器路径 $/Proj/Main → 本地路径 /Users/foo/tfs/Proj/Main。
+    /// </summary>
+    public string? WorkspaceRoot { get; set; }
+
     [JsonIgnore]
     private static readonly JsonSerializerOptions _jsonOptions = new()
     {
