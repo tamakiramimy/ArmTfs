@@ -43,6 +43,36 @@ public static class CheckinCommand
             var meta = ws.LoadMetadata();
             var pending = ws.LoadPendingChanges().ToList();
 
+            // Auto-checkout: scan for modifiedNotCheckedOut files and promote them to pending.
+            var scanPaths = (paths.Length == 1 && paths[0] == ".")
+                ? new[] { Directory.GetCurrentDirectory() }
+                : paths.Select(Path.GetFullPath).ToArray();
+
+            var checkedOutPaths = pending.Select(p => p.LocalPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var scanPath in scanPaths)
+            {
+                foreach (var file in EnumerateTrackedFiles(scanPath))
+                {
+                    if (checkedOutPaths.Contains(file)) continue;
+                    var tracked = ws.GetTrackedVersion(file);
+                    if (tracked is null || !File.Exists(file)) continue;
+
+                    var currentHash = WorkspaceManager.ComputeFileHash(file);
+                    if (string.Equals(currentHash, tracked.ContentHash, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var newPending = new PendingChange
+                    {
+                        ServerPath = tracked.ServerPath,
+                        LocalPath = file,
+                        ChangeType = ChangeType.Edit,
+                    };
+                    ws.AddPendingChange(newPending);
+                    pending.Add(newPending);
+                    Console.WriteLine($"  [AUTO CHECKOUT] {Path.GetRelativePath(Directory.GetCurrentDirectory(), file)}");
+                }
+            }
+
             if (pending.Count == 0) { Console.WriteLine("Nothing to check in."); return; }
 
             // 按路径过滤：支持单个文件、目录前缀匹配，'.' 表示提交全部
@@ -157,5 +187,17 @@ public static class CheckinCommand
         }, commentOpt, pathsArg, dryRunOpt, keepOpt);
 
         return cmd;
+    }
+
+    private static IEnumerable<string> EnumerateTrackedFiles(string path)
+    {
+        if (File.Exists(path)) { yield return path; yield break; }
+        if (!Directory.Exists(path)) yield break;
+        foreach (var file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
+        {
+            var parts = file.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (parts.Contains(".tf")) continue;
+            yield return file;
+        }
     }
 }
