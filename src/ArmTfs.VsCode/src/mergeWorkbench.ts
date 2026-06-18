@@ -292,9 +292,11 @@ export class ArmTfsMergeWorkbench {
       return;
     }
 
-    const blocking = selected.flatMap((candidate) => findConflicts(candidate).filter((conflict) => conflict.blocking));
-    if (blocking.some((conflict) => !this.conflictResolutions.has(conflict.id))) {
-      void vscode.window.showWarningMessage('存在未解决的阻断项，请先处理冲突列表后再合并。');
+    const unresolvedConflict = aggregateConflicts(selected).find(
+      (f) => !this.conflictResolutions.has(f.targetServerPath),
+    );
+    if (unresolvedConflict) {
+      void vscode.window.showWarningMessage('存在未解决的冲突文件，请先在冲突列表中处理后再合并。');
       return;
     }
 
@@ -387,21 +389,20 @@ export class ArmTfsMergeWorkbench {
     const itemsByChangeset = new Map<number, MergeExecutionResolutionFileItem[]>();
     for (const candidate of selected) {
       const items: MergeExecutionResolutionFileItem[] = [];
-      for (const conflict of findConflicts(candidate).filter((item) => item.blocking)) {
-        const choice = this.conflictResolutions.get(conflict.id);
-        if (!choice || !conflict.sourceServerPath) {
-          continue;
-        }
+      for (const change of candidate.changes) {
+        if (change.status.toLowerCase() !== 'conflict') continue;
+        const choice = this.conflictResolutions.get(change.targetServerPath);
+        if (!choice) continue;
 
         const item: MergeExecutionResolutionFileItem = {
-          sourceServerPath: conflict.sourceServerPath,
-          targetServerPath: conflict.targetServerPath,
+          sourceServerPath: change.sourceServerPath,
+          targetServerPath: change.targetServerPath,
           choice,
         };
         if (choice === 'manual') {
-          const content = this.manualMergeContents.get(conflict.id);
+          const content = this.manualMergeContents.get(change.targetServerPath);
           if (content === undefined)
-            throw new Error(`手动合并结果不存在：${conflict.sourceServerPath}`);
+            throw new Error(`手动合并结果不存在：${change.sourceServerPath}`);
           item.contentBase64 = Buffer.from(content, 'utf8').toString('base64');
         }
         items.push(item);
@@ -413,16 +414,13 @@ export class ArmTfsMergeWorkbench {
   }
 
   private async openManualMergeForConflict(conflictId: string): Promise<void> {
+    // conflictId is the conflict file's target server path.
     const candidate = this.state.candidates.find((item) =>
-      findConflicts(item).some((conflict) => conflict.id === conflictId));
-    const conflict = candidate && findConflicts(candidate).find((item) => item.id === conflictId);
-    if (!candidate || !conflict) {
-      return;
-    }
-
-    const change = candidate.changes.find((item) => item.sourceServerPath === conflict.sourceServerPath);
-    if (!change) {
-      void vscode.window.showWarningMessage(`找不到 ${conflict.sourceServerPath} 的合并文件记录。`);
+      item.changes.some((ch) => ch.status.toLowerCase() === 'conflict' && ch.targetServerPath === conflictId));
+    const change = candidate?.changes.find(
+      (ch) => ch.status.toLowerCase() === 'conflict' && ch.targetServerPath === conflictId,
+    );
+    if (!candidate || !change) {
       return;
     }
 
@@ -484,11 +482,10 @@ function renderWorkbenchHtml(
 ): string {
   const nonce = getNonce();
   const selected = state.candidates.find((candidate) => candidate.changesetId === state.selectedChangesetId) ?? state.candidates[0];
-  const conflicts = state.candidates
-    .filter((candidate) => candidate.checked)
-    .flatMap(findConflicts);
+  const conflictFiles = aggregateConflicts(state.candidates);
   const checkedCount = state.candidates.filter((candidate) => candidate.checked).length;
-  const hasUnresolvedBlocking = conflicts.some((item) => item.blocking && !conflictResolutions.has(item.id));
+  const hasUnresolvedBlocking = conflictFiles.some((f) => !conflictResolutions.has(f.targetServerPath));
+  const fileCount = aggregateFileCount(state.candidates);
 
   const body = `
     <main>
@@ -510,27 +507,28 @@ function renderWorkbenchHtml(
             ${state.candidates.map((candidate) => renderCandidate(candidate, selected?.changesetId)).join('')}
           </div>
         </section>
-        <section class="pane files">
-          <div class="pane-title">文件变更记录 <span>${aggregateFileCount(state.candidates)} 个文件 · ${checkedCount} 个变更集合</span></div>
+        <section class="pane files" id="filesPane">
+          <div class="pane-title">
+            <span>文件变更记录 <span class="count">${fileCount} 个文件 · ${checkedCount} 个变更集合</span></span>
+            <span class="pane-actions">
+              <button id="expandAllFiles" title="展开全部">展开全部</button>
+              <button id="collapseAllFiles" title="收缩全部">收缩全部</button>
+            </span>
+          </div>
           <div class="list">
             ${renderFileTree(state.candidates, state.targetPath)}
           </div>
         </section>
         <section class="pane conflicts">
-          <div class="pane-title">冲突列表 <span>${conflicts.length}</span></div>
-          <div class="bulk">
-            <button data-resolution="source">批量采用源分支</button>
-            <button data-resolution="target">批量采用目标分支</button>
+          <div class="pane-title">
+            <span>冲突列表 <span class="count">${conflictFiles.length} 个冲突文件</span></span>
+            <span class="pane-actions">
+              <button data-resolution="source" title="所有冲突采用源分支">批量采用源</button>
+              <button data-resolution="target" title="所有冲突采用目标分支">批量采用目标</button>
+            </span>
           </div>
           <div class="list">
-            ${conflicts.length
-              ? conflicts.map((conflict) => renderConflict(
-                conflict,
-                conflictChecked.get(conflict.id) ?? true,
-                conflictResolutions.get(conflict.id),
-                manualMergeContents.has(conflict.id),
-              )).join('')
-              : '<div class="empty">当前勾选项没有阻断冲突。</div>'}
+            ${renderConflictTree(state.candidates, state.targetPath, conflictResolutions, manualMergeContents)}
           </div>
         </section>
       </section>
@@ -561,15 +559,16 @@ function renderWorkbenchHtml(
     });
     document.getElementById('checkAll')?.addEventListener('click', () => vscode.postMessage({ type: 'toggleAll', checked: true }));
     document.getElementById('uncheckAll')?.addEventListener('click', () => vscode.postMessage({ type: 'toggleAll', checked: false }));
-    document.querySelectorAll('[data-conflict-check]').forEach((input) => {
-      input.addEventListener('change', () => {
-        vscode.postMessage({ type: 'toggleConflict', conflictId: input.dataset.conflictCheck, checked: input.checked });
-      });
+    document.getElementById('expandAllFiles')?.addEventListener('click', () => {
+      document.querySelectorAll('#filesPane details.tree-folder').forEach((d) => { (d as HTMLDetailsElement).open = true; });
+    });
+    document.getElementById('collapseAllFiles')?.addEventListener('click', () => {
+      document.querySelectorAll('#filesPane details.tree-folder').forEach((d) => { (d as HTMLDetailsElement).open = false; });
     });
     document.querySelectorAll('[data-resolution]').forEach((button) => {
       button.addEventListener('click', () => {
-        const conflictIds = Array.from(document.querySelectorAll('[data-conflict-check]:checked'))
-          .map((input) => input.dataset.conflictCheck);
+        const conflictIds = Array.from(document.querySelectorAll('.conflict-leaf'))
+          .map((node) => (node as HTMLElement).dataset.conflict);
         vscode.postMessage({
           type: 'applyBulkResolution',
           conflictIds,
@@ -579,22 +578,22 @@ function renderWorkbenchHtml(
     });
     document.querySelectorAll('[data-conflict-choice]').forEach((button) => {
       button.addEventListener('click', () => {
-        const node = button.closest('[data-conflict]');
-        if (!node) return;
+        const target = button.dataset.conflict;
+        if (!target) return;
         const resolution = button.dataset.conflictChoice;
         if (resolution === 'manual') {
-          vscode.postMessage({ type: 'openManualMerge', conflictId: node.dataset.conflict });
+          vscode.postMessage({ type: 'openManualMerge', conflictId: target });
           return;
         }
-        vscode.postMessage({ type: 'chooseResolution', conflictId: node.dataset.conflict, resolution });
+        vscode.postMessage({ type: 'chooseResolution', conflictId: target, resolution });
       });
     });
     function refreshExecuteState() {
       const execute = document.getElementById('execute');
       if (!execute) return;
       const selectedChangesetIds = Array.from(document.querySelectorAll('[data-candidate-check]:checked')).map((input) => Number(input.dataset.candidateCheck));
-      const unresolvedBlocking = Array.from(document.querySelectorAll('[data-conflict][data-blocking="true"]')).some((node) => !node.dataset.choice);
-      execute.disabled = selectedChangesetIds.length === 0 || unresolvedBlocking;
+      const unresolved = Array.from(document.querySelectorAll('.conflict-leaf')).some((node) => !(node as HTMLElement).dataset.choice);
+      execute.disabled = selectedChangesetIds.length === 0 || unresolved;
       execute.textContent = '合并 ' + selectedChangesetIds.length;
     }
     document.querySelectorAll('[data-candidate-check]').forEach((input) => input.addEventListener('change', refreshExecuteState));
@@ -608,10 +607,22 @@ function renderWorkbenchHtml(
   return renderShell(webview, nonce, body, script);
 }
 
+function codiconFontFace(webview: vscode.Webview): string {
+  const ext = vscode.extensions.getExtension('local.arm-tfs-vscode');
+  if (!ext) return '';
+  const fontUri = webview.asWebviewUri(vscode.Uri.joinPath(ext.extensionUri, 'media', 'codicon.ttf'));
+  return `@font-face {
+    font-family: 'codicon';
+    src: url('${fontUri.toString()}') format('truetype');
+    font-display: block;
+  }`;
+}
+
 function renderShell(webview: vscode.Webview, nonce: string, body: string, script: string): string {
   const csp = [
     `default-src 'none'`,
     `style-src ${webview.cspSource} 'unsafe-inline'`,
+    `font-src ${webview.cspSource}`,
     `script-src 'nonce-${nonce}'`,
   ].join('; ');
 
@@ -622,6 +633,7 @@ function renderShell(webview: vscode.Webview, nonce: string, body: string, scrip
   <meta http-equiv="Content-Security-Policy" content="${csp}">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
+    ${codiconFontFace(webview)}
     :root {
       --bg: var(--vscode-editor-background);
       --fg: var(--vscode-editor-foreground);
@@ -633,6 +645,11 @@ function renderShell(webview: vscode.Webview, nonce: string, body: string, scrip
       --selection: var(--vscode-list-activeSelectionBackground);
       --row: var(--vscode-list-hoverBackground);
     }
+    .codicon { font-family: 'codicon'; font-size: 16px; line-height: 1; vertical-align: middle; }
+    .ci-folder::before { font-family: 'codicon'; content: '\\ea83'; color: var(--vscode-symbolIcon-folderForeground, #c5c5c5); margin-right: 4px; }
+    .ci-file::before { font-family: 'codicon'; content: '\\ea7b'; color: var(--vscode-symbolIcon-fileForeground, #c5c5c5); margin-right: 4px; }
+    .ci-chevron-down::before { font-family: 'codicon'; content: '\\eab4'; }
+    .ci-chevron-right::before { font-family: 'codicon'; content: '\\eab6'; }
     * { box-sizing: border-box; }
     body {
       margin: 0;
@@ -712,6 +729,23 @@ function renderShell(webview: vscode.Webview, nonce: string, body: string, scrip
       border-bottom: 1px solid var(--border);
     }
     .pane-title span { color: var(--muted); font-weight: 400; }
+    .pane-title .count { font-size: 12px; }
+    .pane-actions { display: flex; gap: 6px; }
+    .pane-actions button, .bulk button {
+      border: 1px solid var(--border);
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      min-height: 24px; padding: 2px 8px; cursor: pointer; font: inherit; font-size: 12px; border-radius: 2px;
+    }
+    .pane-actions button:hover, .bulk button:hover { background: var(--row); }
+    .conflict-leaf .conflict-actions { display: inline-flex; gap: 4px; margin-left: 8px; }
+    .conflict-leaf .conflict-actions button {
+      border: 1px solid var(--border); background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground); min-height: 22px; padding: 1px 7px;
+      cursor: pointer; font: inherit; font-size: 11px; border-radius: 2px;
+    }
+    .conflict-leaf[data-choice="source"] .choice-source,
+    .conflict-leaf[data-choice="target"] .choice-target { background: var(--button, var(--vscode-button-background)); color: var(--button-fg, var(--vscode-button-foreground)); border-color: var(--button, var(--vscode-button-background)); }
     .list {
       overflow: auto;
       min-height: 0;
@@ -950,6 +984,102 @@ function renderFileTree(candidates: MergeWorkbenchCandidate[], targetPath: strin
   return `<div class="tree">${renderTreeNode(root)}</div>`;
 }
 
+interface AggregatedConflict {
+  targetServerPath: string;
+  sourceServerPath: string;
+  changesets: number[];
+}
+
+/** 聚合所有勾选 changeset 的冲突文件，按目标路径去重（一个文件只出现一次）。 */
+function aggregateConflicts(candidates: MergeWorkbenchCandidate[]): AggregatedConflict[] {
+  const byPath = new Map<string, AggregatedConflict>();
+  for (const cand of candidates) {
+    if (!cand.checked) continue;
+    for (const ch of cand.changes) {
+      if (ch.status.toLowerCase() !== 'conflict') continue;
+      const existing = byPath.get(ch.targetServerPath);
+      if (existing) {
+        if (!existing.changesets.includes(cand.changesetId)) existing.changesets.push(cand.changesetId);
+      } else {
+        byPath.set(ch.targetServerPath, {
+          targetServerPath: ch.targetServerPath,
+          sourceServerPath: ch.sourceServerPath,
+          changesets: [cand.changesetId],
+        });
+      }
+    }
+  }
+  return [...byPath.values()];
+}
+
+type ConflictResolution = 'source' | 'target' | 'manual';
+
+function renderConflictTree(
+  candidates: MergeWorkbenchCandidate[],
+  targetPath: string,
+  conflictResolutions: ReadonlyMap<string, ConflictResolution>,
+  manualMergeContents: ReadonlyMap<string, string>,
+): string {
+  const conflicts = aggregateConflicts(candidates);
+  if (conflicts.length === 0) return '<div class="empty">当前勾选项没有冲突。</div>';
+  const root: FileTreeNode = { name: '', children: new Map(), files: [] };
+  for (const c of conflicts) {
+    const segments = relativeFilePath(c.targetServerPath, targetPath).split('/').filter(Boolean);
+    let node = root;
+    for (let i = 0; i < segments.length - 1; i++) {
+      const seg = segments[i];
+      let child = node.children.get(seg);
+      if (!child) { child = { name: seg, children: new Map(), files: [] }; node.children.set(seg, child); }
+      node = child;
+    }
+    node.files.push({
+      targetServerPath: c.targetServerPath,
+      sourceServerPath: c.sourceServerPath,
+      sourceChangeType: 'Conflict',
+      targetChangeType: 'Conflict',
+      status: 'conflict',
+      sourceChangesetId: c.changesets[0],
+      targetExists: true,
+      changesets: c.changesets,
+    });
+  }
+  const renderLeaf = (file: AggregatedFile): string => {
+    const name = path.posix.basename(file.targetServerPath);
+    const csList = file.changesets.map((cs) => `cs${cs}`).join(', ');
+    const choice = conflictResolutions.get(file.targetServerPath);
+    const hasManual = manualMergeContents.has(file.targetServerPath);
+    return `
+      <div class="tree-file conflict-leaf is-conflict" data-conflict="${escapeAttribute(file.targetServerPath)}" data-choice="${choice ?? ''}">
+        <i class="ci-file"></i><span class="tree-file-name" title="${escapeAttribute(file.targetServerPath)}">${escapeHtml(name)}</span>
+        <span class="tree-file-cs" title="涉及的变更集合">${escapeHtml(csList)}</span>
+        ${hasManual ? '<span class="badge">已有手动结果</span>' : ''}
+        <span class="conflict-actions">
+          <button class="choice-source" data-conflict-choice="source" data-conflict="${escapeAttribute(file.targetServerPath)}">采用源</button>
+          <button class="choice-target" data-conflict-choice="target" data-conflict="${escapeAttribute(file.targetServerPath)}">采用目标</button>
+          <button class="choice-manual" data-conflict-choice="manual" data-conflict="${escapeAttribute(file.targetServerPath)}">手动合并</button>
+        </span>
+      </div>`;
+  };
+  return `<div class="tree">${renderTreeNodeWithLeaf(root, renderLeaf)}</div>`;
+}
+
+function renderTreeNodeWithLeaf(node: FileTreeNode, renderLeaf: (f: AggregatedFile) => string): string {
+  const folders = [...node.children.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const files = node.files.sort((a, b) =>
+    path.posix.basename(a.targetServerPath).localeCompare(path.posix.basename(b.targetServerPath)),
+  );
+  const items: string[] = [];
+  for (const folder of folders) {
+    items.push(`
+      <details class="tree-folder" open>
+        <summary><i class="ci-folder"></i>${escapeHtml(folder.name)} <span class="badge">${countFiles(folder)}</span></summary>
+        <div class="tree-children">${renderTreeNodeWithLeaf(folder, renderLeaf)}</div>
+      </details>`);
+  }
+  for (const file of files) items.push(renderLeaf(file));
+  return items.join('');
+}
+
 function renderTreeNode(node: FileTreeNode): string {
   const folders = [...node.children.values()].sort((a, b) => a.name.localeCompare(b.name));
   const files = node.files.sort((a, b) =>
@@ -958,8 +1088,8 @@ function renderTreeNode(node: FileTreeNode): string {
   const items: string[] = [];
   for (const folder of folders) {
     items.push(`
-      <details class="tree-folder">
-        <summary>📁 ${escapeHtml(folder.name)} <span class="badge">${countFiles(folder)}</span></summary>
+      <details class="tree-folder" open>
+        <summary><i class="ci-folder"></i>${escapeHtml(folder.name)} <span class="badge">${countFiles(folder)}</span></summary>
         <div class="tree-children">${renderTreeNode(folder)}</div>
       </details>`);
   }
@@ -969,7 +1099,7 @@ function renderTreeNode(node: FileTreeNode): string {
     const isConflict = file.status.toLowerCase() === 'conflict';
     items.push(`
       <div class="tree-file ${isConflict ? 'is-conflict' : ''}">
-        <span class="tree-file-name" title="${escapeAttribute(file.targetServerPath)}">📄 ${escapeHtml(name)}</span>
+        <i class="ci-file"></i><span class="tree-file-name" title="${escapeAttribute(file.targetServerPath)}">${escapeHtml(name)}</span>
         <span class="badge">${escapeHtml(file.sourceChangeType)}→${escapeHtml(file.targetChangeType)}</span>
         ${isConflict ? '<span class="badge warn">冲突</span>' : ''}
         <span class="tree-file-cs" title="涉及的变更集合">${escapeHtml(csList)}</span>
@@ -1119,6 +1249,11 @@ function renderManualMergeHtml(
     `script-src 'nonce-${nonce}'`,
   ].join('; ');
 
+  // Embed content safely into <script>: JSON-encode then break any </script> sequence.
+  const sourceJson = JSON.stringify(sourceContent).replace(/</g, '\\u003c');
+  const targetJson = JSON.stringify(targetContent).replace(/</g, '\\u003c');
+  const initialJson = JSON.stringify(initialResult).replace(/</g, '\\u003c');
+
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1133,87 +1268,49 @@ function renderManualMergeHtml(
       --border: var(--vscode-panel-border);
       --button: var(--vscode-button-background);
       --button-fg: var(--vscode-button-foreground);
+      --add-bg: var(--vscode-diffEditor-insertedTextBackground, rgba(0,180,0,0.15));
+      --del-bg: var(--vscode-diffEditor-removedTextBackground, rgba(255,0,0,0.15));
+      --add-line: var(--vscode-diffEditorGutter-insertedLineBackground, rgba(0,180,0,0.25));
+      --del-line: var(--vscode-diffEditorGutter-removedLineBackground, rgba(255,0,0,0.25));
+      --conflict: var(--vscode-editorWarning-foreground, #cca700);
     }
     * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background: var(--bg);
-      color: var(--fg);
-      font-family: var(--vscode-font-family);
-      font-size: var(--vscode-font-size);
-    }
-    header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      padding: 10px 14px;
-      border-bottom: 1px solid var(--border);
-    }
+    body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); }
+    header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
     h1 { margin: 0; font-size: 16px; }
-    button {
-      border: 1px solid var(--border);
-      background: var(--vscode-button-secondaryBackground);
-      color: var(--vscode-button-secondaryForeground);
-      min-height: 28px;
-      padding: 4px 10px;
-      cursor: pointer;
-      font: inherit;
-    }
-    button.primary {
-      background: var(--button);
-      color: var(--button-fg);
-      border-color: var(--button);
-    }
-    .grid {
-      display: grid;
-      grid-template-rows: minmax(220px, 1fr) minmax(220px, 1fr);
-      height: calc(100vh - 50px);
-    }
-    .top {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      min-height: 0;
-      border-bottom: 1px solid var(--border);
-    }
-    section {
-      min-width: 0;
-      min-height: 0;
-      display: flex;
-      flex-direction: column;
-      border-right: 1px solid var(--border);
-    }
+    .header-actions { display: flex; gap: 8px; align-items: center; }
+    button { border: 1px solid var(--border); background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); min-height: 28px; padding: 4px 10px; cursor: pointer; font: inherit; border-radius: 2px; }
+    button.primary { background: var(--button); color: var(--button-fg); border-color: var(--button); }
+    button.active { background: var(--button); color: var(--button-fg); border-color: var(--button); }
+    .grid { display: grid; grid-template-rows: minmax(200px, 0.9fr) auto minmax(180px, 0.8fr); height: calc(100vh - 52px); }
+    .top { display: grid; grid-template-columns: 1fr 1fr; min-height: 0; border-bottom: 1px solid var(--border); }
+    section { min-width: 0; min-height: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
     section:last-child { border-right: 0; }
-    .title {
-      padding: 8px 10px;
-      font-weight: 650;
-      color: var(--muted);
-      border-bottom: 1px solid var(--border);
-    }
-    pre, textarea {
-      margin: 0;
-      flex: 1;
-      min-height: 0;
-      padding: 10px;
-      overflow: auto;
-      white-space: pre;
-      border: 0;
-      outline: 0;
-      color: var(--fg);
-      background: var(--bg);
-      font-family: var(--vscode-editor-font-family);
-      font-size: var(--vscode-editor-font-size);
-      resize: none;
-    }
-    @media (max-width: 900px) {
-      .top { grid-template-columns: 1fr; }
-    }
+    .title { padding: 6px 10px; font-weight: 650; color: var(--muted); border-bottom: 1px solid var(--border); }
+    pre, textarea { margin: 0; flex: 1; min-height: 0; padding: 8px; overflow: auto; white-space: pre; border: 0; outline: 0; color: var(--fg); background: var(--bg); font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); resize: none; }
+    .line { white-space: pre; }
+    .line.del { background: var(--del-bg); border-left: 3px solid var(--del-line); margin-left: -3px; padding-left: 8px; }
+    .line.add { background: var(--add-bg); border-left: 3px solid var(--add-line); margin-left: -3px; padding-left: 8px; }
+    #hunks { overflow: auto; border-bottom: 1px solid var(--border); max-height: 38vh; }
+    .hunk { border-bottom: 1px dashed var(--border); padding: 8px 10px; }
+    .hunk-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 6px; }
+    .hunk-title { color: var(--conflict); font-weight: 650; font-size: 12px; }
+    .hunk-actions { display: flex; gap: 6px; }
+    .hunk-body { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .hunk-side { font-family: var(--vscode-editor-font-family); font-size: 12px; white-space: pre; padding: 4px 6px; border-radius: 3px; }
+    .hunk-side.src { background: var(--del-bg); }
+    .hunk-side.tgt { background: var(--add-bg); }
+    .hunk-side .lbl { display:block; font-size: 10px; color: var(--muted); margin-bottom: 2px; }
+    .hunk.resolved .hunk-title { color: var(--muted); }
+    @media (max-width: 900px) { .top { grid-template-columns: 1fr; } .hunk-body { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
   <header>
-    <h1>手动合并</h1>
-    <div>
+    <h1>手动合并（左：源分支 · 右：目标分支）</h1>
+    <div class="header-actions">
+      <button id="acceptAllSource" title="所有冲突块采用源分支">全部采用源</button>
+      <button id="acceptAllTarget" title="所有冲突块采用目标分支">全部采用目标</button>
       <button id="cancel">取消</button>
       <button id="save" class="primary">使用合并结果</button>
     </div>
@@ -1222,20 +1319,143 @@ function renderManualMergeHtml(
     <div class="top">
       <section>
         <div class="title">源分支文件</div>
-        <pre>${escapeHtml(sourceContent)}</pre>
+        <pre id="sourcePane"></pre>
       </section>
       <section>
         <div class="title">目标分支文件</div>
-        <pre>${escapeHtml(targetContent)}</pre>
+        <pre id="targetPane"></pre>
       </section>
     </div>
+    <section id="hunksSection">
+      <div class="title">冲突区块（逐块选择采用哪一侧；下方结果会自动更新）</div>
+      <div id="hunks"></div>
+    </section>
     <section>
-      <div class="title">手动合并结果</div>
-      <textarea id="result">${escapeHtml(initialResult)}</textarea>
+      <div class="title">合并结果（可手动编辑）</div>
+      <textarea id="result"></textarea>
     </section>
   </main>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
+    const sourceText = ${sourceJson};
+    const targetText = ${targetJson};
+    const initialResult = ${initialJson};
+    const sourceLines = sourceText.split('\\n');
+    const targetLines = targetText.split('\\n');
+
+    // LCS diff → ops
+    const n = sourceLines.length, m = targetLines.length;
+    const dp = Array.from({length: n + 1}, () => new Array(m + 1).fill(0));
+    for (let i = n - 1; i >= 0; i--) {
+      for (let j = m - 1; j >= 0; j--) {
+        dp[i][j] = sourceLines[i] === targetLines[j] ? dp[i+1][j+1] + 1 : Math.max(dp[i+1][j], dp[i][j+1]);
+      }
+    }
+    const ops = [];
+    let i = 0, j = 0;
+    while (i < n && j < m) {
+      if (sourceLines[i] === targetLines[j]) { ops.push({t:'eq', s:sourceLines[i]}); i++; j++; }
+      else if (dp[i+1][j] >= dp[i][j+1]) { ops.push({t:'del', s:sourceLines[i]}); i++; }
+      else { ops.push({t:'ins', s:targetLines[j]}); j++; }
+    }
+    while (i < n) { ops.push({t:'del', s:sourceLines[i]}); i++; }
+    while (j < m) { ops.push({t:'ins', s:targetLines[j]}); j++; }
+
+    // group into hunks: runs of del/ins
+    const hunks = [];
+    let k = 0;
+    while (k < ops.length) {
+      if (ops[k].t === 'eq') { k++; continue; }
+      const h = { src: [], tgt: [], choice: null };
+      while (k < ops.length && ops[k].t !== 'eq') {
+        if (ops[k].t === 'del') h.src.push(ops[k].s);
+        else h.tgt.push(ops[k].s);
+        k++;
+      }
+      hunks.push(h);
+    }
+
+    function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+    // render side-by-side panes with highlighting
+    const srcHtml = [], tgtHtml = [];
+    for (const op of ops) {
+      if (op.t === 'eq') { srcHtml.push('<span class="line">'+esc(op.s)+'</span>'); tgtHtml.push('<span class="line">'+esc(op.s)+'</span>'); }
+      else if (op.t === 'del') { srcHtml.push('<span class="line del">'+esc(op.s)+'</span>'); }
+      else { tgtHtml.push('<span class="line add">'+esc(op.s)+'</span>'); }
+    }
+    document.getElementById('sourcePane').innerHTML = srcHtml.join('\\n');
+    document.getElementById('targetPane').innerHTML = tgtHtml.join('\\n');
+
+    // build result from ops + hunk choices (unresolved hunks become conflict markers)
+    function buildResult() {
+      const result = [];
+      let p = 0;
+      let h = 0;
+      while (p < ops.length) {
+        if (ops[p].t === 'eq') { result.push(ops[p].s); p++; continue; }
+        const cur = hunks[h]; h++;
+        const c = cur.choice;
+        if (c === 'source') result.push(...cur.src);
+        else if (c === 'target') result.push(...cur.tgt);
+        else if (c === 'both') { result.push(...cur.src); result.push(...cur.tgt); }
+        else {
+          result.push('<<<<<<< 源分支');
+          result.push(...cur.src);
+          result.push('=======');
+          result.push(...cur.tgt);
+          result.push('>>>>>>> 目标分支');
+        }
+        while (p < ops.length && ops[p].t !== 'eq') p++;
+      }
+      return result.join('\\n');
+    }
+
+    function renderHunks() {
+      const box = document.getElementById('hunks');
+      if (hunks.length === 0) { box.innerHTML = '<div style="padding:12px;color:var(--muted)">两侧内容相同，没有冲突区块。</div>'; return; }
+      box.innerHTML = hunks.map((h, idx) => {
+        const choice = h.choice;
+        const srcPre = h.src.length ? esc(h.src.join('\\n')) : '(无)';
+        const tgtPre = h.tgt.length ? esc(h.tgt.join('\\n')) : '(无)';
+        return '<div class="hunk ' + (choice ? 'resolved' : '') + '" data-idx="'+idx+'">'
+          + '<div class="hunk-head"><span class="hunk-title">冲突 #' + (idx+1) + (choice ? ' · 已采用 '+({source:'源',target:'目标',both:'两者'}[choice]) : '') + '</span>'
+          + '<span class="hunk-actions">'
+          + '<button data-hunk="'+idx+'" data-choice="source" class="'+(choice==='source'?'active':'')+'">采用源</button>'
+          + '<button data-hunk="'+idx+'" data-choice="target" class="'+(choice==='target'?'active':'')+'">采用目标</button>'
+          + '<button data-hunk="'+idx+'" data-choice="both" class="'+(choice==='both'?'active':'')+'">两者都采用</button>'
+          + '</span></div>'
+          + '<div class="hunk-body"><div class="hunk-side src"><span class="lbl">源分支</span>'+srcPre+'</div><div class="hunk-side tgt"><span class="lbl">目标分支</span>'+tgtPre+'</div></div>'
+          + '</div>';
+      }).join('');
+      box.querySelectorAll('button[data-hunk]').forEach((b) => {
+        b.addEventListener('click', () => {
+          const idx = Number(b.dataset.hunk);
+          hunks[idx].choice = b.dataset.choice;
+          renderHunks();
+          document.getElementById('result').value = buildResult();
+        });
+      });
+    }
+
+    // initialize: if re-opening with saved content, use it; else build with conflict markers
+    if (initialResult && initialResult.length) {
+      document.getElementById('result').value = initialResult;
+    } else {
+      document.getElementById('result').value = buildResult();
+    }
+    renderHunks();
+
+    document.getElementById('acceptAllSource').addEventListener('click', () => {
+      hunks.forEach((h) => { h.choice = 'source'; });
+      renderHunks();
+      document.getElementById('result').value = buildResult();
+    });
+    document.getElementById('acceptAllTarget').addEventListener('click', () => {
+      hunks.forEach((h) => { h.choice = 'target'; });
+      renderHunks();
+      document.getElementById('result').value = buildResult();
+    });
     document.getElementById('cancel').addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
     document.getElementById('save').addEventListener('click', () => {
       vscode.postMessage({ type: 'save', content: document.getElementById('result').value });

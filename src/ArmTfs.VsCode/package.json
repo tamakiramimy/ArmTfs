@@ -924,5 +924,8 @@
     "@types/node": "^20.17.57",
     "@types/vscode": "^1.90.0",
     "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "@vscode/codicons": "^0.0.36"
   }
 }
