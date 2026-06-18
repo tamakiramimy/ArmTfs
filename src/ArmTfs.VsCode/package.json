@@ -584,47 +584,47 @@
         {
           "command": "armTfs.serverExplorer.getLatest",
           "when": "view == armTfs.serverExplorer && viewItem =~ /armTfsServer(Folder|File)/",
-          "group": "context@1"
+          "group": "1_sync@1"
         },
         {
           "command": "armTfs.serverExplorer.checkout",
           "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFile",
-          "group": "context@2"
+          "group": "1_sync@2"
         },
         {
           "command": "armTfs.serverExplorer.showHistory",
           "when": "view == armTfs.serverExplorer && viewItem =~ /armTfsServer(Folder|File)/",
-          "group": "context@3"
+          "group": "3_info@1"
         },
         {
           "command": "armTfs.serverExplorer.setRoot",
           "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
-          "group": "context@4"
+          "group": "3_info@3"
         },
         {
           "command": "armTfs.serverExplorer.copyPath",
           "when": "view == armTfs.serverExplorer && viewItem =~ /armTfsServer(Folder|File)/",
-          "group": "context@5"
+          "group": "3_info@2"
         },
         {
           "command": "armTfs.checkoutServerPathToFolder",
           "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
-          "group": "context@6"
+          "group": "1_sync@4"
         },
         {
           "command": "armTfs.sidebar.mergeFromBranch",
           "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
-          "group": "context@7"
+          "group": "2_branch@1"
         },
         {
           "command": "armTfs.sidebar.addBranch",
           "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
-          "group": "context@8"
+          "group": "2_branch@2"
         },
         {
           "command": "armTfs.sidebar.pullBranch",
           "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
-          "group": "context@9"
+          "group": "1_sync@3"
         },
         {
           "command": "armTfs.history.diffPrevious",
