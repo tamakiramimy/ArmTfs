@@ -425,6 +425,11 @@
         "command": "armTfs.sidebar.executeMergeCandidate",
         "title": "%command.sidebarExecuteMergeCandidate%",
         "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.changes.revertLocal",
+        "title": "Revert to Server Version",
+        "category": "arm-tfs"
       }
     ],
     "menus": {
@@ -690,6 +695,11 @@
           "command": "armTfs.sidebar.executeMergeCandidate",
           "when": "view == armTfs.merge && viewItem == armTfsSidebarMergeCandidate",
           "group": "context@3"
+        },
+        {
+          "command": "armTfs.changes.revertLocal",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|localChanges)/",
+          "group": "context@1"
         }
       ],
       "scm/title": [
@@ -895,7 +905,10 @@
           "default": [],
           "items": {
             "type": "object",
-            "required": ["serverPath", "localPath"],
+            "required": [
+              "serverPath",
+              "localPath"
+            ],
             "properties": {
               "serverPath": {
                 "type": "string",

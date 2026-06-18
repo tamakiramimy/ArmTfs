@@ -134,6 +134,16 @@ public sealed class TfvcClientService
         return results;
     }
 
+    /// <summary>
+    /// 返回服务器上 serverPath 路径下，changesetId 之后（更新的）有多少个 changeset，
+    /// 即本地落后服务器的数量（⬇N）。最多扫 scanTop 条历史。
+    /// </summary>
+    public async Task<int> GetBehindCountAsync(string serverPath, int localMaxChangesetId, int scanTop = 50, CancellationToken ct = default)
+    {
+        var history = await GetChangesetsAsync(serverPath, top: scanTop, ct: ct).ConfigureAwait(false);
+        return history.Count(cs => cs.ChangesetId > localMaxChangesetId);
+    }
+
     /// <summary>获取单个 Changeset 的详细信息，包括文件列表、工作项和审核信息。</summary>
     /// <param name="changesetId">Changeset 编号</param>
     /// <param name="ct">取消令牌</param>
@@ -952,7 +962,7 @@ public sealed class TfvcClientService
                 try
                 {
                     var actual = await DownloadFileContentAsync(missingPath, null, ct).ConfigureAwait(false);
-                    if (!actual.AsSpan().SequenceEqual(expectedContent))
+                    if (!ContentEquals(actual, expectedContent))
                         trulyMissing.Add(missingPath);
                     // else: target already has exact content — dedup is fine, skip
                 }
@@ -981,7 +991,7 @@ public sealed class TfvcClientService
                 continue;
 
             var actualContent = await DownloadFileContentAsync(targetPath, null, ct).ConfigureAwait(false);
-            if (!actualContent.AsSpan().SequenceEqual(expectedContent))
+            if (!ContentEquals(actualContent, expectedContent))
                 throw new InvalidOperationException($"Merge verification failed: target file '{targetPath}' content does not match the source content after cs#{createdChangesetId}.");
         }
 
@@ -1117,6 +1127,32 @@ public sealed class TfvcClientService
     }
 
     private static string NormalizeServerPath(string serverPath) => serverPath.TrimEnd('/');
+
+    /// <summary>
+    /// Compares two byte arrays for content equality, normalizing CRLF to LF before comparing.
+    /// TFS may serve files with different line endings than what was uploaded (e.g., CRLF ↔ LF),
+    /// so a raw byte comparison would produce false negatives after a successful merge.
+    /// </summary>
+    private static bool ContentEquals(byte[] a, byte[] b)
+    {
+        if (a.AsSpan().SequenceEqual(b))
+            return true;
+
+        // Normalize CRLF → LF and re-compare to handle server line-ending normalization.
+        static byte[] NormalizeCrLf(byte[] data)
+        {
+            var result = new List<byte>(data.Length);
+            for (var i = 0; i < data.Length; i++)
+            {
+                if (data[i] == (byte)'\r' && i + 1 < data.Length && data[i + 1] == (byte)'\n')
+                    continue; // skip CR in CRLF pair
+                result.Add(data[i]);
+            }
+            return result.ToArray();
+        }
+
+        return NormalizeCrLf(a).AsSpan().SequenceEqual(NormalizeCrLf(b));
+    }
 
     private static string RemapServerPath(string sourceServerPath, string sourceRoot, string targetRoot)
     {

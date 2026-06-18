@@ -24,7 +24,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   const client = new ArmTfsCliClient(output);
   const historyBrowser = new ArmTfsHistoryBrowser(client, output);
   const scm = new ArmTfsScmController(client, output, getWorkspaceRoot());
-  const changesView = new ArmTfsChangesViewController(scm);
+  const changesView = new ArmTfsChangesViewController(scm, client);
   const sidebar = new ArmTfsSidebarController(client, output, getWorkspaceRoot(), async () => scm.refresh(), historyBrowser);
   let connections: ArmTfsConnectionsController;
   let uiInitialized = false;
@@ -135,6 +135,9 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   })();
 
   context.subscriptions.push(
+    scm.onDidChangeChanges(() => {
+      void sidebar.notifyPendingChangesUpdated(scm.pendingChanges.length);
+    }),
     vscode.workspace.onDidSaveTextDocument((document) => {
       if (document.uri.scheme === 'file') {
         void refreshUi();

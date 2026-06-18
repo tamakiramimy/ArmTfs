@@ -51,6 +51,20 @@ class BranchNode extends ArmTfsTreeNode {
       arguments: [this],
     };
   }
+
+  /** Update the branch badge. pendingCount = local uncommitted (●N), behindCount = server ahead of local (⬇N). */
+  setStatus(pendingCount: number, behindCount: number): void {
+    const badge: string[] = [];
+    if (behindCount > 0) {
+      badge.push(`⬇${behindCount}`);
+    }
+    if (pendingCount > 0) {
+      badge.push(`●${pendingCount}`);
+    }
+    const baseName = path.posix.basename(this.branch.path);
+    this.label = badge.length > 0 ? `${badge.join(' ')}  ${baseName}` : baseName;
+    this.description = this.branch.path;
+  }
 }
 
 class HistoryNode extends ArmTfsTreeNode {
@@ -134,6 +148,13 @@ class StaticTreeProvider implements vscode.TreeDataProvider<ArmTfsTreeNode> {
     this.onDidChangeTreeDataEmitter.fire();
   }
 
+  refreshNode(node: ArmTfsTreeNode): void {
+    // Fire a full refresh — node-level refresh requires the node to be
+    // registered via getParent(), which StaticTreeProvider does not implement.
+    void node; // suppress unused-variable warning
+    this.onDidChangeTreeDataEmitter.fire();
+  }
+
   getTreeItem(element: ArmTfsTreeNode): vscode.TreeItem {
     return element;
   }
@@ -157,6 +178,8 @@ export class ArmTfsSidebarController implements vscode.Disposable {
   private workspaceStatus: StatusResponse | undefined;
   private activeServerPath: string | undefined;
   private activeBranchPath: string | undefined;
+  private activeBranchNode: BranchNode | undefined;
+  private lastPendingCount = 0;
   private selectedCompareChangesetId: number | undefined;
 
   constructor(
@@ -391,6 +414,21 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       const scopeNode = new InfoNode(t('sidebar.scope'), scope);
       scopeNode.iconPath = new vscode.ThemeIcon('repo');
       this.branchProvider.setItems([scopeNode, ...roots]);
+
+      // Find the active branch node and asynchronously update its merge/pending badge.
+      const activePath = this.activeBranchPath;
+      this.output.appendLine(`[branch-badge] activeBranchPath=${activePath ?? '(none)'}, branch count=${flattenBranchNodes(roots).length}`);
+      if (activePath) {
+        const allNodes = flattenBranchNodes(roots);
+        const activeNode = allNodes.find(
+          (node) => normalizeServerPath(node.branch.path) === normalizeServerPath(activePath),
+        );
+        this.activeBranchNode = activeNode;
+        this.output.appendLine(`[branch-badge] activeNode found: ${activeNode?.branch.path ?? '(none)'}`);
+        if (activeNode) {
+          void this.refreshActiveBranchStatus(activeNode);
+        }
+      }
     } catch (error) {
       const msg = getErrorMessage(error);
       const isNotFound = msg.includes('ENOENT');
@@ -406,6 +444,56 @@ export class ArmTfsSidebarController implements vscode.Disposable {
         this.showError('arm-tfs branch list', error);
       }
     }
+  }
+
+  /** Called by extension when SCM pending changes update, to refresh the active branch badge. */
+  async notifyPendingChangesUpdated(pendingCount: number): Promise<void> {
+    this.lastPendingCount = pendingCount;
+    const node = this.activeBranchNode;
+    if (node) {
+      await this.refreshActiveBranchStatus(node, pendingCount);
+    }
+  }
+
+  /** Fetch merge candidates from the configured merge source → activeBranch, then update the badge. */
+  private async refreshActiveBranchStatus(node: BranchNode, pendingCountOverride?: number): Promise<void> {
+    const targetPath = node.branch.path;
+    this.output.appendLine(`[branch-badge] active branch: ${targetPath}`);
+
+    // ── ⬇N: behind count ────────────────────────────────────────────────────
+    // Compare local max changeset (from .tf/versions/) with server latest history.
+    let behindCount = 0;
+    const localRoot = this.resolvedWorkspaceRoot
+      ?? (this.rootPath ? findTfvcWorkspaceRootSync(this.rootPath) ?? undefined : undefined);
+    if (localRoot) {
+      try {
+        const versionsDir = path.join(localRoot, '.tf', 'versions');
+        const fs = await import('node:fs/promises');
+        const files = await fs.readdir(versionsDir).catch(() => [] as string[]);
+        let localMax = 0;
+        for (const file of files.filter(f => f.endsWith('.json'))) {
+          try {
+            const content = await fs.readFile(path.join(versionsDir, file), 'utf8');
+            const parsed = JSON.parse(content) as { ChangesetId?: number };
+            if (parsed.ChangesetId && parsed.ChangesetId > localMax) {
+              localMax = parsed.ChangesetId;
+            }
+          } catch { /* skip */ }
+        }
+        this.output.appendLine(`[branch-badge] localMax changeset: ${localMax}`);
+        if (localMax > 0) {
+          const history = await this.client.history(targetPath, 50, undefined, { cwdOverride: localRoot });
+          behindCount = history.items.filter(cs => cs.changesetId > localMax).length;
+          this.output.appendLine(`[branch-badge] behind count: ${behindCount}`);
+        }
+      } catch (err) {
+        this.output.appendLine(`[branch-badge] behind count error: ${getErrorMessage(err)}`);
+      }
+    }
+
+    const pendingCount = pendingCountOverride ?? this.lastPendingCount;
+    node.setStatus(pendingCount, behindCount);
+    this.branchProvider.refreshNode(node);
   }
 
   async refreshMerge(): Promise<void> {
@@ -1309,6 +1397,23 @@ function findParentBranch(branchPath: string, nodeByPath: Map<string, BranchNode
   }
 
   return bestMatch;
+}
+
+function flattenBranchNodes(roots: BranchNode[]): BranchNode[] {
+  const result: BranchNode[] = [];
+  const stack = [...roots];
+  while (stack.length) {
+    const node = stack.pop()!;
+    result.push(node);
+    if (node.children) {
+      for (const child of node.children) {
+        if (child instanceof BranchNode) {
+          stack.push(child);
+        }
+      }
+    }
+  }
+  return result;
 }
 
 function buildMergeSummaryNodes(mergeBase: MergeBaseResponse, candidates: MergeCandidateResponse): ArmTfsTreeNode[] {

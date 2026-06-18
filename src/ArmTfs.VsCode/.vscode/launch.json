@@ -5,9 +5,10 @@
       "name": "Run arm-tfs extension",
       "type": "extensionHost",
       "request": "launch",
+      "preLaunchTask": "npm: compile",
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}",
-        "\\\\Mac\\Home\\tfs\\C02_PTL_P090_BussinessCommon"
+        "/Users/tamakirami/tfs/C02_PTL_P090_BussinessCommon/MindrayApp.FlowDesignVue-P_V20250623"
       ],
       "outFiles": [
         "${workspaceFolder}/out/**/*.js"

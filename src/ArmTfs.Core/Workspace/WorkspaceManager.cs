@@ -158,6 +158,31 @@ public sealed class WorkspaceManager
         File.WriteAllText(file, JsonSerializer.Serialize(version, _jsonOptions));
     }
 
+    /// <summary>返回本地工作区中所有已追踪文件的最大 ChangesetId；无追踪文件时返回 null。</summary>
+    public int? GetLocalMaxChangesetId()
+    {
+        if (!Directory.Exists(VersionsPath))
+            return null;
+
+        int max = 0;
+        foreach (var file in Directory.EnumerateFiles(VersionsPath, "*.json"))
+        {
+            try
+            {
+                var json = File.ReadAllText(file);
+                var version = JsonSerializer.Deserialize<TrackedFileVersion>(json, _jsonOptions);
+                if (version is not null && version.ChangesetId > max)
+                    max = version.ChangesetId;
+            }
+            catch
+            {
+                // Skip unreadable version files.
+            }
+        }
+
+        return max > 0 ? max : null;
+    }
+
     /// <summary>删除对应本地文件的版本快照（文件已删除时调用）。</summary>
     public void RemoveTrackedVersion(string localPath)
     {

@@ -1,5 +1,6 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import type { ArmTfsCliClient } from './armTfsCliClient';
 import type { ArmTfsScmController, ArmTfsResourceState, ArmTfsUntrackedResourceState } from './scm';
 import { t } from './i18n';
 
@@ -95,7 +96,7 @@ export class ArmTfsChangesViewController implements vscode.Disposable {
   private readonly treeView: vscode.TreeView<vscode.TreeItem>;
   private readonly disposables: vscode.Disposable[] = [];
 
-  constructor(private readonly scm: ArmTfsScmController) {
+  constructor(private readonly scm: ArmTfsScmController, private readonly client: ArmTfsCliClient) {
     this.provider = new ChangesProvider(scm);
     this.treeView = vscode.window.createTreeView('armTfs.changes', {
       treeDataProvider: this.provider,
@@ -156,6 +157,28 @@ export class ArmTfsChangesViewController implements vscode.Disposable {
         } catch (error) {
           void vscode.window.showErrorMessage(
             t('changesView.delete.failed', { message: error instanceof Error ? error.message : String(error) }),
+          );
+        }
+      }),
+      vscode.commands.registerCommand('armTfs.changes.revertLocal', async (item?: ChangeFileItem) => {
+        if (!item?.resource) {
+          return;
+        }
+        const fsPath = item.resource.resourceUri.fsPath;
+        const choice = await vscode.window.showWarningMessage(
+          t('changesView.revertLocal.confirm', { file: path.basename(fsPath) }),
+          { modal: true, detail: fsPath },
+          t('changesView.revertLocal.action'),
+        );
+        if (choice !== t('changesView.revertLocal.action')) {
+          return;
+        }
+        try {
+          await this.client.get(fsPath, { force: true, recursive: false });
+          await this.scm.refresh();
+        } catch (error) {
+          void vscode.window.showErrorMessage(
+            t('changesView.revertLocal.failed', { message: error instanceof Error ? error.message : String(error) }),
           );
         }
       }),
