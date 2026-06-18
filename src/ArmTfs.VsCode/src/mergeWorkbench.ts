@@ -145,6 +145,35 @@ export class ArmTfsMergeWorkbench {
         candidates,
         selectedChangesetId: candidates[0]?.changesetId,
       };
+
+      // SOAP 3-way conflict preview for the whole candidate range. The REST dry-run above is
+      // unreliable for conflicts (misses add/add and edit/edit when the branch point can't be
+      // detected), so ask the server directly. Mark any candidate change whose target path is a
+      // real conflict as status='conflict' so the conflict list surfaces it.
+      if (candidates.length > 0) {
+        try {
+          const ids = candidates.map((c) => c.changesetId);
+          const from = Math.min(...ids);
+          const to = Math.max(...ids);
+          const preview = await this.client.mergePreviewConflictsJson(sourcePath, targetPath, from, to);
+          const conflictedTargets = new Set(
+            preview.conflicts.map((c) => c.targetServerPath.toLowerCase()),
+          );
+          if (conflictedTargets.size > 0) {
+            for (const cand of candidates) {
+              cand.changes = cand.changes.map((ch) =>
+                conflictedTargets.has(ch.targetServerPath.toLowerCase())
+                  ? { ...ch, status: 'conflict', note: 'Both source and target modified this file (server 3-way merge conflict). Resolve (source/target/manual).' }
+                  : ch,
+              );
+            }
+          }
+        } catch (previewError) {
+          // Preview is best-effort; if it fails, fall back to REST-detected conflicts only.
+          this.output.appendLine(`merge preview-conflicts failed: ${getErrorMessage(previewError)}`);
+        }
+      }
+
       for (const conflict of candidates.flatMap(findConflicts)) {
         this.conflictChecked.set(conflict.id, true);
       }
@@ -455,7 +484,6 @@ function renderWorkbenchHtml(
 ): string {
   const nonce = getNonce();
   const selected = state.candidates.find((candidate) => candidate.changesetId === state.selectedChangesetId) ?? state.candidates[0];
-  const selectedChanges = selected?.changes ?? [];
   const conflicts = state.candidates
     .filter((candidate) => candidate.checked)
     .flatMap(findConflicts);
@@ -483,9 +511,9 @@ function renderWorkbenchHtml(
           </div>
         </section>
         <section class="pane files">
-          <div class="pane-title">文件变更记录 ${selected ? `<span>cs${selected.changesetId}</span>` : ''}</div>
+          <div class="pane-title">文件变更记录 <span>${aggregateFileCount(state.candidates)} 个文件 · ${checkedCount} 个变更集合</span></div>
           <div class="list">
-            ${selectedChanges.length ? selectedChanges.map(renderFileChange).join('') : '<div class="empty">没有可执行的文件变更。</div>'}
+            ${renderFileTree(state.candidates, state.targetPath)}
           </div>
         </section>
         <section class="pane conflicts">
@@ -741,6 +769,24 @@ function renderShell(webview: vscode.Webview, nonce: string, body: string, scrip
       gap: 12px;
       align-items: center;
     }
+    .tree { padding: 6px 8px; }
+    .tree-folder { padding-left: 14px; }
+    .tree-folder > summary {
+      cursor: pointer; user-select: none; padding: 3px 4px; border-radius: 4px;
+      font-weight: 600; color: var(--fg); list-style: none;
+    }
+    .tree-folder > summary::-webkit-details-marker { display: none; }
+    .tree-folder > summary:hover { background: var(--row); }
+    .tree-folder[open] > summary { color: var(--accent); }
+    .tree-children { padding-left: 6px; border-left: 1px dashed var(--border); margin-left: 10px; }
+    .tree-file {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+      padding: 4px 6px 4px 14px; border-radius: 4px;
+    }
+    .tree-file:hover { background: var(--row); }
+    .tree-file-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tree-file-cs { color: var(--muted); font-size: 11px; margin-left: auto; }
+    .tree-file.is-conflict .tree-file-name { color: var(--danger); font-weight: 600; }
     .empty {
       padding: 24px 12px;
       color: var(--muted);
@@ -814,27 +860,123 @@ function renderCandidate(candidate: MergeWorkbenchCandidate, selectedChangesetId
     </article>`;
 }
 
-function renderFileChange(change: MergePlanChange): string {
-  return `
-    <article class="file">
-      <div>
-        <div class="title">
-          <span>${escapeHtml(path.posix.basename(change.targetServerPath))}</span>
-          <span class="badge">${escapeHtml(change.sourceChangeType)}</span>
-          <span class="badge">${escapeHtml(change.targetChangeType)}</span>
-        </div>
-        <div class="path">${escapeHtml(change.sourceServerPath)}</div>
-        <div class="path">${escapeHtml(change.targetServerPath)}</div>
-        ${change.note ? `<div class="note">${escapeHtml(change.note)}</div>` : ''}
-      </div>
-      <button
-        data-diff
-        data-source="${escapeAttribute(change.sourceServerPath)}"
-        data-target="${escapeAttribute(change.targetServerPath)}"
-        data-version="${change.sourceChangesetId}"
-        data-target-exists="${change.targetExists ? 'true' : 'false'}"
-        title="打开左右文件对比">对比</button>
-    </article>`;
+type FileTreeNode = {
+  name: string;
+  children: Map<string, FileTreeNode>;
+  files: AggregatedFile[];
+};
+
+interface AggregatedFile {
+  targetServerPath: string;
+  sourceServerPath: string;
+  sourceChangeType: string;
+  targetChangeType: string;
+  status: string;
+  note?: string;
+  sourceChangesetId: number;
+  targetExists: boolean;
+  changesets: number[];
+}
+
+function relativeFilePath(serverPath: string, rootPath: string): string {
+  const root = rootPath.endsWith('/') ? rootPath : rootPath + '/';
+  return serverPath.toLowerCase().startsWith(root.toLowerCase())
+    ? serverPath.slice(root.length)
+    : serverPath;
+}
+
+function aggregateFileCount(candidates: MergeWorkbenchCandidate[]): number {
+  const paths = new Set<string>();
+  for (const c of candidates) {
+    if (!c.checked) continue;
+    for (const ch of c.changes) paths.add(ch.targetServerPath);
+  }
+  return paths.size;
+}
+
+function buildFileTree(candidates: MergeWorkbenchCandidate[], targetPath: string): FileTreeNode {
+  const root: FileTreeNode = { name: '', children: new Map(), files: [] };
+  const byPath = new Map<string, AggregatedFile>();
+  for (const cand of candidates) {
+    if (!cand.checked) continue;
+    for (const ch of cand.changes) {
+      const existing = byPath.get(ch.targetServerPath);
+      if (existing) {
+        if (!existing.changesets.includes(cand.changesetId)) existing.changesets.push(cand.changesetId);
+      } else {
+        byPath.set(ch.targetServerPath, {
+          targetServerPath: ch.targetServerPath,
+          sourceServerPath: ch.sourceServerPath,
+          sourceChangeType: ch.sourceChangeType,
+          targetChangeType: ch.targetChangeType,
+          status: ch.status,
+          note: ch.note,
+          sourceChangesetId: ch.sourceChangesetId,
+          targetExists: ch.targetExists,
+          changesets: [cand.changesetId],
+        });
+      }
+    }
+  }
+
+  for (const file of byPath.values()) {
+    const segments = relativeFilePath(file.targetServerPath, targetPath).split('/').filter(Boolean);
+    let node = root;
+    for (let i = 0; i < segments.length - 1; i++) {
+      const seg = segments[i];
+      let child = node.children.get(seg);
+      if (!child) {
+        child = { name: seg, children: new Map(), files: [] };
+        node.children.set(seg, child);
+      }
+      node = child;
+    }
+    node.files.push(file);
+  }
+  return root;
+}
+
+function countFiles(node: FileTreeNode): number {
+  let n = node.files.length;
+  for (const child of node.children.values()) n += countFiles(child);
+  return n;
+}
+
+function renderFileTree(candidates: MergeWorkbenchCandidate[], targetPath: string): string {
+  const checked = candidates.filter((c) => c.checked);
+  if (checked.length === 0) return '<div class="empty">勾选变更集合后将显示所有文件变更。</div>';
+  const root = buildFileTree(candidates, targetPath);
+  if (countFiles(root) === 0) return '<div class="empty">勾选的变更集合没有可执行的文件变更。</div>';
+  return `<div class="tree">${renderTreeNode(root)}</div>`;
+}
+
+function renderTreeNode(node: FileTreeNode): string {
+  const folders = [...node.children.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const files = node.files.sort((a, b) =>
+    path.posix.basename(a.targetServerPath).localeCompare(path.posix.basename(b.targetServerPath)),
+  );
+  const items: string[] = [];
+  for (const folder of folders) {
+    items.push(`
+      <details class="tree-folder">
+        <summary>📁 ${escapeHtml(folder.name)} <span class="badge">${countFiles(folder)}</span></summary>
+        <div class="tree-children">${renderTreeNode(folder)}</div>
+      </details>`);
+  }
+  for (const file of files) {
+    const name = path.posix.basename(file.targetServerPath);
+    const csList = file.changesets.map((cs) => `cs${cs}`).join(', ');
+    const isConflict = file.status.toLowerCase() === 'conflict';
+    items.push(`
+      <div class="tree-file ${isConflict ? 'is-conflict' : ''}">
+        <span class="tree-file-name" title="${escapeAttribute(file.targetServerPath)}">📄 ${escapeHtml(name)}</span>
+        <span class="badge">${escapeHtml(file.sourceChangeType)}→${escapeHtml(file.targetChangeType)}</span>
+        ${isConflict ? '<span class="badge warn">冲突</span>' : ''}
+        <span class="tree-file-cs" title="涉及的变更集合">${escapeHtml(csList)}</span>
+        <button data-diff data-source="${escapeAttribute(file.sourceServerPath)}" data-target="${escapeAttribute(file.targetServerPath)}" data-version="${file.sourceChangesetId}" data-target-exists="${file.targetExists ? 'true' : 'false'}" title="打开左右文件对比">对比</button>
+      </div>`);
+  }
+  return items.join('');
 }
 
 function renderConflict(

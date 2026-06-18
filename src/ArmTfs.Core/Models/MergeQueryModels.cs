@@ -96,3 +96,11 @@ public sealed class MergeExecutionResult
     public IReadOnlyList<MergeExecutionChange> Changes { get; init; } = Array.Empty<MergeExecutionChange>();
     public IReadOnlyList<string> Warnings { get; init; } = Array.Empty<string>();
 }
+
+/// <summary>SOAP 服务器 3-way merge 预检出的冲突（未解决）。</summary>
+public sealed class MergeConflictPreview
+{
+    public string SourceServerPath { get; init; } = string.Empty;
+    public string TargetServerPath { get; init; } = string.Empty;
+    public string ConflictType { get; init; } = string.Empty;
+}

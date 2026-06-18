@@ -935,15 +935,14 @@ public sealed class TfvcClientService
             };
         }
 
-        var hasContentResolution = resolutionBySource.Values
-            .Any(r => NormalizeResolutionChoice(r.Choice) is "source" or "manual");
-        if (hasContentResolution)
+        // Any conflict resolution (source/target/manual) means there are conflicts to resolve.
+        // The SOAP flow can't apply per-file conflict resolutions without ResolveConflict plumbing,
+        // so fall back to REST (which handles source/target/manual correctly). The cost: no server
+        // merge history for that changeset (dedup still via comment marker + local merge-history).
+        // Clean merges (no resolutions) proceed via SOAP and write real merge history.
+        if (resolutionBySource.Count > 0)
         {
-            // source/manual resolutions require content-level control that the SOAP flow can't apply
-            // per-file without full conflict-resolution plumbing. Fall back to REST (take-source /
-            // manual content), which is correct at the cost of not recording merge history for this
-            // changeset. Dedup is preserved via the comment marker + local merge-history.
-            warnings.Add("SOAP merge fell back to REST (take-source) for source/manual conflict resolutions; TFVC merge history not recorded for this changeset. Candidate dedup is preserved via the comment marker + local merge-history.");
+            warnings.Add("SOAP merge fell back to REST for conflict resolutions (source/target/manual); TFVC merge history not recorded for this changeset. Candidate dedup is preserved via the comment marker + local merge-history.");
             var restResult = await MergeChangesetAsync(
                 normalizedSource, normalizedTarget, sourceChangesetId, comment,
                 dryRun: false, resolutions, mergeMode: "rest", soapOwner: soapOwner, ct).ConfigureAwait(false);
@@ -960,12 +959,6 @@ public sealed class TfvcClientService
                 Warnings = warnings.Concat(restResult.Warnings).ToList(),
             };
         }
-
-        // "target" resolutions: keep the target version by omitting those files from the SOAP check-in.
-        var targetResolutionPaths = resolutionBySource.Values
-            .Where(r => NormalizeResolutionChoice(r.Choice) is "target")
-            .Select(r => NormalizeServerPath(RemapServerPath(r.SourceServerPath, normalizedSource, normalizedTarget)))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         var workspaceName = $"arm-tfs-soap-merge-{Guid.NewGuid():N}";
         var computer = Environment.MachineName;
@@ -1046,13 +1039,8 @@ public sealed class TfvcClientService
                 };
             }
 
-            // Drop "target"-resolved files: they keep the target version, so do not check them in.
-            var committedOps = ops
-                .Where(op => !targetResolutionPaths.Contains(NormalizeServerPath(op.TargetServerItem)))
-                .ToList();
-            var skippedTargetCount = ops.Count - committedOps.Count;
-            if (skippedTargetCount > 0)
-                warnings.Add($"{skippedTargetCount} file(s) kept on target branch per 'target' resolution and were not merged.");
+            // No resolutions reach here (any resolution triggers REST fallback above), so commit all ops.
+            var committedOps = ops;
 
             if (committedOps.Count == 0)
             {
@@ -1141,6 +1129,76 @@ public sealed class TfvcClientService
     }
 
     private sealed record SoapWorkspaceCreated(string Name, string Owner);
+
+    /// <summary>
+    /// 用 SOAP 服务器 3-way merge 预检一段 changeset 范围 [fromChangeset, toChangeset] 的冲突，
+    /// 不实际提交。在临时 server workspace 里 PendMerge，读取 isresolved=false 的冲突，然后删除 workspace。
+    /// 比 REST 启发式准确（REST 在分支点检测失败或文件在 base 不存在时会漏检 add/add、edit/edit 冲突）。
+    /// </summary>
+    public async Task<IReadOnlyList<MergeConflictPreview>> PreviewMergeConflictsAsync(
+        string sourcePath,
+        string targetPath,
+        int fromChangeset,
+        int toChangeset,
+        CancellationToken ct = default)
+    {
+        var normalizedSource = NormalizeServerPath(sourcePath);
+        var normalizedTarget = NormalizeServerPath(targetPath);
+        var soap = new Soap.TfvcSoapClient(_connection);
+
+        var owner = await _connection.GetAuthenticatedUserGuidAsync(ct).ConfigureAwait(false)
+            ?? throw new InvalidOperationException(
+                "SOAP conflict preview could not resolve the authenticated user identity. "
+                + "Ensure the PAT is valid or pass --soap-owner.");
+
+        var workspaceName = $"arm-tfs-preview-{Guid.NewGuid():N}";
+        var computer = Environment.MachineName;
+        var mergeTempRoot = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "arm-tfs-preview", workspaceName);
+        var workingFolders = new[]
+        {
+            (normalizedTarget, System.IO.Path.Combine(mergeTempRoot, "target")),
+            (normalizedSource, System.IO.Path.Combine(mergeTempRoot, "source")),
+        };
+        SoapWorkspaceCreated? createdWs = null;
+
+        try
+        {
+            var created = await soap.CreateWorkspaceAsync(
+                workspaceName, owner, computer, "arm-tfs conflict preview", workingFolders, ct).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(created.Owner))
+                owner = created.Owner;
+            createdWs = new SoapWorkspaceCreated(workspaceName, owner);
+
+            var pend = await soap.PendMergeAsync(
+                workspaceName, owner,
+                normalizedSource, normalizedTarget,
+                fromChangeset, toChangeset,
+                ct).ConfigureAwait(false);
+
+            return pend.Conflicts
+                .Select(c => new MergeConflictPreview
+                {
+                    SourceServerPath = c.SourceServerItem,
+                    TargetServerPath = c.TargetServerItem,
+                    ConflictType = c.ConflictType,
+                })
+                .ToList();
+        }
+        finally
+        {
+            if (createdWs is not null)
+            {
+                try
+                {
+                    await soap.DeleteWorkspaceAsync(createdWs.Name, createdWs.Owner, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"warning: failed to delete temp SOAP preview workspace '{createdWs.Name}': {ex.Message}");
+                }
+            }
+        }
+    }
 
     private async Task VerifyMergeChangesetAppliedAsync(
         int createdChangesetId,

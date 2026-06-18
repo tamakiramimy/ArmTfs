@@ -17,6 +17,7 @@ import type {
   MergeBaseResponse,
   MergeCandidateResponse,
   MergeExecuteResponse,
+  MergePreviewConflictsResponse,
   StatusResponse,
 } from './contracts';
 
@@ -342,6 +343,30 @@ export class ArmTfsCliClient {
     }
 
     return this.executeJson<MergeExecuteResponse>(args, runOptions);
+  }
+
+  mergePreviewConflictsJson(
+    sourcePath: string,
+    targetPath: string,
+    from: number,
+    to: number,
+    runOptions?: ArmTfsRunOptions,
+  ): Promise<MergePreviewConflictsResponse> {
+    const args = [
+      'merge',
+      'preview-conflicts',
+      '--source',
+      sourcePath,
+      '--target',
+      targetPath,
+      '--from',
+      String(from),
+      '--to',
+      String(to),
+      '--format',
+      'json',
+    ];
+    return this.executeJson<MergePreviewConflictsResponse>(args, runOptions);
   }
 
   /**

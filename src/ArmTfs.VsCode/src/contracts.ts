@@ -286,6 +286,17 @@ export interface MergeCandidateResponse extends JsonEnvelope {
   }>;
 }
 
+export interface MergePreviewConflictsResponse extends JsonEnvelope {
+  command: 'merge.preview-conflicts';
+  query: { sourcePath: string; targetPath: string; from: number; to: number };
+  conflictCount: number;
+  conflicts: Array<{
+    sourceServerPath: string;
+    targetServerPath: string;
+    conflictType: string;
+  }>;
+}
+
 export interface MergeExecuteResponse extends JsonEnvelope {
   command: 'merge.execute';
   result: {

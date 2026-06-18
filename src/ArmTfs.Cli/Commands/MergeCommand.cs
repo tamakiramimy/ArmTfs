@@ -16,6 +16,80 @@ public static class MergeCommand
         cmd.AddCommand(BuildCandidate(config));
         cmd.AddCommand(BuildBase(config));
         cmd.AddCommand(BuildExecute(config));
+        cmd.AddCommand(BuildPreviewConflicts(config));
+        return cmd;
+    }
+
+    private static Command BuildPreviewConflicts(TfsConfig config)
+    {
+        var cmd = new Command("preview-conflicts", "Preview real merge conflicts (server 3-way) for a changeset range without committing. Uses SOAP.");
+        var sourceOpt = new Option<string>("--source") { Description = "Source branch or folder path ($/...)" };
+        var targetOpt = new Option<string>("--target") { Description = "Target branch or folder path ($/...)" };
+        var fromOpt = new Option<int>("--from") { Description = "From source changeset (inclusive)", IsRequired = true };
+        var toOpt = new Option<int>("--to") { Description = "To source changeset (inclusive)", IsRequired = true };
+        var formatOpt = new Option<string>("--format", () => "table") { Description = "Output format: table | json" };
+
+        sourceOpt.IsRequired = true;
+        targetOpt.IsRequired = true;
+
+        cmd.AddOption(sourceOpt);
+        cmd.AddOption(targetOpt);
+        cmd.AddOption(fromOpt);
+        cmd.AddOption(toOpt);
+        cmd.AddOption(formatOpt);
+
+        cmd.SetHandler(async (source, target, from, to, format) =>
+        {
+            using var conn = new TfsConnection(config);
+            var svc = new TfvcClientService(conn);
+
+            try
+            {
+                var resolvedSource = ResolveServerPath(source);
+                var resolvedTarget = ResolveServerPath(target);
+                var conflicts = await svc.PreviewMergeConflictsAsync(resolvedSource, resolvedTarget, from, to).ConfigureAwait(false);
+
+                if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+                {
+                    JsonOutput.Write(new
+                    {
+                        schemaVersion = 1,
+                        command = "merge.preview-conflicts",
+                        query = new { sourcePath = resolvedSource, targetPath = resolvedTarget, from, to },
+                        conflictCount = conflicts.Count,
+                        conflicts = conflicts.Select(c => new
+                        {
+                            sourceServerPath = c.SourceServerPath,
+                            targetServerPath = c.TargetServerPath,
+                            conflictType = c.ConflictType,
+                        }),
+                    });
+                    return;
+                }
+
+                Console.WriteLine($"Source    : {resolvedSource}");
+                Console.WriteLine($"Target    : {resolvedTarget}");
+                Console.WriteLine($"Range     : cs#{from} ~ cs#{to}");
+                Console.WriteLine($"Conflicts : {conflicts.Count}");
+                if (conflicts.Count > 0)
+                {
+                    Console.WriteLine();
+                    foreach (var c in conflicts)
+                        Console.WriteLine($"  {c.TargetServerPath}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Error: {ex.Message}");
+                if (ex is ArmTfs.Core.Client.Soap.SoapFaultException soap && !string.IsNullOrEmpty(soap.RawResponse))
+                {
+                    Console.Error.WriteLine("Raw response:");
+                    Console.Error.WriteLine(soap.RawResponse[..Math.Min(1500, soap.RawResponse.Length)]);
+                }
+                Environment.ExitCode = 1;
+            }
+        }, sourceOpt, targetOpt, fromOpt, toOpt, formatOpt);
+
         return cmd;
     }
 
