@@ -512,6 +512,17 @@ public sealed class TfvcClientService
             if (locallyMergedIds?.Contains(changeset.ChangesetId) == true)
                 continue;
 
+            // Filter: this source changeset is itself a merge FROM the target branch
+            // (a "trunk → branch" merge recorded by arm-tfs). Its content originates from
+            // the target, so merging it back is redundant. Detect via its own comment marker.
+            var ownMarker = MergeCommentMarker.Parse(changeset.Comment);
+            if (ownMarker is not null
+                && IsSameOrDescendantPath(targetPath, ownMarker.SourcePath)
+                && IsSameOrDescendantPath(sourcePath, ownMarker.TargetPath))
+            {
+                continue;
+            }
+
             var detail = await GetChangesetAsync(changeset.ChangesetId, ct).ConfigureAwait(false);
             if (IsChangesetOriginatingFromTarget(detail, sourcePath, targetPath))
                 continue;
@@ -581,6 +592,7 @@ public sealed class TfvcClientService
                 sourceChangesetId,
                 comment,
                 soapOwner,
+                resolutions,
                 ct).ConfigureAwait(false);
         }
 
@@ -595,10 +607,13 @@ public sealed class TfvcClientService
         var tfvcChanges = new List<TfvcChange>();
         var expectedContentByTarget = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         var expectedDeletes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var resolutionBySource = (resolutions ?? Array.Empty<MergeExecutionResolution>())
-            .Where(item => !string.IsNullOrWhiteSpace(item.SourceServerPath))
-            .GroupBy(item => NormalizeServerPath(item.SourceServerPath), StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(group => group.Key, group => group.Last(), StringComparer.OrdinalIgnoreCase);
+        var resolutionBySource = BuildResolutionBySource(resolutions);
+
+        // Pre-assess conflicts (downloads 3-way content for auto-take-source files). The result is
+        // reused both to block the merge on unresolved conflicts and to avoid a second source fetch.
+        var conflictAssessments = await AssessMergeConflictsAsync(
+            detail, normalizedSource, normalizedTarget, mergeBase, resolutionBySource, ct).ConfigureAwait(false);
+        var hasBlockingConflict = false;
 
         foreach (var change in detail.Changes ?? Array.Empty<TfvcChange>())
         {
@@ -679,6 +694,8 @@ public sealed class TfvcClientService
                 continue;
             }
 
+            conflictAssessments.TryGetValue(NormalizeServerPath(sourceItemPath), out var assessed);
+
             byte[]? content = null;
             var requiresContent = targetChangeType.HasFlag(VersionControlChangeType.Add) || targetChangeType.HasFlag(VersionControlChangeType.Edit);
             if (resolutionChoice == "manual")
@@ -687,7 +704,34 @@ public sealed class TfvcClientService
             }
             else if (requiresContent)
             {
-                content = await DownloadFileContentAsync(sourceItemPath, change.Item?.ChangesetVersion ?? sourceChangesetId, ct).ConfigureAwait(false);
+                // Reuse the source content already fetched by the conflict assessment when available
+                // (avoids a second download of the same source version).
+                content = (assessed is not null && assessed.SourceContent is not null)
+                    ? assessed.SourceContent
+                    : await DownloadFileContentAsync(sourceItemPath, change.Item?.ChangesetVersion ?? sourceChangesetId, ct).ConfigureAwait(false);
+            }
+
+            // Conflict detection: when both source and target modified the same file relative to the
+            // merge base AND no explicit resolution was provided, mark the change as a conflict and
+            // block the merge — never silently overwrite the target with the source version. The user
+            // must provide a resolution (source/target/manual) before the merge can proceed.
+            if (resolutionChoice is null && assessed is not null && assessed.IsConflict)
+            {
+                hasBlockingConflict = true;
+                plannedChanges.Add(new MergeExecutionChange
+                {
+                    SourceServerPath = sourceItemPath,
+                    TargetServerPath = targetServerPath,
+                    SourceChangesetId = sourceChangesetId,
+                    SourceChangeType = change.ChangeType.ToString(),
+                    TargetChangeType = targetChangeType.ToString(),
+                    TargetExists = true,
+                    HasContent = content is not null,
+                    Status = "conflict",
+                    Resolution = resolutionChoice,
+                    Note = "Both source and target modified this file since the merge base. Provide a resolution (source/target/manual) to proceed.",
+                });
+                continue;
             }
 
             plannedChanges.Add(new MergeExecutionChange
@@ -725,9 +769,19 @@ public sealed class TfvcClientService
             }
         }
 
-        if (dryRun || tfvcChanges.Count == 0)
+        if (dryRun || tfvcChanges.Count == 0 || (!dryRun && hasBlockingConflict))
         {
-            if (!dryRun && tfvcChanges.Count == 0)
+            if (!dryRun && hasBlockingConflict)
+            {
+                var conflictCount = plannedChanges.Count(c => string.Equals(c.Status, "conflict", StringComparison.OrdinalIgnoreCase));
+                warnings.Add($"Merge aborted: {conflictCount} file(s) have unresolved conflicts. Provide a resolution (source/target/manual) for each conflicted file and retry.");
+            }
+            else if (dryRun && hasBlockingConflict)
+            {
+                var conflictCount = plannedChanges.Count(c => string.Equals(c.Status, "conflict", StringComparison.OrdinalIgnoreCase));
+                warnings.Add($"{conflictCount} conflict(s) detected. Resolve them (source/target/manual) before executing the merge.");
+            }
+            else if (!dryRun && tfvcChanges.Count == 0)
                 warnings.Add("No executable merge changes were produced for the requested source changeset.");
 
             return new MergeExecutionResult
@@ -1251,12 +1305,127 @@ public sealed class TfvcClientService
 
             var sourceContent = await DownloadFileContentAsync(sourceItemPath, sourceVersion, ct).ConfigureAwait(false);
             var targetContent = await DownloadFileContentAsync(targetItemPath, null, ct).ConfigureAwait(false);
-            if (!sourceContent.AsSpan().SequenceEqual(targetContent))
+            if (!ContentEquals(sourceContent, targetContent))
                 return false;
         }
 
         return true;
     }
+
+    /// <summary>
+    /// 判定相对 merge base 是否存在内容冲突：目标侧已改动，且目标当前内容既不是 base 版本、
+    /// 也不同于源侧内容（即源与目标都改了同一文件且结果不一致）。
+    /// 纯函数，便于单元测试。任一输入为 null 时返回 false（无法判定，按非冲突处理）。
+    /// </summary>
+    private static bool IsContentConflict(byte[]? targetCurrent, byte[]? targetBase, byte[]? sourceContent)
+    {
+        if (targetCurrent is null || targetBase is null || sourceContent is null)
+            return false;
+
+        // Target unchanged since base → no conflict (only source side changed).
+        if (ContentEquals(targetCurrent, targetBase))
+            return false;
+
+        // Target already matches source → no conflict (same end state).
+        if (ContentEquals(targetCurrent, sourceContent))
+            return false;
+
+        return true;
+    }
+
+    /// <summary>
+    /// 对源 changeset 中每个可能"用源覆盖目标"的文件，预先评估是否存在冲突。
+    /// 仅对 (a) 源路径属于合并源、(b) 非 folder、(c) 非 metadata-only、(d) 源变更为 Add/Edit/Branch、
+    /// (e) 目标已存在、(f) 未提供显式 resolution（resolutionChoice 为 null）的文件下载三方内容并判定。
+    /// 显式 resolution（source/target/manual）由调用方语义保证不再视为阻断冲突，故不在此评估。
+    /// 返回按规范化源路径索引的评估结果（含已下载的源内容，供后续合并复用，避免重复下载）。
+    /// </summary>
+    private async Task<Dictionary<string, MergeConflictAssessment>> AssessMergeConflictsAsync(
+        TfvcChangeset detail,
+        string normalizedSource,
+        string normalizedTarget,
+        MergeBaseInfo mergeBase,
+        IReadOnlyDictionary<string, MergeExecutionResolution> resolutionBySource,
+        CancellationToken ct)
+    {
+        var assessments = new Dictionary<string, MergeConflictAssessment>(StringComparer.OrdinalIgnoreCase);
+        var baseChangesetId = mergeBase.TargetBranchPointChangesetId ?? mergeBase.SourceBranchPointChangesetId;
+        if (!baseChangesetId.HasValue)
+            return assessments;
+
+        foreach (var change in detail.Changes ?? Array.Empty<TfvcChange>())
+        {
+            var sourceItemPath = change.Item?.Path;
+            if (string.IsNullOrEmpty(sourceItemPath) || !IsSameOrDescendantPath(sourceItemPath, normalizedSource))
+                continue;
+            if (change.Item?.IsFolder == true)
+                continue;
+            if (IsMergeMetadataOnly(change.ChangeType))
+                continue;
+            if (!CanForceSourceContentMerge(change.ChangeType))
+                continue;
+
+            resolutionBySource.TryGetValue(NormalizeServerPath(sourceItemPath), out var resolution);
+            var resolutionChoice = NormalizeResolutionChoice(resolution?.Choice);
+
+            // Only the auto-take-source path (no explicit resolution) needs conflict detection.
+            // Explicit source/target/manual are user resolutions and must not block.
+            if (resolutionChoice is not null)
+                continue;
+
+            var targetServerPath = RemapServerPath(sourceItemPath, normalizedSource, normalizedTarget);
+            var targetVersion = await TryGetItemVersionAsync(targetServerPath, ct).ConfigureAwait(false);
+            if (!targetVersion.HasValue)
+                continue; // target doesn't exist → Add, no conflict possible.
+
+            var sourceVersion = change.Item?.ChangesetVersion > 0
+                ? change.Item.ChangesetVersion
+                : detail.ChangesetId;
+
+            byte[]? sourceContent = null;
+            byte[]? targetCurrent = null;
+            byte[]? targetBase = null;
+            try
+            {
+                sourceContent = await DownloadFileContentAsync(sourceItemPath, sourceVersion, ct).ConfigureAwait(false);
+                targetCurrent = await DownloadFileContentAsync(targetServerPath, null, ct).ConfigureAwait(false);
+                targetBase = await DownloadFileContentAsync(targetServerPath, baseChangesetId.Value, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Unable to fetch one of the three versions (e.g., file didn't exist at base).
+                // Cannot assess → treat as non-conflict; the merge loop will proceed (take source).
+                continue;
+            }
+
+            assessments[NormalizeServerPath(sourceItemPath)] = new MergeConflictAssessment(
+                SourceServerPath: sourceItemPath,
+                TargetServerPath: targetServerPath,
+                SourceContent: sourceContent,
+                IsConflict: IsContentConflict(targetCurrent, targetBase, sourceContent),
+                ResolutionChoice: null);
+        }
+
+        return assessments;
+    }
+
+    /// <summary>从 resolutions 列表构建按规范化源路径索引的字典（重复键取最后一个）。</summary>
+    private static Dictionary<string, MergeExecutionResolution> BuildResolutionBySource(
+        IReadOnlyList<MergeExecutionResolution>? resolutions)
+    {
+        return (resolutions ?? Array.Empty<MergeExecutionResolution>())
+            .Where(item => !string.IsNullOrWhiteSpace(item.SourceServerPath))
+            .GroupBy(item => NormalizeServerPath(item.SourceServerPath), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Last(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>单文件冲突评估结果（含已下载的源内容，便于合并阶段复用）。</summary>
+    private sealed record MergeConflictAssessment(
+        string SourceServerPath,
+        string TargetServerPath,
+        byte[]? SourceContent,
+        bool IsConflict,
+        string? ResolutionChoice);
 
     private static bool IsChangesetOriginatingFromTarget(
         TfvcChangeset detail,

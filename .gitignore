@@ -12,3 +12,4 @@ tests/*/obj/*
 .gitignore
 .codebuddy/memory/2025-06-17.md
 .codebuddy/memory/MEMORY.md
+Temp-arm-tfs/

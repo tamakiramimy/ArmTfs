@@ -627,46 +627,6 @@
           "group": "context@9"
         },
         {
-          "command": "armTfs.sidebar.checkoutBranch",
-          "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
-          "group": "context@10"
-        },
-        {
-          "command": "armTfs.sidebar.pullBranch",
-          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
-          "group": "context@1"
-        },
-        {
-          "command": "armTfs.sidebar.checkoutBranch",
-          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
-          "group": "context@2"
-        },
-        {
-          "command": "armTfs.sidebar.copyTfvcPath",
-          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
-          "group": "context@3"
-        },
-        {
-          "command": "armTfs.sidebar.mergeFromBranch",
-          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
-          "group": "context@4"
-        },
-        {
-          "command": "armTfs.sidebar.addBranch",
-          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
-          "group": "context@5"
-        },
-        {
-          "command": "armTfs.sidebar.showBranchHistory",
-          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
-          "group": "context@6"
-        },
-        {
-          "command": "armTfs.checkoutServerPathToFolder",
-          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
-          "group": "context@7"
-        },
-        {
           "command": "armTfs.history.diffPrevious",
           "when": "view == armTfs.historyGraph && viewItem == armTfsSidebarChangeset",
           "group": "inline@1"
@@ -700,6 +660,36 @@
           "command": "armTfs.changes.revertLocal",
           "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|localChanges)/",
           "group": "context@1"
+        },
+        {
+          "command": "armTfs.sidebar.pullBranch",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "1_sync@1"
+        },
+        {
+          "command": "armTfs.checkoutServerPathToFolder",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "1_sync@2"
+        },
+        {
+          "command": "armTfs.sidebar.mergeFromBranch",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "2_branch@1"
+        },
+        {
+          "command": "armTfs.sidebar.addBranch",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "2_branch@2"
+        },
+        {
+          "command": "armTfs.sidebar.showBranchHistory",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "3_info@1"
+        },
+        {
+          "command": "armTfs.sidebar.copyTfvcPath",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "3_info@2"
         }
       ],
       "scm/title": [
