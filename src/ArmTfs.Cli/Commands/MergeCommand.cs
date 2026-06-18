@@ -29,8 +29,8 @@ public static class MergeCommand
         var dryRunOpt = new Option<bool>("--dry-run") { Description = "Show the merge plan without creating a TFVC changeset" };
         var resolutionFileOpt = new Option<FileInfo?>("--resolution-file") { Description = "JSON file with per-file merge resolutions" };
         var formatOpt = new Option<string>("--format", () => "table") { Description = "Output format: table | json" };
-        var modeOpt = new Option<string>("--mode", () => "rest") { Description = "Merge protocol: rest (default, take-source) | soap (real merge history via Repository.asmx)" };
-        var soapOwnerOpt = new Option<string?>("--soap-owner") { Description = "Owner identity (DOMAIN\\\\user or user@domain) for the temporary SOAP workspace. Required when --mode soap." };
+        var modeOpt = new Option<string>("--mode", () => "soap") { Description = "Merge protocol: soap (default, real merge history via Repository.asmx) | rest (take-source, no merge history)" };
+        var soapOwnerOpt = new Option<string?>("--soap-owner") { Description = "Owner identity (DOMAIN\\\\user or user@domain) for the temporary SOAP workspace. Defaults to configured username, then auto-inferred from the authenticated user's existing workspaces." };
 
         sourceOpt.IsRequired = true;
         targetOpt.IsRequired = true;
@@ -54,7 +54,7 @@ public static class MergeCommand
             var dryRun = ctx.ParseResult.GetValueForOption(dryRunOpt);
             var resolutionFile = ctx.ParseResult.GetValueForOption(resolutionFileOpt);
             var format = ctx.ParseResult.GetValueForOption(formatOpt) ?? "table";
-            var mode = ctx.ParseResult.GetValueForOption(modeOpt) ?? "rest";
+            var mode = ctx.ParseResult.GetValueForOption(modeOpt) ?? "soap";
             var soapOwner = ctx.ParseResult.GetValueForOption(soapOwnerOpt) ?? config.Username;
 
             var ws = WorkspaceManager.FindWorkspace(Directory.GetCurrentDirectory());
@@ -111,6 +111,16 @@ public static class MergeCommand
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"Error: {ex.Message}");
+                if (ex is ArmTfs.Core.Client.Soap.SoapFaultException soap)
+                {
+                    Console.Error.WriteLine($"SOAP method  : {soap.Method}");
+                    Console.Error.WriteLine($"HTTP status  : {(int)soap.StatusCode} {soap.StatusCode}");
+                    if (!string.IsNullOrEmpty(soap.RawResponse))
+                    {
+                        Console.Error.WriteLine("Raw response :");
+                        Console.Error.WriteLine(soap.RawResponse[..Math.Min(2000, soap.RawResponse.Length)]);
+                    }
+                }
                 Environment.ExitCode = 1;
             }
         });

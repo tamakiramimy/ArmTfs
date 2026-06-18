@@ -224,13 +224,41 @@ public class TfvcSoapClientTests
             </soap:Envelope>
             """));
 
-        var ops = await soap.PendMergeAsync("ws", "alice", "$/P/Src", "$/P/Tgt", 100, 100);
+        var result = await soap.PendMergeAsync("ws", "alice", "$/P/Src", "$/P/Tgt", 100, 100);
+        var ops = result.Operations;
         Assert.Equal(2, ops.Count);
         Assert.Equal(555, ops[0].ItemId);
         Assert.Equal("$/P/Src/a.cs", ops[0].SourceServerItem);
         Assert.Equal("$/P/Tgt/a.cs", ops[0].TargetServerItem);
         Assert.Equal("Merge|Edit", ops[0].ChangeType);
         Assert.Equal(100, ops[0].VersionTo);
+        Assert.Empty(result.Conflicts);
+    }
+
+    [Fact]
+    public async Task PendMerge_parses_conflicts()
+    {
+        var soap = BuildSoapWithFakeHandler(_ => CreateXmlResponse("""
+            <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+              <soap:Body>
+                <MergeResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                  <MergeResult />
+                  <conflicts>
+                    <Conflict ysitem="$/P/Tgt/a.cs" tsitem="$/P/Src/a.cs" ctype="Merge" bchg="Edit Merge" isresolved="false" />
+                    <Conflict ysitem="$/P/Tgt/b.cs" tsitem="$/P/Src/b.cs" ctype="Merge" bchg="Encoding Branch Merge" isresolved="true" />
+                  </conflicts>
+                </MergeResponse>
+              </soap:Body>
+            </soap:Envelope>
+            """));
+
+        var result = await soap.PendMergeAsync("ws", "alice", "$/P/Src", "$/P/Tgt", 100, 100);
+        Assert.Empty(result.Operations);
+        // Only the UNRESOLVED conflict (isresolved="false") is reported; the resolved one is skipped.
+        Assert.Single(result.Conflicts);
+        Assert.Equal("$/P/Tgt/a.cs", result.Conflicts[0].TargetServerItem);
+        Assert.Equal("$/P/Src/a.cs", result.Conflicts[0].SourceServerItem);
+        Assert.Equal("Merge", result.Conflicts[0].ConflictType);
     }
 
     [Fact]
@@ -239,10 +267,13 @@ public class TfvcSoapClientTests
         var soap = BuildSoapWithFakeHandler(req =>
         {
             var body = req.Content!.ReadAsStringAsync().Result;
-            // The MergeSources metadata should be in the request
-            Assert.Contains("mergeSource=", body);
-            Assert.Contains("mergeFrom=", body);
-            Assert.Contains("mergeTo=", body);
+            // CheckIn must send merge lineage as <MergeSource s= vf= vt=> inside <MergeSources>
+            // (per Repository.asmx WSDL), plus the required checkinOptions/deferCheckIn/checkInTicket.
+            Assert.Contains("<tns:MergeSource", body);
+            Assert.Contains("vf=", body);
+            Assert.Contains("vt=", body);
+            Assert.Contains("<tns:checkinOptions>None</tns:checkinOptions>", body);
+            Assert.Contains("<tns:checkInTicket>0</tns:checkInTicket>", body);
             return CreateXmlResponse("""
                 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
                   <soap:Body>
@@ -277,6 +308,85 @@ public class TfvcSoapClientTests
         var soap = BuildSoapWithFakeHandler(_ => CreateXmlResponse("<root/>"));
         await Assert.ThrowsAsync<ArgumentException>(() =>
             soap.CheckInAsync("ws", "alice", "comment", Array.Empty<Models.Soap.SoapPendingChange>()));
+    }
+
+    [Fact]
+    public async Task Invoke_throws_on_fault_returned_with_http_200()
+    {
+        // TFS frequently returns a SOAP <Fault> with HTTP 200 (not 5xx). InvokeAsync must detect
+        // the Fault element in the body regardless of status code and surface the real message.
+        var soap = BuildSoapWithFakeHandler(_ => CreateXmlResponse("""
+            <?xml version="1.0"?>
+            <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+              <soap:Body>
+                <soap:Fault>
+                  <faultcode>soap:Server</faultcode>
+                  <faultstring>TF14061: The workspace owner cannot be different from the authenticated user.</faultstring>
+                </soap:Fault>
+              </soap:Body>
+            </soap:Envelope>
+            """));
+
+        var ex = await Assert.ThrowsAsync<SoapFaultException>(() =>
+            soap.CreateWorkspaceAsync("ws", "WRONG\\owner", "PC1", "test"));
+        Assert.Equal("CreateWorkspace", ex.Method);
+        Assert.Equal(HttpStatusCode.OK, ex.StatusCode);
+        Assert.Contains("TF14061", ex.FaultMessage);
+    }
+
+    [Fact]
+    public async Task CreateWorkspace_parses_CreateWorkspaceResult_shape()
+    {
+        // Real TFS returns the created workspace as <CreateWorkspaceResult .../> with attributes
+        // on the result element (no child <Workspace>). Regression guard for the parser.
+        var soap = BuildSoapWithFakeHandler(_ => CreateXmlResponse("""
+            <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+              <soap:Body>
+                <CreateWorkspaceResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                  <CreateWorkspaceResult computer="MR50240429MC1" islocal="false" name="arm-tfs-soap-merge-abc" owner="8adbeef9-f3da-4bd2-8d3f-7974d73f8b18" ownerdisp="杨峰" permissions="9">
+                    <Comment>arm-tfs SOAP merge</Comment>
+                    <Folders />
+                    <LastAccessDate>2026-06-18T16:32:21.82Z</LastAccessDate>
+                  </CreateWorkspaceResult>
+                </CreateWorkspaceResponse>
+              </soap:Body>
+            </soap:Envelope>
+            """));
+
+        var ws = await soap.CreateWorkspaceAsync("arm-tfs-soap-merge-abc", "8adbeef9-f3da-4bd2-8d3f-7974d73f8b18", "MR50240429MC1", "arm-tfs SOAP merge");
+
+        Assert.Equal("arm-tfs-soap-merge-abc", ws.Name);
+        Assert.Equal("MR50240429MC1", ws.Computer);
+        Assert.Equal("8adbeef9-f3da-4bd2-8d3f-7974d73f8b18", ws.Owner);
+        Assert.Equal("杨峰", ws.OwnerDisplay);
+        Assert.Equal("Server", ws.Location);
+        Assert.Equal("arm-tfs SOAP merge", ws.Comment);
+    }
+
+    [Fact]
+    public async Task PendMerge_sends_itemspec_and_optionsEx_per_wsdl()
+    {
+        string capturedBody = string.Empty;
+        var soap = BuildSoapWithFakeHandler(req =>
+        {
+            capturedBody = req.Content!.ReadAsStringAsync().Result;
+            return CreateXmlResponse("""
+                <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                  <soap:Body><MergeResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03"><MergeResult /></MergeResponse></soap:Body>
+                </soap:Envelope>
+                """);
+        });
+
+        await soap.PendMergeAsync("ws", "alice", "$/P/Src", "$/P/Tgt", 100, 100);
+
+        // source/target must be ItemSpec elements (item= attribute), not plain strings.
+        Assert.Contains("<tns:source item=\"$/P/Src\"", capturedBody);
+        Assert.Contains("<tns:target item=\"$/P/Tgt\"", capturedBody);
+        // ChangesetVersionSpec.cs is an attribute.
+        Assert.Contains("cs=\"100\"", capturedBody);
+        Assert.DoesNotContain("<tns:cs>", capturedBody);
+        // optionsEx is required (minOccurs=1).
+        Assert.Contains("<tns:optionsEx>0</tns:optionsEx>", capturedBody);
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────

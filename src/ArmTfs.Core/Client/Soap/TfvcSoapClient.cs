@@ -62,19 +62,33 @@ public sealed class TfvcSoapClient
         using var response = await httpClient.SendAsync(request, ct).ConfigureAwait(false);
         var xml = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
-        if (!response.IsSuccessStatusCode)
-        {
-            throw new SoapFaultException(method, response.StatusCode, ExtractFaultMessage(xml), xml);
-        }
-
+        // Parse defensively — TFS error bodies are usually XML but not always.
+        XDocument? doc = null;
         try
         {
-            return XDocument.Parse(xml);
+            doc = XDocument.Parse(xml);
         }
-        catch (System.Xml.XmlException ex)
+        catch (System.Xml.XmlException)
         {
-            throw new SoapFaultException(method, response.StatusCode, $"Malformed SOAP response: {ex.Message}", xml);
+            // Non-XML body; handled below.
         }
+
+        // TFS frequently returns a SOAP <Fault> with HTTP 200 (not just 5xx). Detect a Fault
+        // element in the body regardless of status code so callers see the real server error
+        // (e.g. TF14061 owner mismatch, TF14050 permission) instead of an opaque "missing
+        // element" message downstream.
+        var faultEl = doc?.Descendants().FirstOrDefault(e => e.Name.LocalName == "Fault");
+        if (!response.IsSuccessStatusCode || faultEl is not null)
+        {
+            var message = faultEl is not null
+                ? ExtractFaultMessage(xml)
+                : (string.IsNullOrWhiteSpace(xml)
+                    ? $"HTTP {(int)response.StatusCode} {response.StatusCode} (empty body)"
+                    : xml[..Math.Min(500, xml.Length)]);
+            throw new SoapFaultException(method, response.StatusCode, message, xml);
+        }
+
+        return doc ?? throw new SoapFaultException(method, response.StatusCode, "Empty SOAP response", xml);
     }
 
     /// <summary>从响应 XML 中提取 <c>&lt;faultstring&gt;</c>；解析失败时返回前 500 字符。</summary>
@@ -200,35 +214,51 @@ public sealed class TfvcSoapClient
     /// <param name="comment">备注</param>
     public async Task<SoapWorkspace> CreateWorkspaceAsync(
         string name,
-        string ownerName,
+        string? ownerName,
         string computer,
         string? comment = null,
+        IReadOnlyList<(string ServerItem, string LocalPath)>? workingFolders = null,
         CancellationToken ct = default)
     {
-        // location="Server" 表示服务端 workspace（不需要本地工作目录）
+        // OwnerName is REQUIRED by TFS (omitting it throws ArgumentNullException). The caller must
+        // pass the authenticated user's identity (GUID) — see TfvcClientService owner resolution.
+        // PendMerge requires a working-folder mapping for the merge target, so the caller passes one.
+        var foldersXml = (workingFolders is null || workingFolders.Count == 0)
+            ? "<tns:Folders />"
+            : "<tns:Folders>" + string.Concat(workingFolders.Select(f =>
+                $@"<tns:WorkingFolder item=""{Esc(f.ServerItem)}"" local=""{Esc(f.LocalPath)}"" type=""Map"" />")) + "</tns:Folders>";
+
         var body = $@"    <tns:CreateWorkspace>
-      <tns:workspace name=""{Esc(name)}"" owner=""{Esc(ownerName)}"" computer=""{Esc(computer)}"" location=""Server"">
+      <tns:workspace name=""{Esc(name)}"" owner=""{Esc(ownerName ?? string.Empty)}"" computer=""{Esc(computer)}"" location=""Server"">
         <tns:Comment>{Esc(comment ?? string.Empty)}</tns:Comment>
-        <tns:Folders />
+        {foldersXml}
         <tns:LastAccessDate>0001-01-01T00:00:00</tns:LastAccessDate>
       </tns:workspace>
     </tns:CreateWorkspace>";
 
         var doc = await InvokeAsync("CreateWorkspace", body, ct).ConfigureAwait(false);
 
-        var ws = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "Workspace");
+        // TFS returns the created workspace as <CreateWorkspaceResult .../> with the workspace
+        // attributes (name/owner/computer/ownerdisp/...) directly on the result element — NOT as a
+        // child <Workspace> element. Accept both shapes for robustness.
+        var ws = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "CreateWorkspaceResult")
+                ?? doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "Workspace");
         if (ws is null)
+        {
+            var raw = doc.ToString();
             throw new SoapFaultException("CreateWorkspace", System.Net.HttpStatusCode.OK,
-                "CreateWorkspace response did not contain a Workspace element", doc.ToString());
+                $"CreateWorkspace response did not contain a workspace element. Raw response (first 800 chars): {raw[..Math.Min(800, raw.Length)]}", raw);
+        }
 
         return new SoapWorkspace
         {
             Name = AttrAny(ws, "name") ?? name,
-            Owner = AttrAny(ws, "owner") ?? ownerName,
+            Owner = AttrAny(ws, "owner") ?? ownerName ?? string.Empty,
             OwnerDisplay = AttrAny(ws, "ownerdisp"),
             Computer = AttrAny(ws, "computer") ?? computer,
             Comment = ChildText(ws, "Comment") ?? comment ?? string.Empty,
-            Location = AttrAny(ws, "location"),
+            Location = AttrAny(ws, "location")
+                ?? (string.Equals(AttrAny(ws, "islocal"), "false", StringComparison.OrdinalIgnoreCase) ? "Server" : null),
         };
     }
 
@@ -257,7 +287,7 @@ public sealed class TfvcSoapClient
     /// <param name="targetPath">目标分支服务器路径</param>
     /// <param name="fromChangeset">起始 changeset；null 表示从最早开始</param>
     /// <param name="toChangeset">结束 changeset；null 表示到最新</param>
-    public async Task<IReadOnlyList<SoapMergeOperation>> PendMergeAsync(
+    public async Task<PendMergeResult> PendMergeAsync(
         string workspaceName,
         string ownerName,
         string sourcePath,
@@ -266,22 +296,27 @@ public sealed class TfvcSoapClient
         int? toChangeset,
         CancellationToken ct = default)
     {
+        // ChangesetVersionSpec.cs is an ATTRIBUTE (not a child element), per the Repository.asmx WSDL.
         var fromEl = fromChangeset.HasValue
-            ? $@"<tns:from xsi:type=""tns:ChangesetVersionSpec""><tns:cs>{fromChangeset.Value}</tns:cs></tns:from>"
+            ? $@"<tns:from xsi:type=""tns:ChangesetVersionSpec"" cs=""{fromChangeset.Value}"" />"
             : @"<tns:from xsi:nil=""true"" />";
         var toEl = toChangeset.HasValue
-            ? $@"<tns:to xsi:type=""tns:ChangesetVersionSpec""><tns:cs>{toChangeset.Value}</tns:cs></tns:to>"
-            : @"<tns:to xsi:type=""tns:LatestVersionSpec""/>";
+            ? $@"<tns:to xsi:type=""tns:ChangesetVersionSpec"" cs=""{toChangeset.Value}"" />"
+            : @"<tns:to xsi:type=""tns:LatestVersionSpec"" />";
 
+        // Per WSDL: source/target are ItemSpec (complexType with item/recurse/did attributes),
+        // NOT plain strings. optionsEx (int, minOccurs=1) is required and was previously omitted
+        // (TFS returned "项不能为 null 或空").
         var body = $@"    <tns:Merge>
       <tns:workspaceName>{Esc(workspaceName)}</tns:workspaceName>
       <tns:workspaceOwner>{Esc(ownerName)}</tns:workspaceOwner>
-      <tns:source>{Esc(sourcePath)}</tns:source>
-      <tns:target>{Esc(targetPath)}</tns:target>
+      <tns:source item=""{Esc(sourcePath)}"" recurse=""Full"" did=""0"" />
+      <tns:target item=""{Esc(targetPath)}"" recurse=""Full"" did=""0"" />
       {fromEl}
       {toEl}
       <tns:options>None</tns:options>
       <tns:lockLevel>Unchanged</tns:lockLevel>
+      <tns:optionsEx>0</tns:optionsEx>
     </tns:Merge>";
 
         var doc = await InvokeAsync("Merge", body, ct).ConfigureAwait(false);
@@ -294,7 +329,8 @@ public sealed class TfvcSoapClient
                 ItemId = TryParseInt(AttrAny(op, "itemid")) ?? 0,
                 SourceServerItem = AttrAny(op, "sitem") ?? AttrAny(op, "srcitem") ?? string.Empty,
                 TargetServerItem = AttrAny(op, "titem") ?? AttrAny(op, "targetitem") ?? string.Empty,
-                ChangeType = AttrAny(op, "ct") ?? AttrAny(op, "chgEx") ?? string.Empty,
+                // GetOperation exposes the pending change type as the `chg` attribute (ChangeType list).
+                ChangeType = AttrAny(op, "chg") ?? AttrAny(op, "ct") ?? string.Empty,
                 VersionFrom = TryParseInt(AttrAny(op, "vrevto"))
                               ?? TryParseInt(AttrAny(op, "mvfrom")),
                 VersionTo = TryParseInt(AttrAny(op, "sver"))
@@ -303,7 +339,28 @@ public sealed class TfvcSoapClient
             });
         }
 
-        return ops;
+        // The server's 3-way merge may pend CONFLICTS instead of operations when both sides changed
+        // the same file. These appear under <conflicts><Conflict .../> (ysitem = target/your side,
+        // tsitem = source/their side). Only UNRESOLVED conflicts (isresolved="false") block the
+        // check-in — resolved ones (isresolved="true", e.g. auto-resolved branch relationships) are
+        // informational and are ignored. Unresolved conflicts must be resolved before check-in; never
+        // silently take one side.
+        var conflicts = new List<SoapMergeConflict>();
+        foreach (var c in doc.Descendants().Where(e => e.Name.LocalName == "Conflict"))
+        {
+            var isResolved = string.Equals(AttrAny(c, "isresolved"), "true", StringComparison.OrdinalIgnoreCase);
+            if (isResolved)
+                continue;
+            conflicts.Add(new SoapMergeConflict
+            {
+                TargetServerItem = AttrAny(c, "ysitem") ?? string.Empty,
+                SourceServerItem = AttrAny(c, "tsitem") ?? string.Empty,
+                ConflictType = AttrAny(c, "ctype") ?? string.Empty,
+                BaseChangeType = AttrAny(c, "bchg") ?? string.Empty,
+            });
+        }
+
+        return new PendMergeResult { Operations = ops, Conflicts = conflicts };
     }
 
     /// <summary>
@@ -320,18 +377,24 @@ public sealed class TfvcSoapClient
         if (changes.Count == 0)
             throw new ArgumentException("CheckIn requires at least one pending change.", nameof(changes));
 
+        // Per WSDL: info.Changes is ArrayOfChange. Each <Change> has a required `type` (ChangeType)
+        // and `typeEx` (int) attribute, an <Item> child (server path, with required `date` attr), and
+        // a <MergeSources> child whose <MergeSource> entries (s/vf/vt attributes) are what make TFS
+        // record real merge history. The CheckIn method also requires checkinNotificationInfo,
+        // checkinOptions, deferCheckIn and checkInTicket (all minOccurs=1).
         var changesXml = new StringBuilder();
         foreach (var change in changes)
         {
-            var mergeSourceAttrs = string.Empty;
+            var mergeSourcesXml = string.Empty;
             if (!string.IsNullOrEmpty(change.SourceServerItem) && change.VersionTo.HasValue)
             {
                 var verFrom = change.VersionFrom ?? change.VersionTo.Value;
-                mergeSourceAttrs = $@" mergeSource=""{Esc(change.SourceServerItem)}"" mergeFrom=""{verFrom}"" mergeTo=""{change.VersionTo.Value}""";
+                mergeSourcesXml = $@"<tns:MergeSources><tns:MergeSource s=""{Esc(change.SourceServerItem)}"" vf=""{verFrom}"" vt=""{change.VersionTo.Value}"" /></tns:MergeSources>";
             }
 
+            var chg = string.IsNullOrEmpty(change.ChangeType) ? "Merge" : change.ChangeType;
             changesXml.AppendLine(
-                $@"          <tns:PendingChange itemid=""{change.ItemId}"" item=""{Esc(change.ServerItem)}"" chg=""{Esc(change.ChangeType)}""{mergeSourceAttrs} />");
+                $@"          <tns:Change type=""{Esc(chg)}"" typeEx=""0""><tns:Item itemid=""{change.ItemId}"" item=""{Esc(change.ServerItem)}"" type=""File"" date=""0001-01-01T00:00:00"" />{mergeSourcesXml}</tns:Change>");
         }
 
         var body = $@"    <tns:CheckIn>
@@ -339,11 +402,15 @@ public sealed class TfvcSoapClient
       <tns:ownerName>{Esc(ownerName)}</tns:ownerName>
       <tns:serverItems>
 {string.Concat(changes.Select(c => $"        <tns:string>{Esc(c.ServerItem)}</tns:string>\n"))}      </tns:serverItems>
-      <tns:info>
+      <tns:info date=""0001-01-01T00:00:00"" cset=""0"">
         <tns:Comment>{Esc(comment)}</tns:Comment>
         <tns:Changes>
 {changesXml}        </tns:Changes>
       </tns:info>
+      <tns:checkinNotificationInfo />
+      <tns:checkinOptions>None</tns:checkinOptions>
+      <tns:deferCheckIn>false</tns:deferCheckIn>
+      <tns:checkInTicket>0</tns:checkInTicket>
     </tns:CheckIn>";
 
         var doc = await InvokeAsync("CheckIn", body, ct).ConfigureAwait(false);

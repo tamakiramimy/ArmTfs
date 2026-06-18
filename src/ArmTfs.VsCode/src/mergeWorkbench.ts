@@ -894,7 +894,13 @@ function summarizeMergeResponse(response: MergeExecuteResponse): string {
 
 function findConflicts(candidate: MergeWorkbenchCandidate): MergeConflictView[] {
   return candidate.changes
-    .filter((change) => change.status.toLowerCase() === 'skipped')
+    .filter((change) => {
+      const status = change.status.toLowerCase();
+      // 'conflict' = both sides modified the same file (needs source/target/manual resolution).
+      // 'skipped'   = unsupported change type that the merge plan could not execute.
+      // Both must be surfaced and resolved before the merge can proceed.
+      return status === 'conflict' || status === 'skipped';
+    })
     .map((change) => ({
       id: `${candidate.changesetId}:${change.sourceServerPath}`,
       changesetId: candidate.changesetId,

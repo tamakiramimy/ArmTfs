@@ -89,6 +89,35 @@ public class TfsConnection : IDisposable
     }
 
     /// <summary>
+    /// 查询当前认证用户的身份 GUID（REST <c>_apis/connectionData</c>）。
+    /// SOAP CreateWorkspace 要求 OwnerName = 认证用户身份；用 GUID 最稳定。
+    /// 解析失败返回 null。
+    /// </summary>
+    public async Task<string?> GetAuthenticatedUserGuidAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            using var http = CreateHttpClient();
+            var url = ServerUrl.TrimEnd('/') + "/_apis/connectionData?api-version=5.0-preview";
+            using var resp = await http.GetAsync(url, ct).ConfigureAwait(false);
+            if (!resp.IsSuccessStatusCode)
+                return null;
+            var json = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("authenticatedUser", out var user)
+                && user.TryGetProperty("id", out var id))
+            {
+                return id.GetString();
+            }
+        }
+        catch
+        {
+            // Ignore — caller will surface a clear error if owner cannot be resolved.
+        }
+        return null;
+    }
+
+    /// <summary>
     /// 创建一个带有 TFS 认证头的 <see cref="HttpClient"/>，用于 SOAP 或其他非 REST 调用。
     /// </summary>
     public virtual HttpClient CreateHttpClient()

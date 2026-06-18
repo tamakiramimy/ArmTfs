@@ -865,11 +865,9 @@ public sealed class TfvcClientService
         int sourceChangesetId,
         string? comment,
         string? soapOwner,
+        IReadOnlyList<MergeExecutionResolution>? resolutions,
         CancellationToken ct)
     {
-        var owner = soapOwner ?? throw new InvalidOperationException(
-            "SOAP merge requires --soap-owner (DOMAIN\\\\user or user@domain) so the temporary server workspace can be created.");
-
         var mergeBase = await ResolveMergeBaseAsync(normalizedSource, normalizedTarget, ct).ConfigureAwait(false);
         var effectiveComment = string.IsNullOrWhiteSpace(comment)
             ? $"Merge cs#{sourceChangesetId} from {normalizedSource} to {normalizedTarget}"
@@ -881,21 +879,155 @@ public sealed class TfvcClientService
             + Models.MergeCommentMarker.Build(normalizedSource, sourceChangesetId, normalizedTarget);
 
         var soap = new Soap.TfvcSoapClient(_connection);
+        var resolutionBySource = BuildResolutionBySource(resolutions);
+        var warnings = new List<string>();
+
+        // Resolve the workspace owner = the authenticated user's identity GUID. TFS CreateWorkspace
+        // requires OwnerName and it MUST equal the authenticated user (else Merge fails with
+        // TF204017 no Use permission). We must NOT infer it from QueryWorkspaces — that returns other
+        // users' workspaces on this server and previously picked the wrong identity. The authenticated
+        // user's GUID comes from REST connectionData. An explicit --soap-owner overrides this.
+        var owner = soapOwner;
+        if (string.IsNullOrWhiteSpace(owner))
+        {
+            owner = await _connection.GetAuthenticatedUserGuidAsync(ct).ConfigureAwait(false);
+        }
+        if (string.IsNullOrWhiteSpace(owner))
+        {
+            throw new InvalidOperationException(
+                "SOAP merge could not resolve the authenticated user identity for the workspace owner. "
+                + "Pass --soap-owner explicitly, or ensure the PAT is valid.");
+        }
+
+        // Conflict pre-check (same logic as the REST path). Unresolved conflicts block the merge;
+        // content-level resolutions (source/manual) cannot be honored by the naive SOAP PendMerge+CheckIn
+        // flow, so they fall back to the REST execute path which handles per-file content correctly.
+        var detail = await GetChangesetAsync(sourceChangesetId, ct).ConfigureAwait(false);
+        var conflictAssessments = await AssessMergeConflictsAsync(
+            detail, normalizedSource, normalizedTarget, mergeBase, resolutionBySource, ct).ConfigureAwait(false);
+
+        var unresolvedConflicts = conflictAssessments.Values
+            .Where(a => a.IsConflict)
+            .Select(a => a.SourceServerPath)
+            .ToList();
+        if (unresolvedConflicts.Count > 0)
+        {
+            warnings.Add($"Merge aborted: {unresolvedConflicts.Count} file(s) have unresolved conflicts. Provide a resolution (source/target/manual) for each and retry.");
+            return new MergeExecutionResult
+            {
+                SourcePath = normalizedSource,
+                TargetPath = normalizedTarget,
+                SourceChangesetId = sourceChangesetId,
+                Comment = commentWithMarker,
+                DryRun = false,
+                CreatedChangesetId = null,
+                BaseInfo = mergeBase,
+                Changes = unresolvedConflicts.Select(p => new MergeExecutionChange
+                {
+                    SourceServerPath = p,
+                    TargetServerPath = RemapServerPath(p, normalizedSource, normalizedTarget),
+                    SourceChangesetId = sourceChangesetId,
+                    Status = "conflict",
+                    TargetExists = true,
+                    Note = "Both source and target modified this file since the merge base. Provide a resolution (source/target/manual) to proceed.",
+                }).ToList(),
+                Warnings = warnings,
+            };
+        }
+
+        var hasContentResolution = resolutionBySource.Values
+            .Any(r => NormalizeResolutionChoice(r.Choice) is "source" or "manual");
+        if (hasContentResolution)
+        {
+            // source/manual resolutions require content-level control that the SOAP flow can't apply
+            // per-file without full conflict-resolution plumbing. Fall back to REST (take-source /
+            // manual content), which is correct at the cost of not recording merge history for this
+            // changeset. Dedup is preserved via the comment marker + local merge-history.
+            warnings.Add("SOAP merge fell back to REST (take-source) for source/manual conflict resolutions; TFVC merge history not recorded for this changeset. Candidate dedup is preserved via the comment marker + local merge-history.");
+            var restResult = await MergeChangesetAsync(
+                normalizedSource, normalizedTarget, sourceChangesetId, comment,
+                dryRun: false, resolutions, mergeMode: "rest", soapOwner: soapOwner, ct).ConfigureAwait(false);
+            return new MergeExecutionResult
+            {
+                SourcePath = restResult.SourcePath,
+                TargetPath = restResult.TargetPath,
+                SourceChangesetId = restResult.SourceChangesetId,
+                Comment = restResult.Comment,
+                DryRun = restResult.DryRun,
+                CreatedChangesetId = restResult.CreatedChangesetId,
+                BaseInfo = restResult.BaseInfo,
+                Changes = restResult.Changes,
+                Warnings = warnings.Concat(restResult.Warnings).ToList(),
+            };
+        }
+
+        // "target" resolutions: keep the target version by omitting those files from the SOAP check-in.
+        var targetResolutionPaths = resolutionBySource.Values
+            .Where(r => NormalizeResolutionChoice(r.Choice) is "target")
+            .Select(r => NormalizeServerPath(RemapServerPath(r.SourceServerPath, normalizedSource, normalizedTarget)))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
         var workspaceName = $"arm-tfs-soap-merge-{Guid.NewGuid():N}";
         var computer = Environment.MachineName;
-        var warnings = new List<string>();
+        // PendMerge requires the merge target to be mapped in the workspace (a server workspace
+        // mapping is server-side bookkeeping; no local files are downloaded for a merge+checkin).
+        // Map source and target to distinct temp local paths so neither side is "unmapped".
+        var mergeTempRoot = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "arm-tfs-merge", workspaceName);
+        var workingFolders = new[]
+        {
+            (normalizedTarget, System.IO.Path.Combine(mergeTempRoot, "target")),
+            (normalizedSource, System.IO.Path.Combine(mergeTempRoot, "source")),
+        };
         SoapWorkspaceCreated? createdWs = null;
 
         try
         {
-            await soap.CreateWorkspaceAsync(workspaceName, owner, computer, "arm-tfs SOAP merge", ct).ConfigureAwait(false);
+            // CreateWorkspace with owner = authenticated user GUID. Reuse this owner for every
+            // subsequent call so the workspace lookup (by name+owner) matches and the caller has
+            // Use permission. Prefer the server-recorded owner from the response when available.
+            var createdWorkspace = await soap.CreateWorkspaceAsync(
+                workspaceName, owner, computer, "arm-tfs SOAP merge", workingFolders, ct).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(createdWorkspace.Owner))
+            {
+                owner = createdWorkspace.Owner;
+            }
             createdWs = new SoapWorkspaceCreated(workspaceName, owner);
 
-            var ops = await soap.PendMergeAsync(
+            var pendResult = await soap.PendMergeAsync(
                 workspaceName, owner,
                 normalizedSource, normalizedTarget,
                 sourceChangesetId, sourceChangesetId,
                 ct).ConfigureAwait(false);
+            var ops = pendResult.Operations;
+
+            // The server's 3-way merge may have pended CONFLICTS (both sides changed the same file).
+            // These cannot be checked in without resolution. Abort with the conflict list — never
+            // silently take one side (problem 2: 不再静默用源覆盖目标). This also corrects the old
+            // false "already merged" report that happened when conflicts left Operations empty.
+            if (pendResult.Conflicts.Count > 0)
+            {
+                warnings.Add($"Merge aborted: {pendResult.Conflicts.Count} conflict(s) detected by the server's 3-way merge. Resolve each (source/target/manual) and retry.");
+                return new MergeExecutionResult
+                {
+                    SourcePath = normalizedSource,
+                    TargetPath = normalizedTarget,
+                    SourceChangesetId = sourceChangesetId,
+                    Comment = commentWithMarker,
+                    DryRun = false,
+                    CreatedChangesetId = null,
+                    BaseInfo = mergeBase,
+                    Changes = pendResult.Conflicts.Select(c => new MergeExecutionChange
+                    {
+                        SourceServerPath = c.SourceServerItem,
+                        TargetServerPath = c.TargetServerItem,
+                        SourceChangesetId = sourceChangesetId,
+                        Status = "conflict",
+                        TargetExists = true,
+                        Note = "Both source and target modified this file (server 3-way merge conflict). Provide a resolution (source/target/manual) to proceed.",
+                    }).ToList(),
+                    Warnings = warnings,
+                };
+            }
 
             if (ops.Count == 0)
             {
@@ -914,7 +1046,32 @@ public sealed class TfvcClientService
                 };
             }
 
-            var pendingChanges = ops.Select(op => new Models.Soap.SoapPendingChange
+            // Drop "target"-resolved files: they keep the target version, so do not check them in.
+            var committedOps = ops
+                .Where(op => !targetResolutionPaths.Contains(NormalizeServerPath(op.TargetServerItem)))
+                .ToList();
+            var skippedTargetCount = ops.Count - committedOps.Count;
+            if (skippedTargetCount > 0)
+                warnings.Add($"{skippedTargetCount} file(s) kept on target branch per 'target' resolution and were not merged.");
+
+            if (committedOps.Count == 0)
+            {
+                warnings.Add("All merge operations were resolved to 'target'; nothing to commit.");
+                return new MergeExecutionResult
+                {
+                    SourcePath = normalizedSource,
+                    TargetPath = normalizedTarget,
+                    SourceChangesetId = sourceChangesetId,
+                    Comment = commentWithMarker,
+                    DryRun = false,
+                    CreatedChangesetId = null,
+                    BaseInfo = mergeBase,
+                    Changes = Array.Empty<MergeExecutionChange>(),
+                    Warnings = warnings,
+                };
+            }
+
+            var pendingChanges = committedOps.Select(op => new Models.Soap.SoapPendingChange
             {
                 ItemId = op.ItemId,
                 ServerItem = op.TargetServerItem,
@@ -940,7 +1097,7 @@ public sealed class TfvcClientService
                 Method = "soap-merge",
             });
 
-            var executionChanges = ops.Select(op => new MergeExecutionChange
+            var executionChanges = committedOps.Select(op => new MergeExecutionChange
             {
                 SourceServerPath = op.SourceServerItem,
                 TargetServerPath = op.TargetServerItem,
@@ -1187,7 +1344,7 @@ public sealed class TfvcClientService
     /// TFS may serve files with different line endings than what was uploaded (e.g., CRLF ↔ LF),
     /// so a raw byte comparison would produce false negatives after a successful merge.
     /// </summary>
-    private static bool ContentEquals(byte[] a, byte[] b)
+    internal static bool ContentEquals(byte[] a, byte[] b)
     {
         if (a.AsSpan().SequenceEqual(b))
             return true;
@@ -1317,7 +1474,7 @@ public sealed class TfvcClientService
     /// 也不同于源侧内容（即源与目标都改了同一文件且结果不一致）。
     /// 纯函数，便于单元测试。任一输入为 null 时返回 false（无法判定，按非冲突处理）。
     /// </summary>
-    private static bool IsContentConflict(byte[]? targetCurrent, byte[]? targetBase, byte[]? sourceContent)
+    internal static bool IsContentConflict(byte[]? targetCurrent, byte[]? targetBase, byte[]? sourceContent)
     {
         if (targetCurrent is null || targetBase is null || sourceContent is null)
             return false;

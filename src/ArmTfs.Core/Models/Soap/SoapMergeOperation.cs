@@ -29,3 +29,26 @@ public sealed class SoapMergeOperation
 
     public override string ToString() => $"{ChangeType} {SourceServerItem} → {TargetServerItem} (cs{VersionFrom}-{VersionTo})";
 }
+
+/// <summary>PendMerge 返回的冲突（服务器 3-way merge 检测到双方都改了同一文件）。</summary>
+public sealed class SoapMergeConflict
+{
+    /// <summary>目标分支上的服务器路径（"your" side）。</summary>
+    public string TargetServerItem { get; init; } = string.Empty;
+
+    /// <summary>源分支上的服务器路径（"their" side）。</summary>
+    public string SourceServerItem { get; init; } = string.Empty;
+
+    /// <summary>冲突类型（如 "Merge"）。</summary>
+    public string ConflictType { get; init; } = string.Empty;
+
+    /// <summary>基线变更类型（如 "Edit Merge"）。</summary>
+    public string BaseChangeType { get; init; } = string.Empty;
+}
+
+/// <summary>PendMerge 的结果：可提交的操作 + 待解决的冲突。</summary>
+public sealed class PendMergeResult
+{
+    public IReadOnlyList<SoapMergeOperation> Operations { get; init; } = Array.Empty<SoapMergeOperation>();
+    public IReadOnlyList<SoapMergeConflict> Conflicts { get; init; } = Array.Empty<SoapMergeConflict>();
+}
