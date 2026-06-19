@@ -118,7 +118,7 @@ public sealed class TfvcClientService
         var client = _connection.GetTfvcClient();
         var results = await client.GetChangesetsAsync(
             project: null,
-            maxCommentLength: 200,
+            maxCommentLength: 4000,
             skip: skip,
             top: top,
             orderby: orderby,
