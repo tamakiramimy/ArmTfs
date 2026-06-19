@@ -260,9 +260,9 @@ export class ArmTfsMergeWorkbench {
           {
             serverPath: sourceServerPath,
             version: sourceChangesetId,
-            label: `${path.posix.basename(sourceServerPath)} source cs${sourceChangesetId}`,
+            label: `${path.posix.basename(sourceServerPath)} 源分支 cs${sourceChangesetId}`,
           },
-          `${path.posix.basename(sourceServerPath)}: empty target -> source cs${sourceChangesetId}`,
+          `${path.posix.basename(sourceServerPath)}: 空目标 -> 源分支 cs${sourceChangesetId}`,
         );
         return;
       }
@@ -272,13 +272,13 @@ export class ArmTfsMergeWorkbench {
         {
           serverPath: sourceServerPath,
           version: sourceChangesetId,
-          label: `${path.posix.basename(sourceServerPath)} source cs${sourceChangesetId}`,
+          label: `${path.posix.basename(sourceServerPath)} 源分支 cs${sourceChangesetId}`,
         },
         {
           serverPath: targetServerPath,
-          label: `${path.posix.basename(targetServerPath)} target latest`,
+          label: `${path.posix.basename(targetServerPath)} 目标分支最新`,
         },
-        `${path.posix.basename(sourceServerPath)}: source cs${sourceChangesetId} -> target`,
+        `${path.posix.basename(sourceServerPath)}: 源分支 cs${sourceChangesetId} -> 目标分支`,
       );
     } catch (error) {
       this.showError('arm-tfs merge file diff', error);
@@ -434,6 +434,8 @@ export class ArmTfsMergeWorkbench {
         source,
         target,
         this.manualMergeContents.get(conflictId) ?? source,
+        this.state.sourcePath,
+        this.state.targetPath,
       );
       if (content !== undefined) {
         this.manualMergeContents.set(conflictId, content);
@@ -1203,6 +1205,8 @@ function openManualMergePanel(
   sourceContent: string,
   targetContent: string,
   initialResult: string,
+  sourceBranchPath: string,
+  targetBranchPath: string,
 ): Promise<string | undefined> {
   const panel = vscode.window.createWebviewPanel(
     'armTfsManualMerge',
@@ -1214,7 +1218,7 @@ function openManualMergePanel(
     },
   );
   const nonce = getNonce();
-  panel.webview.html = renderManualMergeHtml(panel.webview, nonce, sourceContent, targetContent, initialResult);
+  panel.webview.html = renderManualMergeHtml(panel.webview, nonce, sourceContent, targetContent, initialResult, sourceBranchPath, targetBranchPath);
 
   return new Promise((resolve) => {
     const disposable = panel.webview.onDidReceiveMessage((message: { type: string; content?: string }) => {
@@ -1242,6 +1246,8 @@ function renderManualMergeHtml(
   sourceContent: string,
   targetContent: string,
   initialResult: string,
+  sourceBranchPath: string,
+  targetBranchPath: string,
 ): string {
   const csp = [
     `default-src 'none'`,
@@ -1253,6 +1259,8 @@ function renderManualMergeHtml(
   const sourceJson = JSON.stringify(sourceContent).replace(/</g, '\\u003c');
   const targetJson = JSON.stringify(targetContent).replace(/</g, '\\u003c');
   const initialJson = JSON.stringify(initialResult).replace(/</g, '\\u003c');
+  const sourceBranch = escapeHtml(sourceBranchPath);
+  const targetBranch = escapeHtml(targetBranchPath);
 
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1318,11 +1326,11 @@ function renderManualMergeHtml(
   <main class="grid">
     <div class="top">
       <section>
-        <div class="title">源分支文件</div>
+        <div class="title">源分支文件 · ${sourceBranch}</div>
         <pre id="sourcePane"></pre>
       </section>
       <section>
-        <div class="title">目标分支文件</div>
+        <div class="title">目标分支文件 · ${targetBranch}</div>
         <pre id="targetPane"></pre>
       </section>
     </div>
