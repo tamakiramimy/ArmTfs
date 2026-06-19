@@ -195,6 +195,16 @@ public static class MergeCommand
                         Console.Error.WriteLine(soap.RawResponse[..Math.Min(2000, soap.RawResponse.Length)]);
                     }
                 }
+                else
+                {
+                    // REST path errors (VssServiceException etc.): print full detail incl. inner
+                    // exceptions so "部分更改无效" type rejections show which change/file was rejected.
+                    Console.Error.WriteLine("Detail:");
+                    for (var e = ex; e is not null; e = e.InnerException)
+                    {
+                        Console.Error.WriteLine($"  {e.GetType().FullName}: {e.Message}");
+                    }
+                }
                 Environment.ExitCode = 1;
             }
         });

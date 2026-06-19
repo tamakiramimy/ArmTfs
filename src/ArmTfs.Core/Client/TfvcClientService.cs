@@ -753,6 +753,8 @@ public sealed class TfvcClientService
 
             // The REST changeset API does not accept merge change types or merge sources, so we
             // push a plain Add/Edit/Delete carrying the source content instead of merge metadata.
+            // TFS requires the item's current changesetVersion for an Edit ("请指定项版本"), so we
+            // pass the target's current version (targetExists) as the base.
             tfvcChanges.Add(BuildTfvcChange(
                 targetServerPath,
                 targetChangeType,
