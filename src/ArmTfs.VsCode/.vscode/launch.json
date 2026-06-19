@@ -8,7 +8,7 @@
       "preLaunchTask": "npm: compile",
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}",
-        "/Users/tamakirami/tfs/C02_PTL_P090_BussinessCommon/MindrayApp.FlowDesignVue-P_V20250623"
+        "/Users/tamakirami/tfs/C02_PTL_P090_BussinessCommon/MindrayApp.FlowDesignVue"
       ],
       "outFiles": [
         "${workspaceFolder}/out/**/*.js"

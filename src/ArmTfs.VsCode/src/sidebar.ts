@@ -241,6 +241,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       vscode.commands.registerCommand('armTfs.sidebar.showBranchHistory', async (node?: BranchNode | ServerExplorerNode) => this.showBranchHistory(node)),
       vscode.commands.registerCommand('armTfs.sidebar.mergeFromBranch', async (node?: BranchNode | ServerExplorerNode) => this.mergeFromBranch(node)),
       vscode.commands.registerCommand('armTfs.sidebar.addBranch', async (node?: BranchNode | ServerExplorerNode) => this.addBranch(node)),
+      vscode.commands.registerCommand('armTfs.sidebar.deleteBranch', async (node?: BranchNode | ServerExplorerNode) => this.deleteBranch(node)),
       vscode.commands.registerCommand('armTfs.history.diffPrevious', async (node?: HistoryNode) => this.diffHistoryNodeWithPrevious(node)),
       vscode.commands.registerCommand('armTfs.history.selectForCompare', async (node?: HistoryNode) => this.selectChangesetForCompare(node)),
       vscode.commands.registerCommand('armTfs.history.compareSelected', async (node?: HistoryNode) => this.compareWithSelectedChangeset(node)),
@@ -1101,6 +1102,41 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       await this.refreshBranches();
     } catch (error) {
       this.showError('arm-tfs branch create', error);
+    }
+  }
+
+  private async deleteBranch(node?: BranchNode | ServerExplorerNode): Promise<void> {
+    const branchPath = getNodeServerPath(node);
+    if (!branchPath) {
+      void vscode.window.showWarningMessage(t('sidebar.warning.selectBranchFromView'));
+      return;
+    }
+
+    const confirm = await vscode.window.showWarningMessage(
+      `确定要删除分支 ${branchPath} 吗？这将创建一个删除 changeset（可通过 undelete 恢复，不是 tf destroy）。`,
+      { modal: true },
+      '删除',
+    );
+    if (confirm !== '删除') {
+      return;
+    }
+
+    const comment = await vscode.window.showInputBox({
+      prompt: '删除分支的注释（可选）',
+      value: `Delete branch ${path.posix.basename(branchPath)}`,
+      ignoreFocusOut: true,
+    });
+    if (comment === undefined) {
+      return;
+    }
+
+    try {
+      const result = await this.client.branchDelete(branchPath, { comment: comment.trim() || undefined });
+      void vscode.window.showInformationMessage(`已删除分支 ${branchPath}（cs#${result.createdChangesetId}）`);
+      await this.refreshBranches();
+      await this.refreshAll();
+    } catch (error) {
+      this.showError('arm-tfs branch delete', error);
     }
   }
 

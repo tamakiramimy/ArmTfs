@@ -67,6 +67,7 @@
   "command.sidebarShowBranchHistory": "Show History (Log)",
   "command.sidebarMergeFromBranch": "Merge to Branch",
   "command.sidebarAddBranch": "New Branch",
+  "command.sidebarDeleteBranch": "Delete Branch",
   "command.historyDiffPrevious": "Compare With Previous Version",
   "command.historyOpenBrowser": "Open TFVC History Browser",
   "command.historySelectCompare": "Select Changeset For Compare",

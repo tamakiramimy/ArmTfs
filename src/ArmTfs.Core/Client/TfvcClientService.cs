@@ -231,6 +231,34 @@ public sealed class TfvcClientService
         return await soap.CreateBranchAsync(sourcePath, targetPath, sourceChangesetId, comment, ct).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// 删除一个服务器路径（文件或文件夹/分支）。通过创建一个含 Delete 变更的 changeset 实现，
+    /// 即 TFS 的"可撤销删除"（区别于 tf destroy 永久销毁）。删除文件夹/分支时 TFS 递归删除其下所有内容。
+    /// </summary>
+    public async Task<TfvcChangesetRef> DeleteItemAsync(
+        string serverPath,
+        string? comment = null,
+        CancellationToken ct = default)
+    {
+        var normalized = NormalizeServerPath(serverPath);
+        var effectiveComment = string.IsNullOrWhiteSpace(comment)
+            ? $"Delete {normalized}"
+            : comment.Trim();
+
+        // Verify the item exists (and is not already deleted). TFS requires the item's current
+        // changesetVersion as the base for a Delete change ("请指定项版本").
+        var version = await TryGetItemVersionAsync(normalized, ct).ConfigureAwait(false);
+        if (!version.HasValue)
+        {
+            throw new InvalidOperationException($"'{normalized}' does not exist (or is already deleted) on the server.");
+        }
+
+        return await CheckinAsync(
+            effectiveComment,
+            new[] { (normalized, Models.ChangeType.Delete, (byte[]?)null, version) },
+            ct).ConfigureAwait(false);
+    }
+
     /// <summary>查询 TFVC Label 列表。</summary>
     public async Task<IReadOnlyList<TfvcLabelRef>> GetLabelsAsync(
         string? owner = null,

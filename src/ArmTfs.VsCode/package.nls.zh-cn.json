@@ -67,6 +67,7 @@
   "command.sidebarShowBranchHistory": "查看历史 (Log)",
   "command.sidebarMergeFromBranch": "合并到分支 (Merge)",
   "command.sidebarAddBranch": "新建分支 (Branch)",
+  "command.sidebarDeleteBranch": "删除分支",
   "command.historyDiffPrevious": "与上一版本比较",
   "command.historyOpenBrowser": "打开 TFVC 历史浏览器",
   "command.historySelectCompare": "选择变更集作为比较基准",

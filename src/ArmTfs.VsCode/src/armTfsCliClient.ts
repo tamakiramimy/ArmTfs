@@ -236,6 +236,18 @@ export class ArmTfsCliClient {
     return this.executeJson<BranchCreateResponse>(args, runOptions);
   }
 
+  branchDelete(
+    branchPath: string,
+    options?: { comment?: string },
+    runOptions?: ArmTfsRunOptions,
+  ): Promise<{ schemaVersion: number; command: 'branch.delete'; path: string; createdChangesetId: number }> {
+    const args = ['branch', 'delete', '--path', branchPath, '--format', 'json'];
+    if (options?.comment) {
+      args.push('--comment', options.comment);
+    }
+    return this.executeJson(args, runOptions);
+  }
+
   changesetShow(changesetId: number, options?: ArmTfsRunOptions): Promise<ChangesetShowResponse> {
     return this.executeJson<ChangesetShowResponse>(['changeset', 'show', String(changesetId), '--format', 'json'], options);
   }

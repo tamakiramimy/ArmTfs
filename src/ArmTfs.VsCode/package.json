@@ -389,6 +389,12 @@
         "icon": "$(git-branch-create)"
       },
       {
+        "command": "armTfs.sidebar.deleteBranch",
+        "title": "%command.sidebarDeleteBranch%",
+        "category": "arm-tfs",
+        "icon": "$(trash)"
+      },
+      {
         "command": "armTfs.history.diffPrevious",
         "title": "%command.historyDiffPrevious%",
         "category": "arm-tfs",
@@ -622,6 +628,11 @@
           "group": "2_branch@2"
         },
         {
+          "command": "armTfs.sidebar.deleteBranch",
+          "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
+          "group": "2_branch@3"
+        },
+        {
           "command": "armTfs.sidebar.pullBranch",
           "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
           "group": "1_sync@3"
@@ -680,6 +691,11 @@
           "command": "armTfs.sidebar.addBranch",
           "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
           "group": "2_branch@2"
+        },
+        {
+          "command": "armTfs.sidebar.deleteBranch",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "2_branch@3"
         },
         {
           "command": "armTfs.sidebar.showBranchHistory",

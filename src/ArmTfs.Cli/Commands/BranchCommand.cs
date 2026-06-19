@@ -17,6 +17,54 @@ public static class BranchCommand
         cmd.AddCommand(BuildList(config));
         cmd.AddCommand(BuildShow(config));
         cmd.AddCommand(BuildCreate(config));
+        cmd.AddCommand(BuildDelete(config));
+
+        return cmd;
+    }
+
+    private static Command BuildDelete(TfsConfig config)
+    {
+        var cmd = new Command("delete", "Delete a TFVC branch (reversible delete changeset; not tf destroy).");
+        var pathOpt = new Option<string>("--path") { Description = "Branch path to delete ($/...)", IsRequired = true };
+        var commentOpt = new Option<string?>("--comment") { Description = "Changeset comment" };
+        var formatOpt = new Option<string>("--format", () => "table") { Description = "Output format: table | json" };
+
+        cmd.AddOption(pathOpt);
+        cmd.AddOption(commentOpt);
+        cmd.AddOption(formatOpt);
+
+        cmd.SetHandler(async (path, comment, format) =>
+        {
+            using var conn = new TfsConnection(config);
+            var svc = new TfvcClientService(conn);
+            try
+            {
+                if (!path.StartsWith("$/", StringComparison.Ordinal))
+                    throw new InvalidOperationException("Branch path must be a server path starting with $/.");
+                var resolved = path;
+                var created = await svc.DeleteItemAsync(resolved, comment).ConfigureAwait(false);
+
+                if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+                {
+                    JsonOutput.Write(new
+                    {
+                        schemaVersion = 1,
+                        command = "branch.delete",
+                        path = resolved,
+                        createdChangesetId = created.ChangesetId,
+                    });
+                    return;
+                }
+
+                Console.WriteLine($"Deleted branch : {resolved}");
+                Console.WriteLine($"Changeset      : cs#{created.ChangesetId}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Error: {ex.Message}");
+                Environment.ExitCode = 1;
+            }
+        }, pathOpt, commentOpt, formatOpt);
 
         return cmd;
     }
