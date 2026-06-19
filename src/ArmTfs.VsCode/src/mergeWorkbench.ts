@@ -315,7 +315,9 @@ export class ArmTfsMergeWorkbench {
     const outputs: string[] = [];
     const createdIds: number[] = [];
     const noChangeIds: number[] = [];
+    const conflictAbortIds: number[] = [];
     const resolutionFiles: string[] = [];
+    let abortedByConflict = false;
     try {
       await vscode.window.withProgress(
         {
@@ -324,6 +326,7 @@ export class ArmTfsMergeWorkbench {
         },
         async (progress) => {
           for (const [index, candidate] of selected.entries()) {
+            if (abortedByConflict) break;
             progress.report({
               message: `cs${candidate.changesetId} (${index + 1}/${selected.length})`,
             });
@@ -339,7 +342,16 @@ export class ArmTfsMergeWorkbench {
               },
             );
             const createdId = response.result.createdChangesetId;
-            if (createdId !== null && createdId !== undefined) {
+            const conflictChanges = response.result.changes.filter((c) => c.status.toLowerCase() === 'conflict');
+            if (conflictChanges.length > 0) {
+              // The server's 3-way merge found conflicts the workbench preview did not surface
+              // (e.g. per-changeset conflicts differ from the range preview, or state changed
+              // after intermediate merges). Mark them on the candidate so the conflict list shows
+              // them and the user can resolve (批量采用源/目标 or per-file), then retry.
+              conflictAbortIds.push(candidate.changesetId);
+              this.applyConflictResultToCandidate(candidate, conflictChanges);
+              abortedByConflict = true;
+            } else if (createdId !== null && createdId !== undefined) {
               createdIds.push(createdId);
             } else {
               noChangeIds.push(candidate.changesetId);
@@ -349,37 +361,59 @@ export class ArmTfsMergeWorkbench {
         },
       );
 
-      // Write the full outcome to the output channel (the "console") instead of opening a
-      // throwaway document, and surface concise toasts that reflect what actually happened.
       this.output.appendLine('> arm-tfs merge execute');
       this.output.appendLine(outputs.join('\n\n'));
       this.output.appendLine('');
 
       await this.refreshAfterExecute();
 
-      if (createdIds.length) {
+      if (abortedByConflict) {
+        this.render();
+        void vscode.window.showWarningMessage(
+          `cs${conflictAbortIds.join(', cs')} 合并中止：服务器检测到冲突，已列入冲突列表。请解决（批量采用源/目标或逐个）后重试。`,
+        );
+      } else if (createdIds.length) {
         void vscode.window.showInformationMessage(
           t('merge.execute.success', {
             count: createdIds.length,
             created: createdIds.map((id) => `cs${id}`).join(', '),
           }),
         );
-      }
-      if (noChangeIds.length) {
-        void vscode.window.showWarningMessage(
-          t('merge.execute.noChange', {
-            changesets: noChangeIds.map((id) => `cs${id}`).join(', '),
-          }),
-        );
+        if (noChangeIds.length) {
+          void vscode.window.showWarningMessage(
+            t('merge.execute.noChange', {
+              changesets: noChangeIds.map((id) => `cs${id}`).join(', '),
+            }),
+          );
+        }
       }
 
-      if (createdIds.length) {
+      if (createdIds.length && !abortedByConflict) {
         this.panel.dispose();
       }
     } catch (error) {
       this.showError('arm-tfs merge execute', error);
     } finally {
       await Promise.all(resolutionFiles.map((file) => fs.rm(path.dirname(file), { force: true, recursive: true })));
+    }
+  }
+
+  /** 把执行结果里的冲突回填到候选的 changes 上，让冲突列表显示出来供用户解决。 */
+  private applyConflictResultToCandidate(candidate: MergeWorkbenchCandidate, conflictChanges: MergePlanChange[]): void {
+    const conflictByTarget = new Map(
+      conflictChanges.map((c) => [c.targetServerPath.toLowerCase(), c]),
+    );
+    for (const change of candidate.changes) {
+      const cc = conflictByTarget.get(change.targetServerPath.toLowerCase());
+      if (cc) {
+        change.status = 'conflict';
+        change.note = cc.note || 'Both source and target modified this file (server 3-way merge conflict). Resolve (source/target/manual).';
+        conflictByTarget.delete(change.targetServerPath.toLowerCase());
+      }
+    }
+    // Conflict files not already in the plan (e.g. files the REST dry-run didn't list) — add them.
+    for (const cc of conflictByTarget.values()) {
+      candidate.changes.push({ ...cc, status: 'conflict' });
     }
   }
 
