@@ -1521,10 +1521,11 @@ public sealed class TfvcClientService
                 continue;
             }
 
-            var sourceVersion = change.Item.ChangesetVersion > 0
-                ? change.Item.ChangesetVersion
-                : detail.ChangesetId;
-            var sourceItem = await TryGetItemSnapshotAsync(sourceItemPath, sourceVersion, ct).ConfigureAwait(false);
+            // Compare the LATEST source content to the target's latest. Using the changeset's own
+            // version would flag superseded changesets (whose content was later overwritten on the
+            // source branch) as candidates — merging them would regress the target with stale content.
+            // If the latest source already matches the target, the file is in sync → exclude.
+            var sourceItem = await TryGetItemSnapshotAsync(sourceItemPath, null, ct).ConfigureAwait(false);
             if (sourceItem is null || targetItem is null)
                 return false;
 
@@ -1535,7 +1536,7 @@ public sealed class TfvcClientService
                 continue;
             }
 
-            var sourceContent = await DownloadFileContentAsync(sourceItemPath, sourceVersion, ct).ConfigureAwait(false);
+            var sourceContent = await DownloadFileContentAsync(sourceItemPath, null, ct).ConfigureAwait(false);
             var targetContent = await DownloadFileContentAsync(targetItemPath, null, ct).ConfigureAwait(false);
             if (!ContentEquals(sourceContent, targetContent))
                 return false;
