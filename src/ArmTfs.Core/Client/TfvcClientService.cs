@@ -812,12 +812,13 @@ public sealed class TfvcClientService
             Changes = tfvcChanges,
         }, cancellationToken: ct).ConfigureAwait(false);
 
-        await VerifyMergeChangesetAppliedAsync(
+        var verifyWarnings = await VerifyMergeChangesetAppliedAsync(
             created.ChangesetId,
             tfvcChanges.Select(change => change.Item?.Path).Where(path => !string.IsNullOrEmpty(path)).Cast<string>().ToArray(),
             expectedContentByTarget,
             expectedDeletes,
             ct).ConfigureAwait(false);
+        warnings.AddRange(verifyWarnings);
 
         // Record in local merge-history so the candidate list clears immediately,
         // even before the target history scan picks up the comment marker.
@@ -1202,13 +1203,14 @@ public sealed class TfvcClientService
         }
     }
 
-    private async Task VerifyMergeChangesetAppliedAsync(
+    private async Task<IReadOnlyList<string>> VerifyMergeChangesetAppliedAsync(
         int createdChangesetId,
         IReadOnlyCollection<string> expectedTargetPaths,
         IReadOnlyDictionary<string, byte[]> expectedContentByTarget,
         IReadOnlySet<string> expectedDeletes,
         CancellationToken ct)
     {
+        var verifyWarnings = new List<string>();
         var createdDetail = await GetChangesetAsync(createdChangesetId, ct).ConfigureAwait(false);
         var changedPaths = (createdDetail.Changes ?? Array.Empty<TfvcChange>())
             .Select(change => change.Item?.Path)
@@ -1255,15 +1257,26 @@ public sealed class TfvcClientService
         if (trulyMissing.Count > 0)
             throw new InvalidOperationException($"Merge verification failed: created changeset cs#{createdChangesetId} did not contain expected target path(s): {string.Join(", ", trulyMissing)}.");
 
+        // For files that ARE in the created changeset, the merge landed. TFS may normalize content
+        // on check-in (BOM / encoding / line-ending conversion), so a byte-level mismatch here is
+        // NOT a real failure — warn instead of throwing (which would falsely report the merge as
+        // failed after the changeset was already created).
         foreach (var (targetPath, expectedContent) in expectedContentByTarget)
         {
             // Already verified above as part of server-dedup check — skip re-download.
             if (!changedPaths.Contains(NormalizeServerPath(targetPath)))
                 continue;
 
-            var actualContent = await DownloadFileContentAsync(targetPath, null, ct).ConfigureAwait(false);
-            if (!ContentEquals(actualContent, expectedContent))
-                throw new InvalidOperationException($"Merge verification failed: target file '{targetPath}' content does not match the source content after cs#{createdChangesetId}.");
+            try
+            {
+                var actualContent = await DownloadFileContentAsync(targetPath, null, ct).ConfigureAwait(false);
+                if (!ContentEquals(actualContent, expectedContent))
+                    verifyWarnings.Add($"Verified: '{targetPath}' was committed in cs#{createdChangesetId}, but its stored content differs from the pushed bytes (TFS likely normalized BOM/encoding/line-endings). The merge still landed.");
+            }
+            catch (Exception ex)
+            {
+                verifyWarnings.Add($"Could not re-verify '{targetPath}' after cs#{createdChangesetId}: {ex.Message}. The merge still landed.");
+            }
         }
 
         foreach (var targetPath in expectedDeletes)
@@ -1271,6 +1284,8 @@ public sealed class TfvcClientService
             if (await TryGetItemVersionAsync(targetPath, ct).ConfigureAwait(false) is not null)
                 throw new InvalidOperationException($"Merge verification failed: target file '{targetPath}' still exists after delete merge cs#{createdChangesetId}.");
         }
+
+        return verifyWarnings;
     }
 
     private async Task<TfvcBranch?> TryResolveBranchAsync(string path, CancellationToken ct)
