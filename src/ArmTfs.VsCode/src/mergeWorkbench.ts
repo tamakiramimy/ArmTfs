@@ -560,15 +560,15 @@ function renderWorkbenchHtml(
     document.getElementById('checkAll')?.addEventListener('click', () => vscode.postMessage({ type: 'toggleAll', checked: true }));
     document.getElementById('uncheckAll')?.addEventListener('click', () => vscode.postMessage({ type: 'toggleAll', checked: false }));
     document.getElementById('expandAllFiles')?.addEventListener('click', () => {
-      document.querySelectorAll('#filesPane details.tree-folder').forEach((d) => { (d as HTMLDetailsElement).open = true; });
+      document.querySelectorAll('#filesPane details.tree-folder').forEach((d) => { d.open = true; });
     });
     document.getElementById('collapseAllFiles')?.addEventListener('click', () => {
-      document.querySelectorAll('#filesPane details.tree-folder').forEach((d) => { (d as HTMLDetailsElement).open = false; });
+      document.querySelectorAll('#filesPane details.tree-folder').forEach((d) => { d.open = false; });
     });
     document.querySelectorAll('[data-resolution]').forEach((button) => {
       button.addEventListener('click', () => {
         const conflictIds = Array.from(document.querySelectorAll('.conflict-leaf'))
-          .map((node) => (node as HTMLElement).dataset.conflict);
+          .map((node) => node.dataset.conflict);
         vscode.postMessage({
           type: 'applyBulkResolution',
           conflictIds,
@@ -592,7 +592,7 @@ function renderWorkbenchHtml(
       const execute = document.getElementById('execute');
       if (!execute) return;
       const selectedChangesetIds = Array.from(document.querySelectorAll('[data-candidate-check]:checked')).map((input) => Number(input.dataset.candidateCheck));
-      const unresolved = Array.from(document.querySelectorAll('.conflict-leaf')).some((node) => !(node as HTMLElement).dataset.choice);
+      const unresolved = Array.from(document.querySelectorAll('.conflict-leaf')).some((node) => !node.dataset.choice);
       execute.disabled = selectedChangesetIds.length === 0 || unresolved;
       execute.textContent = '合并 ' + selectedChangesetIds.length;
     }
