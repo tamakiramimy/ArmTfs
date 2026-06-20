@@ -578,6 +578,100 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     return runAndShow(t('extension.operation.label'), output, async () => client.labelShow(labelId));
   });
 
+  // ─── 删除服务器文件/文件夹 ─────────────────────────────────────────────
+  register('armTfs.deleteServerItem', async (input) => {
+    const serverPath = readStringOption(input, 'path')
+      ?? await promptPath(t('extension.prompt.deleteServerPath'), getActivePath() ?? '$/');
+    if (!serverPath) { return; }
+    const comment = await promptPath(t('extension.prompt.deleteComment'), '') ?? '';
+    return runAndShowText(t('extension.operation.deleteServerItem'), output, () =>
+      client.deleteServerItem(serverPath, comment.trim() || undefined));
+  });
+
+  // ─── 重命名/移动服务器文件 ─────────────────────────────────────────────
+  register('armTfs.renameServerItem', async (input) => {
+    const oldPath = readStringOption(input, 'oldPath')
+      ?? await promptPath(t('extension.prompt.renameOldPath'), getActivePath() ?? '$/');
+    if (!oldPath) { return; }
+    const newPath = await promptPath(t('extension.prompt.renameNewPath'), oldPath);
+    if (!newPath) { return; }
+    const comment = await promptPath(t('extension.prompt.renameComment'), '') ?? '';
+    return runAndShowText(t('extension.operation.renameServerItem'), output, () =>
+      client.renameServerItem(oldPath, newPath, comment.trim() || undefined));
+  });
+
+  // ─── 回滚指定 changeset ────────────────────────────────────────────────
+  register('armTfs.rollback', async (input) => {
+    const csRaw = readStringOption(input, 'changesetId')
+      ?? await promptPath(t('extension.prompt.rollbackChangesetId'), '');
+    if (!csRaw) { return; }
+    const cs = Number.parseInt(csRaw.replace(/^C/i, ''), 10);
+    if (Number.isNaN(cs)) { return; }
+    const comment = await promptPath(t('extension.prompt.rollbackComment'), '') ?? '';
+    return runAndShowText(t('extension.operation.rollback'), output, () =>
+      client.rollback(cs, comment.trim() || undefined));
+  });
+
+  // ─── 还原已删除文件 ────────────────────────────────────────────────────
+  register('armTfs.undeleteServerItem', async (input) => {
+    const serverPath = readStringOption(input, 'path')
+      ?? await promptPath(t('extension.prompt.undeletePath'), '$/');
+    if (!serverPath) { return; }
+    const comment = await promptPath(t('extension.prompt.undeleteComment'), '') ?? '';
+    return runAndShowText(t('extension.operation.undeleteServerItem'), output, () =>
+      client.undeleteServerItem(serverPath, comment.trim() || undefined));
+  });
+
+  // ─── 锁定/解锁服务器文件 ──────────────────────────────────────────────
+  register('armTfs.lockServerItem', async (input) => {
+    const serverPath = readStringOption(input, 'path')
+      ?? await promptPath(t('extension.prompt.lockPath'), getActivePath() ?? '$/');
+    if (!serverPath) { return; }
+    return runAndShowText(t('extension.operation.lockServerItem'), output, () => client.lockItem(serverPath));
+  });
+
+  register('armTfs.unlockServerItem', async (input) => {
+    const serverPath = readStringOption(input, 'path')
+      ?? await promptPath(t('extension.prompt.unlockPath'), getActivePath() ?? '$/');
+    if (!serverPath) { return; }
+    return runAndShowText(t('extension.operation.unlockServerItem'), output, () => client.unlockItem(serverPath));
+  });
+
+  // ─── Cloak / Uncloak ──────────────────────────────────────────────────
+  register('armTfs.cloakPath', async (input) => {
+    const serverPath = readStringOption(input, 'path')
+      ?? await promptPath(t('extension.prompt.cloakPath'), '$/');
+    if (!serverPath) { return; }
+    return runAndShowText(t('extension.operation.cloakPath'), output, () => client.workfoldCloak(serverPath));
+  });
+
+  register('armTfs.uncloakPath', async (input) => {
+    const serverPath = readStringOption(input, 'path')
+      ?? await promptPath(t('extension.prompt.uncloakPath'), '$/');
+    if (!serverPath) { return; }
+    return runAndShowText(t('extension.operation.uncloakPath'), output, () => client.workfoldUncloak(serverPath));
+  });
+
+  // ─── Label 创建/删除 ──────────────────────────────────────────────────
+  register('armTfs.createLabel', async (input) => {
+    const name = readStringOption(input, 'name')
+      ?? await promptPath(t('extension.prompt.labelName'), '');
+    if (!name) { return; }
+    const serverPath = readStringOption(input, 'path')
+      ?? await promptPath(t('extension.prompt.labelPath'), '$/');
+    if (!serverPath) { return; }
+    const comment = await promptPath(t('extension.prompt.labelComment'), '') ?? '';
+    return runAndShowText(t('extension.operation.createLabel'), output, () =>
+      client.labelCreate(name, serverPath, comment.trim() || undefined));
+  });
+
+  register('armTfs.deleteLabel', async (input) => {
+    const labelId = readStringOption(input, 'labelId')
+      ?? await promptPath(t('extension.prompt.deleteLabelId'), '');
+    if (!labelId) { return; }
+    return runAndShowText(t('extension.operation.deleteLabel'), output, () => client.labelDelete(labelId));
+  });
+
   register('armTfs.showMergeBase', async (input) => {
     const sourcePath = readStringOption(input, 'sourcePath') ?? await promptPath(t('sidebar.prompt.mergeSourcePath'), '$/');
     if (!sourcePath) {

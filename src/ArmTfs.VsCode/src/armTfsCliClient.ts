@@ -394,6 +394,66 @@ export class ArmTfsCliClient {
     return this.executeJson<ItemsListResponse>(args, options);
   }
 
+  /** 删除服务器文件或文件夹（可撤销删除）。 */
+  deleteServerItem(serverPath: string, comment?: string, options?: ArmTfsRunOptions): Promise<string> {
+    const args = ['delete', serverPath];
+    if (comment) args.push('--comment', comment);
+    return this.executeText(args, options);
+  }
+
+  /** 重命名/移动服务器文件或文件夹。 */
+  renameServerItem(oldPath: string, newPath: string, comment?: string, options?: ArmTfsRunOptions): Promise<string> {
+    const args = ['rename', oldPath, newPath];
+    if (comment) args.push('--comment', comment);
+    return this.executeText(args, options);
+  }
+
+  /** 回滚指定 changeset 的所有变更（生成反向 changeset）。 */
+  rollback(changesetId: number, comment?: string, options?: ArmTfsRunOptions): Promise<string> {
+    const args = ['rollback', String(changesetId)];
+    if (comment) args.push('--comment', comment);
+    return this.executeText(args, options);
+  }
+
+  /** 还原已删除的服务器文件/文件夹。 */
+  undeleteServerItem(serverPath: string, comment?: string, options?: ArmTfsRunOptions): Promise<string> {
+    const args = ['undelete', serverPath];
+    if (comment) args.push('--comment', comment);
+    return this.executeText(args, options);
+  }
+
+  /** 锁定服务器文件（独占编辑锁）。 */
+  lockItem(serverPath: string, options?: ArmTfsRunOptions): Promise<string> {
+    return this.executeText(['lock', 'set', serverPath], options);
+  }
+
+  /** 解锁服务器文件。 */
+  unlockItem(serverPath: string, options?: ArmTfsRunOptions): Promise<string> {
+    return this.executeText(['lock', 'unset', serverPath], options);
+  }
+
+  /** 屏蔽工作区路径（cloak），get 时跳过该目录。 */
+  workfoldCloak(serverPath: string, options?: ArmTfsRunOptions): Promise<string> {
+    return this.executeText(['workfold', 'cloak', serverPath], options);
+  }
+
+  /** 取消屏蔽工作区路径（uncloak）。 */
+  workfoldUncloak(serverPath: string, options?: ArmTfsRunOptions): Promise<string> {
+    return this.executeText(['workfold', 'uncloak', serverPath], options);
+  }
+
+  /** 创建 Label（标签）。 */
+  labelCreate(name: string, serverPath: string, comment?: string, options?: ArmTfsRunOptions): Promise<string> {
+    const args = ['label', 'create', name, serverPath];
+    if (comment) args.push('--comment', comment);
+    return this.executeText(args, options);
+  }
+
+  /** 删除 Label（标签）。 */
+  labelDelete(labelId: string, options?: ArmTfsRunOptions): Promise<string> {
+    return this.executeText(['label', 'delete', labelId], options);
+  }
+
   /**
    * Configure TFS server URL, PAT, and display name by calling the CLI's configure subcommand.
    * The PAT is passed as a command-line argument — avoid reuse in non-configuration contexts.

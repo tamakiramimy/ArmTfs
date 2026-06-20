@@ -436,6 +436,74 @@
         "command": "armTfs.changes.revertLocal",
         "title": "Revert to Server Version",
         "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.deleteServerItem",
+        "title": "%command.deleteServerItem%"
+      },
+      {
+        "command": "armTfs.renameServerItem",
+        "title": "%command.renameServerItem%"
+      },
+      {
+        "command": "armTfs.rollback",
+        "title": "%command.rollback%"
+      },
+      {
+        "command": "armTfs.undeleteServerItem",
+        "title": "%command.undeleteServerItem%"
+      },
+      {
+        "command": "armTfs.lockServerItem",
+        "title": "%command.lockServerItem%"
+      },
+      {
+        "command": "armTfs.unlockServerItem",
+        "title": "%command.unlockServerItem%"
+      },
+      {
+        "command": "armTfs.cloakPath",
+        "title": "%command.cloakPath%"
+      },
+      {
+        "command": "armTfs.uncloakPath",
+        "title": "%command.uncloakPath%"
+      },
+      {
+        "command": "armTfs.createLabel",
+        "title": "%command.createLabel%"
+      },
+      {
+        "command": "armTfs.deleteLabel",
+        "title": "%command.deleteLabel%"
+      },
+      {
+        "command": "armTfs.serverExplorer.deleteItem",
+        "title": "%command.deleteServerItem%"
+      },
+      {
+        "command": "armTfs.serverExplorer.renameItem",
+        "title": "%command.renameServerItem%"
+      },
+      {
+        "command": "armTfs.serverExplorer.undeleteItem",
+        "title": "%command.undeleteServerItem%"
+      },
+      {
+        "command": "armTfs.serverExplorer.lockItem",
+        "title": "%command.lockServerItem%"
+      },
+      {
+        "command": "armTfs.serverExplorer.unlockItem",
+        "title": "%command.unlockServerItem%"
+      },
+      {
+        "command": "armTfs.serverExplorer.cloakPath",
+        "title": "%command.cloakPath%"
+      },
+      {
+        "command": "armTfs.serverExplorer.uncloakPath",
+        "title": "%command.uncloakPath%"
       }
     ],
     "menus": {
@@ -706,6 +774,41 @@
           "command": "armTfs.sidebar.copyTfvcPath",
           "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
           "group": "3_info@2"
+        },
+        {
+          "command": "armTfs.serverExplorer.deleteItem",
+          "when": "view == armTfs.serverExplorer && viewItem =~ /armTfsServer(Folder|File)/",
+          "group": "4_edit@1"
+        },
+        {
+          "command": "armTfs.serverExplorer.renameItem",
+          "when": "view == armTfs.serverExplorer && viewItem =~ /armTfsServer(Folder|File)/",
+          "group": "4_edit@2"
+        },
+        {
+          "command": "armTfs.serverExplorer.lockItem",
+          "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFile",
+          "group": "4_edit@3"
+        },
+        {
+          "command": "armTfs.serverExplorer.unlockItem",
+          "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFile",
+          "group": "4_edit@4"
+        },
+        {
+          "command": "armTfs.serverExplorer.cloakPath",
+          "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
+          "group": "4_edit@5"
+        },
+        {
+          "command": "armTfs.serverExplorer.uncloakPath",
+          "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
+          "group": "4_edit@6"
+        },
+        {
+          "command": "armTfs.serverExplorer.undeleteItem",
+          "when": "view == armTfs.serverExplorer && viewItem =~ /armTfsServer(Folder|File)/",
+          "group": "4_edit@7"
         }
       ],
       "scm/title": [
@@ -782,6 +885,21 @@
           "command": "armTfs.showHistory",
           "when": "resourceScheme == file",
           "group": "navigation@24"
+        },
+        {
+          "command": "armTfs.deleteServerItem",
+          "when": "resourceScheme == file",
+          "group": "navigation@25"
+        },
+        {
+          "command": "armTfs.lockServerItem",
+          "when": "resourceScheme == file",
+          "group": "navigation@26"
+        },
+        {
+          "command": "armTfs.unlockServerItem",
+          "when": "resourceScheme == file",
+          "group": "navigation@27"
         }
       ],
       "editor/title/context": [

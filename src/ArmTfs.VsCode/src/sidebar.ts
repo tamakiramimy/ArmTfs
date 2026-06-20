@@ -2068,6 +2068,100 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
         await vscode.env.clipboard.writeText(node.entry.serverPath);
         vscode.window.setStatusBarMessage(t('serverExplorer.status.copiedPath', { path: node.entry.serverPath }), 2000);
       }),
+
+      // ─── 删除服务器文件/文件夹 ─────────────────────────────────────────
+      vscode.commands.registerCommand('armTfs.serverExplorer.deleteItem', async (node?: ServerExplorerNode) => {
+        const serverPath = node?.entry.serverPath;
+        if (!serverPath) { return; }
+        const confirm = await vscode.window.showWarningMessage(
+          `确定删除 ${serverPath}？将生成删除 changeset（可通过 undelete 恢复）`,
+          { modal: true }, '删除',
+        );
+        if (confirm !== '删除') { return; }
+        const comment = await vscode.window.showInputBox({ prompt: '删除注释（可选）', ignoreFocusOut: true });
+        if (comment === undefined) { return; }
+        try {
+          const out = await this.client.deleteServerItem(serverPath, comment.trim() || undefined);
+          void vscode.window.showInformationMessage(`已删除 ${serverPath}`);
+          reportCommandOutput(this.output, 'delete', out);
+          await this.provider.refresh();
+        } catch (e) { void vscode.window.showErrorMessage(t('error.failed', { title: 'arm-tfs delete', message: translateCliMessage(getErrorMessage(e)) })); }
+      }),
+
+      // ─── 重命名/移动服务器文件 ─────────────────────────────────────────
+      vscode.commands.registerCommand('armTfs.serverExplorer.renameItem', async (node?: ServerExplorerNode) => {
+        const oldPath = node?.entry.serverPath;
+        if (!oldPath) { return; }
+        const newPath = await vscode.window.showInputBox({
+          prompt: '新服务器路径',
+          value: oldPath,
+          ignoreFocusOut: true,
+        });
+        if (!newPath || newPath === oldPath) { return; }
+        const comment = await vscode.window.showInputBox({ prompt: '移动注释（可选）', ignoreFocusOut: true });
+        if (comment === undefined) { return; }
+        try {
+          const out = await this.client.renameServerItem(oldPath, newPath, comment.trim() || undefined);
+          void vscode.window.showInformationMessage(`已移动 ${oldPath} → ${newPath}`);
+          reportCommandOutput(this.output, 'rename', out);
+          await this.provider.refresh();
+        } catch (e) { void vscode.window.showErrorMessage(t('error.failed', { title: 'arm-tfs rename', message: translateCliMessage(getErrorMessage(e)) })); }
+      }),
+
+      // ─── 还原已删除文件 ────────────────────────────────────────────────
+      vscode.commands.registerCommand('armTfs.serverExplorer.undeleteItem', async (node?: ServerExplorerNode) => {
+        const serverPath = node?.entry.serverPath
+          ?? await vscode.window.showInputBox({ prompt: '要还原的服务器路径', value: '$/', ignoreFocusOut: true });
+        if (!serverPath) { return; }
+        const comment = await vscode.window.showInputBox({ prompt: '还原注释（可选）', ignoreFocusOut: true });
+        if (comment === undefined) { return; }
+        try {
+          const out = await this.client.undeleteServerItem(serverPath, comment.trim() || undefined);
+          void vscode.window.showInformationMessage(`已还原 ${serverPath}`);
+          reportCommandOutput(this.output, 'undelete', out);
+          await this.provider.refresh();
+        } catch (e) { void vscode.window.showErrorMessage(t('error.failed', { title: 'arm-tfs undelete', message: translateCliMessage(getErrorMessage(e)) })); }
+      }),
+
+      // ─── 锁定文件 ──────────────────────────────────────────────────────
+      vscode.commands.registerCommand('armTfs.serverExplorer.lockItem', async (node?: ServerExplorerNode) => {
+        const serverPath = node?.entry.serverPath;
+        if (!serverPath) { return; }
+        try {
+          await this.client.lockItem(serverPath);
+          void vscode.window.showInformationMessage(`已锁定 ${serverPath}`);
+        } catch (e) { void vscode.window.showErrorMessage(t('error.failed', { title: 'arm-tfs lock', message: translateCliMessage(getErrorMessage(e)) })); }
+      }),
+
+      // ─── 解锁文件 ──────────────────────────────────────────────────────
+      vscode.commands.registerCommand('armTfs.serverExplorer.unlockItem', async (node?: ServerExplorerNode) => {
+        const serverPath = node?.entry.serverPath;
+        if (!serverPath) { return; }
+        try {
+          await this.client.unlockItem(serverPath);
+          void vscode.window.showInformationMessage(`已解锁 ${serverPath}`);
+        } catch (e) { void vscode.window.showErrorMessage(t('error.failed', { title: 'arm-tfs unlock', message: translateCliMessage(getErrorMessage(e)) })); }
+      }),
+
+      // ─── Cloak（屏蔽目录，get 时跳过） ────────────────────────────────
+      vscode.commands.registerCommand('armTfs.serverExplorer.cloakPath', async (node?: ServerExplorerNode) => {
+        const serverPath = node?.entry.serverPath;
+        if (!serverPath) { return; }
+        try {
+          await this.client.workfoldCloak(serverPath);
+          void vscode.window.showInformationMessage(`已屏蔽 ${serverPath}（Cloak）`);
+        } catch (e) { void vscode.window.showErrorMessage(t('error.failed', { title: 'arm-tfs cloak', message: translateCliMessage(getErrorMessage(e)) })); }
+      }),
+
+      // ─── Uncloak（取消屏蔽） ──────────────────────────────────────────
+      vscode.commands.registerCommand('armTfs.serverExplorer.uncloakPath', async (node?: ServerExplorerNode) => {
+        const serverPath = node?.entry.serverPath;
+        if (!serverPath) { return; }
+        try {
+          await this.client.workfoldUncloak(serverPath);
+          void vscode.window.showInformationMessage(`已取消屏蔽 ${serverPath}`);
+        } catch (e) { void vscode.window.showErrorMessage(t('error.failed', { title: 'arm-tfs uncloak', message: translateCliMessage(getErrorMessage(e)) })); }
+      }),
     );
   }
 
