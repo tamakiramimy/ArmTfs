@@ -12,6 +12,8 @@ public static class LabelCommand
         var cmd = new Command("label", "List and inspect TFVC labels.");
         cmd.AddCommand(BuildList(config));
         cmd.AddCommand(BuildShow(config));
+        cmd.AddCommand(BuildCreate(config));
+        cmd.AddCommand(BuildDelete(config));
         return cmd;
     }
 
@@ -167,4 +169,48 @@ public static class LabelCommand
         modifiedDate = label.ModifiedDate,
         owner = JsonOutput.Identity(label.Owner),
     };
+
+    private static Command BuildCreate(TfsConfig config)
+    {
+        var cmd = new Command("create", "Create a TFVC label on a server path.");
+        var nameArg = new Argument<string>("name", "Label name");
+        var pathArg = new Argument<string>("path", "Server path to label");
+        var commentOpt = new Option<string?>("--comment", "-c") { Description = "Label description" };
+        var versionOpt = new Option<int?>("--version", "-v") { Description = "Attach label at this changeset" };
+        cmd.AddArgument(nameArg);
+        cmd.AddArgument(pathArg);
+        cmd.AddOption(commentOpt);
+        cmd.AddOption(versionOpt);
+        cmd.SetHandler(async (name, path, comment, version) =>
+        {
+            using var conn = new TfsConnection(config);
+            var svc = new TfvcClientService(conn);
+            try
+            {
+                var result = await svc.CreateLabelAsync(name, path, comment, version).ConfigureAwait(false);
+                Console.WriteLine($"Label '{name}' created (result: {result}).");
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"Error: {ex.Message}"); Environment.ExitCode = 1; }
+        }, nameArg, pathArg, commentOpt, versionOpt);
+        return cmd;
+    }
+
+    private static Command BuildDelete(TfsConfig config)
+    {
+        var cmd = new Command("delete", "Delete a TFVC label by ID or name.");
+        var idArg = new Argument<string>("id", "Label ID (numeric) or label name");
+        cmd.AddArgument(idArg);
+        cmd.SetHandler(async (id) =>
+        {
+            using var conn = new TfsConnection(config);
+            var svc = new TfvcClientService(conn);
+            try
+            {
+                await svc.DeleteLabelAsync(id).ConfigureAwait(false);
+                Console.WriteLine($"Label '{id}' deleted.");
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"Error: {ex.Message}"); Environment.ExitCode = 1; }
+        }, idArg);
+        return cmd;
+    }
 }

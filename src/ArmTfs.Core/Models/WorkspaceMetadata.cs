@@ -31,6 +31,12 @@ public sealed record WorkspaceMetadata
     /// <summary>服务器路径 → 本地路径映射列表（顺序无关，匹配时按路径长度降序优先）</summary>
     public List<WorkspaceMapping> Mappings { get; init; } = new();
 
+    /// <summary>
+    /// Cloaked server paths — these paths are excluded from <c>get</c> operations.
+    /// Use <c>arm-tfs workfold cloak</c> to add entries and <c>uncloak</c> to remove.
+    /// </summary>
+    public List<string> CloakedPaths { get; init; } = new();
+
     /// <summary>工作区创建时间（UTC）</summary>
     public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.UtcNow;
 }

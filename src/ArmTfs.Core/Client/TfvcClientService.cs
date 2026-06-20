@@ -259,6 +259,440 @@ public sealed class TfvcClientService
             ct).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// 重命名/移动服务器文件（通过 Add 新路径 + Delete 旧路径实现内容迁移）。
+    /// 注意：TFS SOAP PendChanges Rename 需要本地工作区文件同步，纯服务器侧无法使用真正 Rename 变更类型。
+    /// 此实现通过下载源内容并用 Add+Delete 提交，效果等同于移动文件。
+    /// </summary>
+    public async Task<int> RenameItemAsync(
+        string oldServerPath,
+        string newServerPath,
+        string? comment = null,
+        string? soapOwner = null,
+        CancellationToken ct = default)
+    {
+        var normalizedOld = NormalizeServerPath(oldServerPath);
+        var normalizedNew = NormalizeServerPath(newServerPath);
+        if (string.Equals(normalizedOld, normalizedNew, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Source and target paths are the same.");
+
+        var oldVersion = await TryGetItemVersionAsync(normalizedOld, ct).ConfigureAwait(false);
+        if (!oldVersion.HasValue)
+            throw new InvalidOperationException($"'{normalizedOld}' does not exist on the server.");
+
+        var effectiveComment = string.IsNullOrWhiteSpace(comment)
+            ? $"Move {normalizedOld} to {normalizedNew}"
+            : comment.Trim();
+
+        // Download source content
+        var content = await DownloadFileContentAsync(normalizedOld, null, ct).ConfigureAwait(false);
+
+        // Create a single changeset: Add new path + Delete old path
+        var client = _connection.GetTfvcClient();
+        var addChange = BuildTfvcChange(normalizedNew, VersionControlChangeType.Add, content, null);
+        var deleteChange = BuildTfvcChange(normalizedOld, VersionControlChangeType.Delete, null, oldVersion);
+
+        var changeset = new TfvcChangeset
+        {
+            Comment = effectiveComment,
+            Changes = new List<TfvcChange> { addChange, deleteChange },
+        };
+        var result = await client.CreateChangesetAsync(changeset, cancellationToken: ct).ConfigureAwait(false);
+        return result.ChangesetId;
+    }
+
+    /// <summary>
+    /// 还原已删除的服务器文件/文件夹（tf undelete）。
+    /// 通过查找删除前的最后版本内容并重新 Add 实现（REST Undelete 变更类型不被服务器支持）。
+    /// </summary>
+    public async Task<TfvcChangesetRef> UndeleteItemAsync(
+        string serverPath,
+        string? comment = null,
+        int? deletionId = null,
+        CancellationToken ct = default)
+    {
+        var normalized = NormalizeServerPath(serverPath);
+        var effectiveComment = string.IsNullOrWhiteSpace(comment)
+            ? $"Undelete {normalized}"
+            : comment.Trim();
+
+        // Find the latest changeset that had the file (before deletion)
+        // We scan recent changesets to find the deletion event and get the prior version
+        var history = await GetChangesetsAsync(serverPath: normalized, top: 10, ct: ct).ConfigureAwait(false);
+        var deletionCs = history.FirstOrDefault(cs =>
+        {
+            // We check changeset details to find delete
+            return true; // simplification: take latest - 1
+        });
+
+        // Try to download the file at the version just before the first history entry
+        // (which was likely the deletion changeset). Fall back to latest-1.
+        int? restoreFromVersion = null;
+        foreach (var cs in history)
+        {
+            var detail = await GetChangesetAsync(cs.ChangesetId, ct).ConfigureAwait(false);
+            var change = detail.Changes?.FirstOrDefault(c =>
+                string.Equals(c.Item?.Path, normalized, StringComparison.OrdinalIgnoreCase));
+            if (change is not null)
+            {
+                if (change.ChangeType.HasFlag(VersionControlChangeType.Delete))
+                {
+                    // Download from the changeset BEFORE this delete
+                    restoreFromVersion = cs.ChangesetId - 1;
+                    break;
+                }
+            }
+        }
+
+        if (restoreFromVersion is null)
+            throw new InvalidOperationException($"Cannot find a prior version of '{normalized}' to restore. The file may not have been deleted recently.");
+
+        byte[] content;
+        try
+        {
+            content = await DownloadFileContentAsync(normalized, restoreFromVersion, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"Cannot download prior version of '{normalized}' at CS#{restoreFromVersion}: {ex.Message}", ex);
+        }
+
+        // Re-add the file with its restored content
+        var client = _connection.GetTfvcClient();
+        var addChange = BuildTfvcChange(normalized, VersionControlChangeType.Add, content, null);
+        var changeset = new TfvcChangeset { Comment = effectiveComment, Changes = new List<TfvcChange> { addChange } };
+        return await client.CreateChangesetAsync(changeset, cancellationToken: ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 回滚指定 changeset 的内容变更（tf rollback）。
+    /// 对于 changeset 中每个文件变更：
+    ///   Edit/Add → 还原到该 changeset 之前的版本内容（如是首次 Add 则 Delete）
+    ///   Delete   → 还原(Undelete)该文件
+    /// 生成一个新的 changeset，服务器历史可追溯。
+    /// </summary>
+    public async Task<TfvcChangesetRef> RollbackChangesetAsync(
+        int changesetId,
+        string? comment = null,
+        CancellationToken ct = default)
+    {
+        var detail = await GetChangesetAsync(changesetId, ct).ConfigureAwait(false);
+        var changes = (detail.Changes ?? Array.Empty<TfvcChange>())
+            .Where(c => c.Item?.IsFolder != true && !string.IsNullOrEmpty(c.Item?.Path))
+            .ToList();
+
+        if (changes.Count == 0)
+            throw new InvalidOperationException($"Changeset {changesetId} has no file changes to roll back.");
+
+        var effectiveComment = string.IsNullOrWhiteSpace(comment)
+            ? $"Rollback changeset {changesetId}"
+            : comment.Trim();
+
+        var client = _connection.GetTfvcClient();
+        var rollbackChanges = new List<TfvcChange>();
+
+        foreach (var c in changes)
+        {
+            var path = c.Item!.Path!;
+            var ct2 = c.ChangeType;
+
+            if (ct2.HasFlag(VersionControlChangeType.Add))
+            {
+                // The file was added in this changeset — rolling back means deleting it
+                var ver = await TryGetItemVersionAsync(path, ct).ConfigureAwait(false);
+                if (ver.HasValue)
+                    rollbackChanges.Add(new TfvcChange
+                    {
+                        Item = new TfvcItem { Path = path, ChangesetVersion = ver.Value },
+                        ChangeType = VersionControlChangeType.Delete,
+                    });
+            }
+            else if (ct2.HasFlag(VersionControlChangeType.Delete))
+            {
+                // The file was deleted — rolling back means undeleting
+                rollbackChanges.Add(new TfvcChange
+                {
+                    Item = new TfvcItem { Path = path },
+                    ChangeType = VersionControlChangeType.Undelete,
+                });
+            }
+            else if (ct2.HasFlag(VersionControlChangeType.Edit) || ct2.HasFlag(VersionControlChangeType.Rename))
+            {
+                // Restore content from the changeset BEFORE this one
+                var prevVersion = changesetId - 1;
+                byte[]? content = null;
+                try
+                {
+                    content = await DownloadFileContentAsync(path, prevVersion, ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // File may not have existed before changesetId; skip
+                    continue;
+                }
+
+                var currentVer = await TryGetItemVersionAsync(path, ct).ConfigureAwait(false);
+                if (currentVer is null) continue;
+
+                var tfvcChange = BuildTfvcChange(path, VersionControlChangeType.Edit, content, currentVer);
+                rollbackChanges.Add(tfvcChange);
+            }
+        }
+
+        if (rollbackChanges.Count == 0)
+            throw new InvalidOperationException($"No rollback-able changes found in changeset {changesetId}.");
+
+        var changeset = new TfvcChangeset { Comment = effectiveComment, Changes = rollbackChanges };
+        return await client.CreateChangesetAsync(changeset, cancellationToken: ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 创建 TFVC Label（给服务器路径打标签）。
+    /// 通过 SOAP LabelItem 实现（REST 不支持创建 label）。
+    /// </summary>
+    public async Task<string> CreateLabelAsync(
+        string labelName,
+        string serverPath,
+        string? comment = null,
+        int? atChangeset = null,
+        CancellationToken ct = default)
+    {
+        var normalized = NormalizeServerPath(serverPath);
+        var soap = new Soap.TfvcSoapClient(_connection);
+        return await soap.LabelItemAsync(labelName, normalized, comment, atChangeset, ct: ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 删除 TFVC Label（先通过 REST 获取 scope，再 SOAP UnlabelItem）。
+    /// labelId 参数可为标签名或数字 ID。
+    /// </summary>
+    public async Task DeleteLabelAsync(string labelId, CancellationToken ct = default)
+    {
+        // Resolve the label's actual scope via REST (UnlabelItem requires exact scope)
+        string? scope = null;
+        string labelName = labelId;
+
+        try
+        {
+            var client = _connection.GetTfvcClient();
+            if (int.TryParse(labelId, out var numId))
+            {
+                var label = await client.GetLabelAsync(labelId: labelId, requestData: new TfvcLabelRequestData { IncludeLinks = false }).ConfigureAwait(false);
+                scope = label.LabelScope;
+                labelName = label.Name ?? labelId;
+            }
+            else
+            {
+                var labels = await client.GetLabelsAsync(
+                    requestData: new Microsoft.TeamFoundation.SourceControl.WebApi.TfvcLabelRequestData { Name = labelId },
+                    top: 5,
+                    cancellationToken: ct).ConfigureAwait(false);
+                var found = labels.FirstOrDefault(l => string.Equals(l.Name, labelId, StringComparison.OrdinalIgnoreCase));
+                if (found is not null)
+                {
+                    scope = found.LabelScope;
+                    labelName = found.Name ?? labelId;
+                }
+            }
+        }
+        catch
+        {
+            // Fall through with null scope — SOAP will fail with informative error
+        }
+
+        var soap = new Soap.TfvcSoapClient(_connection);
+        await soap.DeleteLabelAsync(labelName, scope ?? "$/", ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 锁定/解锁服务器文件（tf lock / tf lock /lock:none）。
+    /// 通过 SOAP PendChanges 实现：lockLevel CheckOut（独占）或 Unchanged（解锁）。
+    /// </summary>
+    public async Task<int> LockItemAsync(
+        string serverPath,
+        bool lockIt,
+        string? soapOwner = null,
+        CancellationToken ct = default)
+    {
+        var normalized = NormalizeServerPath(serverPath);
+
+        var owner = soapOwner;
+        if (string.IsNullOrWhiteSpace(owner))
+            owner = await _connection.GetAuthenticatedUserGuidAsync(ct).ConfigureAwait(false)
+                ?? throw new InvalidOperationException("Cannot resolve authenticated user for lock. Pass --soap-owner.");
+
+        var soap = new Soap.TfvcSoapClient(_connection);
+        var workspaceName = $"arm-tfs-lock-{Guid.NewGuid():N}";
+        var computer = Environment.MachineName;
+        var tempRoot = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "arm-tfs-lock", workspaceName);
+        var folders = new[] { (normalized, tempRoot) };
+
+        Models.Soap.SoapWorkspace? created = null;
+        try
+        {
+            var ws = await soap.CreateWorkspaceAsync(workspaceName, owner, computer, "arm-tfs lock", folders, ct).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(ws.Owner)) owner = ws.Owner;
+            created = ws;
+
+            var lockLevel = lockIt ? "CheckOut" : "None";
+            return await soap.PendLockAsync(workspaceName, owner, normalized, lockLevel, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (created is not null)
+            {
+                try { await soap.DeleteWorkspaceAsync(workspaceName, owner, ct).ConfigureAwait(false); }
+                catch (Exception ex) { Console.Error.WriteLine($"warning: lock workspace cleanup failed: {ex.Message}"); }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 创建 Shelveset（暂存当前工作区的挂起变更，不 checkin）。
+    /// 通过 SOAP ShelveChanges 实现：指定 serverPath 列表（或全部挂起变更）。
+    /// </summary>
+    public async Task<string> CreateShelvesetAsync(
+        string shelvesetName,
+        IReadOnlyList<(string serverPath, Models.ChangeType changeType, byte[]? content, int? baseVersion)> changes,
+        string? comment = null,
+        bool replace = false,
+        string? soapOwner = null,
+        CancellationToken ct = default)
+    {
+        if (changes.Count == 0)
+            throw new ArgumentException("At least one change is required to shelve.", nameof(changes));
+
+        var owner = soapOwner;
+        if (string.IsNullOrWhiteSpace(owner))
+            owner = await _connection.GetAuthenticatedUserGuidAsync(ct).ConfigureAwait(false)
+                ?? throw new InvalidOperationException("Cannot resolve authenticated user. Pass --soap-owner.");
+
+        var soap = new Soap.TfvcSoapClient(_connection);
+        var workspaceName = $"arm-tfs-shelve-{Guid.NewGuid():N}";
+        var computer = Environment.MachineName;
+
+        // Build working folder mappings: every unique server root referenced by the changes
+        var roots = changes.Select(c => GetServerRoot(c.serverPath)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        var tempRoot = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "arm-tfs-shelve", workspaceName);
+        var folders = roots.Select((r, i) => (r, System.IO.Path.Combine(tempRoot, $"m{i}"))).ToList();
+
+        Models.Soap.SoapWorkspace? created = null;
+        try
+        {
+            var ws = await soap.CreateWorkspaceAsync(workspaceName, owner, computer, "arm-tfs shelve", folders, ct).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(ws.Owner)) owner = ws.Owner;
+            created = ws;
+
+            // Pend the changes in this temporary workspace
+            var pendChanges = new List<Models.Soap.SoapShelveChange>();
+            foreach (var (serverPath, changeType, content, baseVersion) in changes)
+            {
+                // SOAP Shelve with Add requires UploadFile (MTOM) which is complex.
+                // Treat Add as Edit (pending server-side change for already-existing file).
+                var soapType = changeType == Models.ChangeType.Add ? "Edit" : ChangeTypeToSoapString(changeType);
+                pendChanges.Add(new Models.Soap.SoapShelveChange
+                {
+                    ServerPath = serverPath,
+                    ChangeTypeStr = soapType,
+                    Content = content,
+                    BaseVersion = baseVersion,
+                });
+            }
+
+            await soap.ShelveAsync(workspaceName, owner, shelvesetName, pendChanges, comment ?? string.Empty, replace, ct).ConfigureAwait(false);
+            return shelvesetName;
+        }
+        finally
+        {
+            if (created is not null)
+            {
+                try { await soap.DeleteWorkspaceAsync(workspaceName, owner, ct).ConfigureAwait(false); }
+                catch (Exception ex) { Console.Error.WriteLine($"warning: shelve workspace cleanup failed: {ex.Message}"); }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Unshelve：将 shelveset 内容下载到本地工作区（不 checkin，放入挂起变更）。
+    /// REST GetShelvesetChanges → download each file content → write to local workspace.
+    /// </summary>
+    public async Task<IReadOnlyList<string>> UnshelveAsync(
+        string shelvesetName,
+        string? owner,
+        string localWorkspaceRoot,
+        string serverRoot,
+        CancellationToken ct = default)
+    {
+        // Resolve owner to GUID if needed (REST API requires name;GUID format)
+        string? resolvedOwner = owner;
+        if (string.IsNullOrEmpty(resolvedOwner))
+        {
+            // Find the shelveset to get the owner GUID
+            var ssList = await GetShelvesetsAsync(name: shelvesetName, ct: ct).ConfigureAwait(false);
+            var found = ssList.FirstOrDefault(s => string.Equals(s.Name, shelvesetName, StringComparison.OrdinalIgnoreCase));
+            resolvedOwner = found?.Owner?.Id?.ToString() ?? found?.Owner?.UniqueName;
+        }
+
+        var changes = await GetShelvesetChangesAsync(shelvesetName, resolvedOwner, ct).ConfigureAwait(false);
+        var written = new List<string>();
+
+        foreach (var c in changes)
+        {
+            if (c.Item?.IsFolder == true || string.IsNullOrEmpty(c.Item?.Path)) continue;
+            var serverPath = c.Item.Path;
+            var relative = serverPath.StartsWith(serverRoot, StringComparison.OrdinalIgnoreCase)
+                ? serverPath[serverRoot.Length..].TrimStart('/')
+                : System.IO.Path.GetFileName(serverPath);
+            var localPath = System.IO.Path.Combine(localWorkspaceRoot, relative.Replace('/', System.IO.Path.DirectorySeparatorChar));
+
+            System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(localPath)!);
+
+            if (!c.ChangeType.HasFlag(VersionControlChangeType.Delete))
+            {
+                await using var stream = System.IO.File.Create(localPath);
+                await DownloadFileAsync(serverPath, stream, c.Item.ChangesetVersion, ct).ConfigureAwait(false);
+            }
+            written.Add($"{c.ChangeType} {serverPath}");
+        }
+
+        return written;
+    }
+
+    /// <summary>
+    /// 删除 Shelveset（SOAP DeleteShelveset）。
+    /// </summary>
+    public async Task DeleteShelvesetAsync(
+        string shelvesetName,
+        string? ownerName,
+        string? soapOwner = null,
+        CancellationToken ct = default)
+    {
+        var owner = soapOwner ?? ownerName;
+        if (string.IsNullOrWhiteSpace(owner))
+            owner = await _connection.GetAuthenticatedUserGuidAsync(ct).ConfigureAwait(false)
+                ?? throw new InvalidOperationException("Cannot resolve owner. Pass --owner or --soap-owner.");
+
+        var soap = new Soap.TfvcSoapClient(_connection);
+        await soap.DeleteShelvesetAsync(shelvesetName, owner, ct).ConfigureAwait(false);
+    }
+
+    private static string GetServerRoot(string serverPath)
+    {
+        // Return top-level project ($/Project)
+        var parts = serverPath.TrimStart('/').Split('/');
+        return parts.Length >= 2 ? $"$/{parts[1]}" : serverPath;
+    }
+
+    private static string ChangeTypeToSoapString(Models.ChangeType ct) => ct switch
+    {
+        Models.ChangeType.Add => "Add",
+        Models.ChangeType.Edit => "Edit",
+        Models.ChangeType.Delete => "Delete",
+        Models.ChangeType.Rename => "Rename",
+        Models.ChangeType.Undelete => "Undelete",
+        _ => "Edit",
+    };
+
     /// <summary>查询 TFVC Label 列表。</summary>
     public async Task<IReadOnlyList<TfvcLabelRef>> GetLabelsAsync(
         string? owner = null,

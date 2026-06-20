@@ -431,6 +431,226 @@ public sealed class TfvcSoapClient
         return changesetId;
     }
 
+    // ─── PendChanges / Lock / Shelve ─────────────────────────────────────────
+
+    /// <summary>
+    /// 对指定路径施加/解除锁定（tf lock）。
+    /// lockLevel: CheckOut（独占锁）、None（解锁）、Checkin（签入时锁）。
+    /// 返回影响的操作数。
+    /// </summary>
+    public async Task<int> PendLockAsync(
+        string workspaceName,
+        string ownerName,
+        string serverPath,
+        string lockLevel = "CheckOut",
+        CancellationToken ct = default)
+    {
+        var body = $@"    <tns:PendChanges>
+      <tns:workspaceName>{Esc(workspaceName)}</tns:workspaceName>
+      <tns:ownerName>{Esc(ownerName)}</tns:ownerName>
+      <tns:changes>
+        <tns:ChangeRequest req=""Lock"" lock=""{Esc(lockLevel)}"">
+          <tns:item item=""{Esc(serverPath)}"" recurse=""None"" did=""0"" />
+          <tns:vspec xsi:type=""tns:LatestVersionSpec"" />
+        </tns:ChangeRequest>
+      </tns:changes>
+      <tns:pendChangesOptions>0</tns:pendChangesOptions>
+      <tns:supportedFeatures>0</tns:supportedFeatures>
+    </tns:PendChanges>";
+
+        var doc = await InvokeAsync("PendChanges", body, ct).ConfigureAwait(false);
+        var result = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "PendChangesResult");
+        var countAttr = AttrAny(result, "count") ?? AttrAny(result, "Count");
+        return int.TryParse(countAttr, out var n) ? n : 0;
+    }
+
+    /// <summary>
+    /// Shelve：将 workspace 中的挂起变更保存为 shelveset，不签入到服务器历史。
+    /// replace=true 时覆盖同名 shelveset。
+    /// </summary>
+    public async Task ShelveAsync(
+        string workspaceName,
+        string ownerName,
+        string shelvesetName,
+        IReadOnlyList<Models.Soap.SoapShelveChange> changes,
+        string comment,
+        bool replace = false,
+        CancellationToken ct = default)
+    {
+        // First pend the changes in the workspace so the server knows what to shelve
+        var changesXml = new System.Text.StringBuilder();
+        foreach (var c in changes)
+        {
+            var verEl = c.BaseVersion.HasValue
+                ? $@"<tns:vspec xsi:type=""tns:ChangesetVersionSpec"" cs=""{c.BaseVersion.Value}"" />"
+                : @"<tns:vspec xsi:type=""tns:LatestVersionSpec"" />";
+            changesXml.AppendLine($@"        <tns:ChangeRequest req=""{Esc(c.ChangeTypeStr)}"" lock=""Unchanged"" enc=""65001"" type=""File"">
+          <tns:item item=""{Esc(c.ServerPath)}"" recurse=""None"" did=""0"" />
+          {verEl}
+        </tns:ChangeRequest>");
+        }
+
+        var pendBody = $@"    <tns:PendChanges>
+      <tns:workspaceName>{Esc(workspaceName)}</tns:workspaceName>
+      <tns:ownerName>{Esc(ownerName)}</tns:ownerName>
+      <tns:changes>
+{changesXml}      </tns:changes>
+      <tns:pendChangesOptions>0</tns:pendChangesOptions>
+      <tns:supportedFeatures>0</tns:supportedFeatures>
+    </tns:PendChanges>";
+
+        await InvokeAsync("PendChanges", pendBody, ct).ConfigureAwait(false);
+
+        // Now shelve
+        var serverItemsXml = string.Concat(changes.Select(c => $"        <tns:string>{Esc(c.ServerPath)}</tns:string>\n"));
+        var shelveBody = $@"    <tns:Shelve>
+      <tns:workspaceName>{Esc(workspaceName)}</tns:workspaceName>
+      <tns:workspaceOwner>{Esc(ownerName)}</tns:workspaceOwner>
+      <tns:serverItems>
+{serverItemsXml}      </tns:serverItems>
+      <tns:shelveset name=""{Esc(shelvesetName)}"" owner=""{Esc(ownerName)}"" date=""0001-01-01T00:00:00"">
+        <tns:Comment>{Esc(comment)}</tns:Comment>
+      </tns:shelveset>
+      <tns:replace>{(replace ? "true" : "false")}</tns:replace>
+      <tns:move>false</tns:move>
+    </tns:Shelve>";
+
+        await InvokeAsync("Shelve", shelveBody, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 删除指定 shelveset（tf shelve /delete）。
+    /// </summary>
+    public async Task DeleteShelvesetAsync(
+        string shelvesetName,
+        string ownerName,
+        CancellationToken ct = default)
+    {
+        var body = $@"    <tns:DeleteShelveset>
+      <tns:shelvesetName>{Esc(shelvesetName)}</tns:shelvesetName>
+      <tns:ownerName>{Esc(ownerName)}</tns:ownerName>
+    </tns:DeleteShelveset>";
+
+        await InvokeAsync("DeleteShelveset", body, ct).ConfigureAwait(false);
+    }
+
+    // ─── Label ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// 创建（或更新）TFVC Label，并将指定路径附加到该 label。
+    /// TFS REST API 不支持 label 创建，必须使用 SOAP LabelItem。
+    /// </summary>
+    public async Task<string> LabelItemAsync(
+        string labelName,
+        string serverPath,
+        string? comment = null,
+        int? atChangeset = null,
+        string? scope = null,
+        CancellationToken ct = default)
+    {
+        var versionEl = atChangeset.HasValue
+            ? $@"<tns:Version xsi:type=""tns:ChangesetVersionSpec"" cs=""{atChangeset.Value}"" />"
+            : @"<tns:Version xsi:type=""tns:LatestVersionSpec"" />";
+
+        // VersionControlLabel requires date attribute; label/scope are attributes on the label element.
+        // labelSpecs is a sibling element (not nested inside label).
+        var body = $@"    <tns:LabelItem>
+      <tns:label name=""{Esc(labelName)}"" date=""0001-01-01T00:00:00"">
+        <tns:Comment>{Esc(comment ?? string.Empty)}</tns:Comment>
+      </tns:label>
+      <tns:labelSpecs>
+        <tns:LabelItemSpec>
+          <tns:ItemSpec item=""{Esc(serverPath)}"" recurse=""Full"" did=""0"" />
+          {versionEl}
+        </tns:LabelItemSpec>
+      </tns:labelSpecs>
+      <tns:children>Replace</tns:children>
+    </tns:LabelItem>";
+
+        var doc = await InvokeAsync("LabelItem", body, ct).ConfigureAwait(false);
+
+        // Check for failures
+        var failures = doc.Descendants().Where(e => e.Name.LocalName == "Failure").ToList();
+        if (failures.Count > 0)
+        {
+            var msg = failures.First().Descendants().FirstOrDefault(e => e.Name.LocalName == "Message")?.Value
+                   ?? failures.First().ToString();
+            throw new SoapFaultException("LabelItem", System.Net.HttpStatusCode.OK, msg, doc.ToString());
+        }
+
+        return labelName;
+    }
+
+    /// <summary>
+    /// 删除 TFVC Label（SOAP UnlabelItem）。
+    /// </summary>
+    public async Task DeleteLabelAsync(
+        string labelName,
+        string scope = "$/",
+        CancellationToken ct = default)
+    {
+        var body = $@"    <tns:UnlabelItem>
+      <tns:labelName>{Esc(labelName)}</tns:labelName>
+      <tns:labelScope>{Esc(scope)}</tns:labelScope>
+      <tns:items>
+        <tns:ItemSpec item=""{Esc(scope)}"" recurse=""Full"" did=""0"" />
+      </tns:items>
+      <tns:version xsi:type=""tns:LatestVersionSpec"" />
+    </tns:UnlabelItem>";
+
+        var doc = await InvokeAsync("UnlabelItem", body, ct).ConfigureAwait(false);
+
+        // Check for failures
+        var failures = doc.Descendants().Where(e => e.Name.LocalName == "Failure").ToList();
+        if (failures.Count > 0)
+        {
+            var msg = failures.First().Descendants().FirstOrDefault(e => e.Name.LocalName == "Message")?.Value
+                   ?? failures.First().ToString();
+            throw new SoapFaultException("UnlabelItem", System.Net.HttpStatusCode.OK, msg, doc.ToString());
+        }
+    }
+
+    /// <summary>
+    /// 在 workspace 中 Pend 一个 Rename 操作，返回目标文件的 itemId（用于 CheckIn）。
+    /// </summary>
+    public async Task<int> PendRenameAsync(
+        string workspaceName,
+        string ownerName,
+        string oldServerPath,
+        string newServerPath,
+        int baseVersion,
+        CancellationToken ct = default)
+    {
+        var body = $@"    <tns:PendChanges>
+      <tns:workspaceName>{Esc(workspaceName)}</tns:workspaceName>
+      <tns:ownerName>{Esc(ownerName)}</tns:ownerName>
+      <tns:changes>
+        <tns:ChangeRequest req=""Rename"" target=""{Esc(newServerPath)}"" lock=""Unchanged"">
+          <tns:item item=""{Esc(oldServerPath)}"" recurse=""None"" did=""0"" />
+          <tns:vspec xsi:type=""tns:ChangesetVersionSpec"" cs=""{baseVersion}"" />
+        </tns:ChangeRequest>
+      </tns:changes>
+      <tns:pendChangesOptions>0</tns:pendChangesOptions>
+      <tns:supportedFeatures>0</tns:supportedFeatures>
+    </tns:PendChanges>";
+
+        var doc = await InvokeAsync("PendChanges", body, ct).ConfigureAwait(false);
+
+        // Find the GetOperation for the renamed (new) path
+        foreach (var op in doc.Descendants().Where(e => e.Name.LocalName == "GetOperation"))
+        {
+            var titem = AttrAny(op, "titem") ?? AttrAny(op, "targetitem") ?? AttrAny(op, "sitem") ?? string.Empty;
+            if (string.Equals(titem, newServerPath, StringComparison.OrdinalIgnoreCase))
+                return TryParseInt(AttrAny(op, "itemid")) ?? 0;
+        }
+
+        // Fallback: return any item id found
+        foreach (var op in doc.Descendants().Where(e => e.Name.LocalName == "GetOperation"))
+            return TryParseInt(AttrAny(op, "itemid")) ?? 0;
+
+        return 0;
+    }
+
     private static string? AttrAny(XElement? element, string localName)
     {
         if (element is null) return null;

@@ -14,6 +14,9 @@ public static class ShelvesetCommand
 
         cmd.AddCommand(BuildList(config));
         cmd.AddCommand(BuildShow(config));
+        cmd.AddCommand(BuildCreate(config));
+        cmd.AddCommand(BuildUnshelve(config));
+        cmd.AddCommand(BuildDelete(config));
 
         return cmd;
     }
@@ -115,6 +118,147 @@ public static class ShelvesetCommand
                 Environment.ExitCode = 1;
             }
         }, nameArg);
+
+        return cmd;
+    }
+
+    private static Command BuildCreate(TfsConfig config)
+    {
+        var cmd = new Command("create", "Create a shelveset from pending changes (local workspace).");
+
+        var nameArg = new Argument<string>("name", "Shelveset name");
+        var pathsArg = new Argument<string[]>("paths", () => new[] { "." }) { Description = "Local files to shelve (defaults to all pending)", Arity = ArgumentArity.ZeroOrMore };
+        var commentOpt = new Option<string?>("--comment", "-c") { Description = "Shelveset comment" };
+        var replaceOpt = new Option<bool>("--replace") { Description = "Replace existing shelveset with the same name" };
+        var ownerOpt = new Option<string?>("--soap-owner") { Description = "Override SOAP owner (GUID or DOMAIN\\\\user)" };
+
+        cmd.AddArgument(nameArg);
+        cmd.AddArgument(pathsArg);
+        cmd.AddOption(commentOpt);
+        cmd.AddOption(replaceOpt);
+        cmd.AddOption(ownerOpt);
+
+        cmd.SetHandler(async (name, paths, comment, replace, soapOwner) =>
+        {
+            var ws = ArmTfs.Core.Workspace.WorkspaceManager.FindWorkspace(Directory.GetCurrentDirectory());
+            if (ws is null) { Console.Error.WriteLine("No workspace found."); Environment.ExitCode = 1; return; }
+
+            var pending = ws.LoadPendingChanges().ToList();
+            if (pending.Count == 0) { Console.WriteLine("Nothing pending to shelve."); return; }
+
+            // Filter by paths
+            IList<ArmTfs.Core.Models.PendingChange> toShelve;
+            if (paths.Length == 0 || (paths.Length == 1 && paths[0] == "."))
+                toShelve = pending;
+            else
+            {
+                var absPaths = paths.Select(Path.GetFullPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                toShelve = pending.Where(p =>
+                    absPaths.Contains(p.LocalPath) ||
+                    absPaths.Any(ap => p.LocalPath.StartsWith(ap + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                ).ToList();
+            }
+
+            if (toShelve.Count == 0) { Console.WriteLine("No pending changes match the specified paths."); return; }
+
+            // Build changes list
+            var changes = new List<(string serverPath, ArmTfs.Core.Models.ChangeType changeType, byte[]? content, int? baseVersion)>();
+            foreach (var c in toShelve)
+            {
+                byte[]? content = null;
+                int? baseVersion = null;
+                if (c.ChangeType is ArmTfs.Core.Models.ChangeType.Add or ArmTfs.Core.Models.ChangeType.Edit)
+                {
+                    if (File.Exists(c.LocalPath))
+                        content = await File.ReadAllBytesAsync(c.LocalPath).ConfigureAwait(false);
+                }
+                if (c.ChangeType is not ArmTfs.Core.Models.ChangeType.Add)
+                {
+                    var tracked = ws.GetTrackedVersion(c.LocalPath);
+                    baseVersion = tracked?.ChangesetId;
+                }
+                changes.Add((c.ServerPath, c.ChangeType, content, baseVersion));
+            }
+
+            using var conn = new TfsConnection(config);
+            var svc = new TfvcClientService(conn);
+            try
+            {
+                await svc.CreateShelvesetAsync(name, changes, comment, replace, soapOwner).ConfigureAwait(false);
+                Console.WriteLine($"Shelveset '{name}' created with {changes.Count} change(s).");
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"Error: {ex.Message}"); Environment.ExitCode = 1; }
+        }, nameArg, pathsArg, commentOpt, replaceOpt, ownerOpt);
+
+        return cmd;
+    }
+
+    private static Command BuildUnshelve(TfsConfig config)
+    {
+        var cmd = new Command("unshelve", "Apply a shelveset's changes to the local workspace.");
+
+        var nameArg = new Argument<string>("name", "Shelveset name (use 'name;owner' to specify owner)");
+        cmd.AddArgument(nameArg);
+
+        cmd.SetHandler(async (name) =>
+        {
+            string shelvesetName = name, owner = "";
+            var semi = name.IndexOf(';');
+            if (semi >= 0) { shelvesetName = name[..semi]; owner = name[(semi + 1)..]; }
+
+            var ws = ArmTfs.Core.Workspace.WorkspaceManager.FindWorkspace(Directory.GetCurrentDirectory());
+            if (ws is null) { Console.Error.WriteLine("No workspace found."); Environment.ExitCode = 1; return; }
+
+            var meta = ws.LoadMetadata();
+            var mapping = meta.Mappings.FirstOrDefault();
+            if (mapping is null) { Console.Error.WriteLine("No workspace mapping."); Environment.ExitCode = 1; return; }
+
+            using var conn = new TfsConnection(config);
+            var svc = new TfvcClientService(conn);
+            try
+            {
+                var written = await svc.UnshelveAsync(
+                    shelvesetName,
+                    string.IsNullOrEmpty(owner) ? null : owner,
+                    mapping.LocalPath,
+                    mapping.ServerPath).ConfigureAwait(false);
+
+                Console.WriteLine($"Unshelved {written.Count} file(s):");
+                foreach (var f in written) Console.WriteLine($"  {f}");
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"Error: {ex.Message}"); Environment.ExitCode = 1; }
+        }, nameArg);
+
+        return cmd;
+    }
+
+    private static Command BuildDelete(TfsConfig config)
+    {
+        var cmd = new Command("delete", "Delete a shelveset from the server.");
+
+        var nameArg = new Argument<string>("name", "Shelveset name (use 'name;owner' to specify owner)");
+        var ownerOpt = new Option<string?>("--owner", "-o") { Description = "Owner of the shelveset" };
+        var soapOwnerOpt = new Option<string?>("--soap-owner") { Description = "Override SOAP owner (GUID)" };
+
+        cmd.AddArgument(nameArg);
+        cmd.AddOption(ownerOpt);
+        cmd.AddOption(soapOwnerOpt);
+
+        cmd.SetHandler(async (name, owner, soapOwner) =>
+        {
+            string shelvesetName = name, resolvedOwner = owner ?? "";
+            var semi = name.IndexOf(';');
+            if (semi >= 0) { shelvesetName = name[..semi]; if (string.IsNullOrEmpty(resolvedOwner)) resolvedOwner = name[(semi + 1)..]; }
+
+            using var conn = new TfsConnection(config);
+            var svc = new TfvcClientService(conn);
+            try
+            {
+                await svc.DeleteShelvesetAsync(shelvesetName, resolvedOwner, soapOwner).ConfigureAwait(false);
+                Console.WriteLine($"Shelveset '{shelvesetName}' deleted.");
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"Error: {ex.Message}"); Environment.ExitCode = 1; }
+        }, nameArg, ownerOpt, soapOwnerOpt);
 
         return cmd;
     }

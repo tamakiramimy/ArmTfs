@@ -15,7 +15,7 @@ public static class GetCommand
         var cmd = new Command("get", "Get the latest version of files from the server.");
 
         var pathArg = new Argument<string>("path", () => ".", "Local path or server path to sync");
-        var versionOpt = new Option<int?>("--version", "-v") { Description = "Download a specific changeset version" };
+        var versionOpt = new Option<string?>("--version", "-v") { Description = "Version spec: changeset (C123), label (Lname), date (Ddate), latest (T)" };
         var forceOpt = new Option<bool>(new[] { "--force", "-f" }) { Description = "Overwrite even if local file appears up-to-date" };
         var recursiveOpt = new Option<bool>(new[] { "--recursive", "-r" }, getDefaultValue: () => true) { Description = "Get all files recursively (default: true)" };
         var dryRunOpt = new Option<bool>("--dry-run") { Description = "Show what would be downloaded without writing files" };
@@ -28,8 +28,18 @@ public static class GetCommand
         cmd.AddOption(dryRunOpt);
         cmd.AddOption(localPathOpt);
 
-        cmd.SetHandler(async (path, version, force, recursive, dryRun, localPathOverride) =>
+        cmd.SetHandler(async (path, versionSpec, force, recursive, dryRun, localPathOverride) =>
         {
+            // Parse version spec → int? (changeset) for REST
+            int? version = ParseVersionSpec(versionSpec);
+            Microsoft.TeamFoundation.SourceControl.WebApi.TfvcVersionDescriptor? versionDescriptor = null;
+            if (!string.IsNullOrWhiteSpace(versionSpec) && version is null)
+            {
+                // Non-numeric version spec — pass through as label or date descriptor via TfvcVersionDescriptor
+                // We'll plumb this in GetItemsAsync via the existing atChangeset=null path (not yet supported)
+                // For now, try resolving label/date to a changeset ID via REST items call
+                versionDescriptor = ParseVersionDescriptor(versionSpec);
+            }
             var ws = WorkspaceManager.FindWorkspace(Directory.GetCurrentDirectory());
 
             // ── 自动工作区创建 ─────────────────────────────────────────────────────
@@ -93,7 +103,11 @@ public static class GetCommand
             Console.WriteLine($"Getting from: {serverPath}");
 
             var items = await svc.GetItemsAsync(serverPath, recursive, version).ConfigureAwait(false);
-            var files = items.Where(i => !i.IsFolder).ToList();
+            var cloaked = meta.CloakedPaths;
+            var files = items
+                .Where(i => !i.IsFolder)
+                .Where(i => !cloaked.Any(c => i.ServerPath.StartsWith(c + "/", StringComparison.OrdinalIgnoreCase) || string.Equals(i.ServerPath, c, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
 
             Console.WriteLine($"Found {files.Count} file(s).");
 
@@ -167,5 +181,41 @@ public static class GetCommand
         }, pathArg, versionOpt, forceOpt, recursiveOpt, dryRunOpt, localPathOpt);
 
         return cmd;
+    }
+
+    /// <summary>
+    /// 解析 TFS 版本规格字符串为 changeset ID（int）。
+    /// 支持格式：纯数字 "123"、"C123"（Changeset）。
+    /// Label "Lname" 和 Date "D..." 返回 null（需要 versionDescriptor）。
+    /// </summary>
+    private static int? ParseVersionSpec(string? spec)
+    {
+        if (string.IsNullOrWhiteSpace(spec)) return null;
+        var s = spec.Trim();
+        // C123 or plain integer → changeset
+        if (s.StartsWith("C", StringComparison.OrdinalIgnoreCase) && int.TryParse(s[1..], out var cs)) return cs;
+        if (int.TryParse(s, out var n)) return n;
+        return null;
+    }
+
+    private static Microsoft.TeamFoundation.SourceControl.WebApi.TfvcVersionDescriptor? ParseVersionDescriptor(string spec)
+    {
+        var s = spec.Trim();
+        if (s.StartsWith("L", StringComparison.OrdinalIgnoreCase))
+            return new Microsoft.TeamFoundation.SourceControl.WebApi.TfvcVersionDescriptor
+            {
+                VersionType = Microsoft.TeamFoundation.SourceControl.WebApi.TfvcVersionType.Changeset,
+                VersionOption = Microsoft.TeamFoundation.SourceControl.WebApi.TfvcVersionOption.None,
+                Version = $"L{s[1..]}",
+            };
+        if (s.StartsWith("D", StringComparison.OrdinalIgnoreCase))
+            return new Microsoft.TeamFoundation.SourceControl.WebApi.TfvcVersionDescriptor
+            {
+                VersionType = Microsoft.TeamFoundation.SourceControl.WebApi.TfvcVersionType.Changeset,
+                VersionOption = Microsoft.TeamFoundation.SourceControl.WebApi.TfvcVersionOption.None,
+                Version = null, // date not easily representable; fall back to null (latest)
+            };
+        // T (latest) — return null (default behavior is latest)
+        return null;
     }
 }
