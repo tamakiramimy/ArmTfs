@@ -95,10 +95,12 @@ public static class MergeCommand
 
     private static Command BuildExecute(TfsConfig config)
     {
-        var cmd = new Command("execute", "Execute a single TFVC changeset merge from source to target.");
+        var cmd = new Command("execute", "Execute or preview a TFVC merge from source to target.");
         var sourceOpt = new Option<string>("--source") { Description = "Source branch or folder path ($/...)" };
         var targetOpt = new Option<string>("--target") { Description = "Target branch or folder path ($/...)" };
-        var changesetOpt = new Option<int>("--changeset") { Description = "Source changeset ID to merge", IsRequired = true };
+        var changesetOpt = new Option<int?>("--changeset") { Description = "Single source changeset ID to merge" };
+        var fromOpt = new Option<int?>("--from") { Description = "First source changeset in a SOAP range merge plan (inclusive)" };
+        var toOpt = new Option<int?>("--to") { Description = "Last source changeset in a SOAP range merge plan (inclusive)" };
         var commentOpt = new Option<string?>("--comment") { Description = "Comment for the created merge changeset" };
         var dryRunOpt = new Option<bool>("--dry-run") { Description = "Show the merge plan without creating a TFVC changeset" };
         var resolutionFileOpt = new Option<FileInfo?>("--resolution-file") { Description = "JSON file with per-file merge resolutions" };
@@ -112,6 +114,8 @@ public static class MergeCommand
         cmd.AddOption(sourceOpt);
         cmd.AddOption(targetOpt);
         cmd.AddOption(changesetOpt);
+        cmd.AddOption(fromOpt);
+        cmd.AddOption(toOpt);
         cmd.AddOption(commentOpt);
         cmd.AddOption(dryRunOpt);
         cmd.AddOption(resolutionFileOpt);
@@ -124,6 +128,8 @@ public static class MergeCommand
             var source = ctx.ParseResult.GetValueForOption(sourceOpt)!;
             var target = ctx.ParseResult.GetValueForOption(targetOpt)!;
             var changesetId = ctx.ParseResult.GetValueForOption(changesetOpt);
+            var fromChangeset = ctx.ParseResult.GetValueForOption(fromOpt);
+            var toChangeset = ctx.ParseResult.GetValueForOption(toOpt);
             var comment = ctx.ParseResult.GetValueForOption(commentOpt);
             var dryRun = ctx.ParseResult.GetValueForOption(dryRunOpt);
             var resolutionFile = ctx.ParseResult.GetValueForOption(resolutionFileOpt);
@@ -139,11 +145,34 @@ public static class MergeCommand
             {
                 var resolvedSource = ResolveServerPath(source);
                 var resolvedTarget = ResolveServerPath(target);
-                var resolutions = LoadMergeResolutions(resolutionFile);
-                var result = await svc.MergeChangesetAsync(
-                    resolvedSource, resolvedTarget, changesetId, comment, dryRun, resolutions,
-                    mergeMode: mode,
-                    soapOwner: soapOwner).ConfigureAwait(false);
+                var hasSingle = changesetId.HasValue;
+                var hasRange = fromChangeset.HasValue || toChangeset.HasValue;
+                if (hasSingle == hasRange || (hasRange && (!fromChangeset.HasValue || !toChangeset.HasValue)))
+                    throw new InvalidOperationException("Specify either --changeset, or both --from and --to.");
+
+                MergeExecutionResult result;
+                if (hasRange)
+                {
+                    if (!string.Equals(mode, "soap", StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException("Range merge is SOAP-only. Omit --mode or use --mode soap.");
+                    if (resolutionFile is not null)
+                        throw new InvalidOperationException("Range merge does not accept --resolution-file yet. Use the range dry-run to list conflicts, then execute resolved single changesets from the workbench.");
+
+                    result = await svc.MergeChangesetRangeViaSoapAsync(
+                        resolvedSource, resolvedTarget,
+                        fromChangeset!.Value, toChangeset!.Value,
+                        comment,
+                        dryRun,
+                        soapOwner: soapOwner).ConfigureAwait(false);
+                }
+                else
+                {
+                    var resolutions = LoadMergeResolutions(resolutionFile);
+                    result = await svc.MergeChangesetAsync(
+                        resolvedSource, resolvedTarget, changesetId!.Value, comment, dryRun, resolutions,
+                        mergeMode: mode,
+                        soapOwner: soapOwner).ConfigureAwait(false);
+                }
 
                 if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
                 {
@@ -158,7 +187,12 @@ public static class MergeCommand
 
                 Console.WriteLine($"Source      : {result.SourcePath}");
                 Console.WriteLine($"Target      : {result.TargetPath}");
-                Console.WriteLine($"Changeset   : cs#{result.SourceChangesetId}");
+                var isRange = result.SourceFromChangesetId > 0
+                    && result.SourceToChangesetId > 0
+                    && result.SourceFromChangesetId != result.SourceToChangesetId;
+                Console.WriteLine(isRange
+                    ? $"Range       : cs#{result.SourceFromChangesetId} ~ cs#{result.SourceToChangesetId}"
+                    : $"Changeset   : cs#{result.SourceChangesetId}");
                 Console.WriteLine($"Mode        : {(result.DryRun ? "dry-run" : "execute")}");
                 Console.WriteLine($"Comment     : {result.Comment}");
                 if (result.CreatedChangesetId.HasValue)
@@ -456,6 +490,8 @@ public static class MergeCommand
         sourcePath = result.SourcePath,
         targetPath = result.TargetPath,
         sourceChangesetId = result.SourceChangesetId,
+        sourceFromChangesetId = result.SourceFromChangesetId,
+        sourceToChangesetId = result.SourceToChangesetId,
         comment = result.Comment,
         dryRun = result.DryRun,
         createdChangesetId = result.CreatedChangesetId,

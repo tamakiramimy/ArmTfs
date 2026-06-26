@@ -89,6 +89,8 @@ public sealed class MergeExecutionResult
     public string SourcePath { get; init; } = string.Empty;
     public string TargetPath { get; init; } = string.Empty;
     public int SourceChangesetId { get; init; }
+    public int SourceFromChangesetId { get; init; }
+    public int SourceToChangesetId { get; init; }
     public string Comment { get; init; } = string.Empty;
     public bool DryRun { get; init; }
     public int? CreatedChangesetId { get; init; }

@@ -113,6 +113,25 @@ public class MergeConflictLogicTests
         Assert.True(TfvcClientService.ContentEquals(Array.Empty<byte>(), Array.Empty<byte>()));
     }
 
+    // ─── Resolution choice normalization ─────────────────────────────────────
+
+    [Fact]
+    public void NormalizeResolutionChoice_keeps_missing_choice_unresolved()
+    {
+        Assert.Null(TfvcClientService.NormalizeResolutionChoice(null));
+        Assert.Null(TfvcClientService.NormalizeResolutionChoice(""));
+        Assert.Null(TfvcClientService.NormalizeResolutionChoice("  "));
+    }
+
+    [Fact]
+    public void NormalizeResolutionChoice_accepts_explicit_choices_only()
+    {
+        Assert.Equal("source", TfvcClientService.NormalizeResolutionChoice("source"));
+        Assert.Equal("target", TfvcClientService.NormalizeResolutionChoice("TARGET"));
+        Assert.Equal("manual", TfvcClientService.NormalizeResolutionChoice("Manual"));
+        Assert.Throws<InvalidOperationException>(() => TfvcClientService.NormalizeResolutionChoice("ours"));
+    }
+
     // ─── MergeCommentMarker (bidirectional recognition) ────────────────────────
 
     [Fact]

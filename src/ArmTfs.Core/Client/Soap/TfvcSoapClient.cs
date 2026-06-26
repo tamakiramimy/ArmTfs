@@ -321,23 +321,7 @@ public sealed class TfvcSoapClient
 
         var doc = await InvokeAsync("Merge", body, ct).ConfigureAwait(false);
 
-        var ops = new List<SoapMergeOperation>();
-        foreach (var op in doc.Descendants().Where(e => e.Name.LocalName == "GetOperation"))
-        {
-            ops.Add(new SoapMergeOperation
-            {
-                ItemId = TryParseInt(AttrAny(op, "itemid")) ?? 0,
-                SourceServerItem = AttrAny(op, "sitem") ?? AttrAny(op, "srcitem") ?? string.Empty,
-                TargetServerItem = AttrAny(op, "titem") ?? AttrAny(op, "targetitem") ?? string.Empty,
-                // GetOperation exposes the pending change type as the `chg` attribute (ChangeType list).
-                ChangeType = AttrAny(op, "chg") ?? AttrAny(op, "ct") ?? string.Empty,
-                VersionFrom = TryParseInt(AttrAny(op, "vrevto"))
-                              ?? TryParseInt(AttrAny(op, "mvfrom")),
-                VersionTo = TryParseInt(AttrAny(op, "sver"))
-                            ?? TryParseInt(AttrAny(op, "mvto")),
-                IsPending = true,
-            });
-        }
+        var ops = ParseGetOperations(doc.Descendants().Where(e => e.Name.LocalName == "GetOperation"));
 
         // The server's 3-way merge may pend CONFLICTS instead of operations when both sides changed
         // the same file. These appear under <conflicts><Conflict .../> (ysitem = target/your side,
@@ -345,22 +329,155 @@ public sealed class TfvcSoapClient
         // check-in — resolved ones (isresolved="true", e.g. auto-resolved branch relationships) are
         // informational and are ignored. Unresolved conflicts must be resolved before check-in; never
         // silently take one side.
-        var conflicts = new List<SoapMergeConflict>();
-        foreach (var c in doc.Descendants().Where(e => e.Name.LocalName == "Conflict"))
+        var conflicts = ParseConflicts(
+            doc.Descendants().Where(e => e.Name.LocalName == "Conflict"),
+            unresolvedOnly: true);
+
+        return new PendMergeResult { Operations = ops, Conflicts = conflicts };
+    }
+
+    /// <summary>查询 workspace 中尚未解决的冲突。</summary>
+    public async Task<IReadOnlyList<SoapMergeConflict>> QueryConflictsAsync(
+        string workspaceName,
+        string ownerName,
+        IReadOnlyList<string>? serverItems = null,
+        CancellationToken ct = default)
+    {
+        var itemsXml = (serverItems is null || serverItems.Count == 0)
+            ? "<tns:items />"
+            : "<tns:items>" + string.Concat(serverItems.Select(item =>
+                $@"<tns:ItemSpec item=""{Esc(item)}"" recurse=""Full"" did=""0"" />")) + "</tns:items>";
+
+        var body = $@"    <tns:QueryConflicts>
+      <tns:workspaceName>{Esc(workspaceName)}</tns:workspaceName>
+      <tns:ownerName>{Esc(ownerName)}</tns:ownerName>
+      {itemsXml}
+    </tns:QueryConflicts>";
+
+        var doc = await InvokeAsync("QueryConflicts", body, ct).ConfigureAwait(false);
+        return ParseConflicts(
+            doc.Descendants().Where(e => e.Name.LocalName == "Conflict"),
+            unresolvedOnly: true);
+    }
+
+    /// <summary>
+    /// 解决一个已存在的 workspace 冲突。对应 Repository.asmx 的 <c>Resolve</c> 方法。
+    /// resolution 应为 <c>AcceptTheirs</c>、<c>AcceptYours</c> 或 <c>AcceptMerge</c>。
+    /// </summary>
+    public async Task<ResolveConflictResult> ResolveConflictAsync(
+        string workspaceName,
+        string ownerName,
+        int conflictId,
+        string resolution,
+        string? newPath = null,
+        int encoding = -2,
+        string lockLevel = "Unchanged",
+        CancellationToken ct = default)
+    {
+        if (conflictId <= 0)
+            throw new ArgumentOutOfRangeException(nameof(conflictId), "Conflict ID must be positive.");
+
+        var normalizedResolution = NormalizeSoapResolution(resolution);
+        var normalizedLockLevel = NormalizeSoapLockLevel(lockLevel);
+        var newPathEl = string.IsNullOrWhiteSpace(newPath)
+            ? @"<tns:newPath xsi:nil=""true"" />"
+            : $"<tns:newPath>{Esc(newPath)}</tns:newPath>";
+
+        // Signature from Repository.asmx / TEE:
+        // Resolve(workspaceName, ownerName, conflictId, resolution, newPath, encoding, lockLevel)
+        // encoding=-2 means VersionControlConstants.ENCODING_UNCHANGED.
+        var body = $@"    <tns:Resolve>
+      <tns:workspaceName>{Esc(workspaceName)}</tns:workspaceName>
+      <tns:ownerName>{Esc(ownerName)}</tns:ownerName>
+      <tns:conflictId>{conflictId}</tns:conflictId>
+      <tns:resolution>{Esc(normalizedResolution)}</tns:resolution>
+      {newPathEl}
+      <tns:encoding>{encoding}</tns:encoding>
+      <tns:lockLevel>{Esc(normalizedLockLevel)}</tns:lockLevel>
+    </tns:Resolve>";
+
+        var doc = await InvokeAsync("Resolve", body, ct).ConfigureAwait(false);
+        var resolveResult = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "ResolveResult");
+        var undoOperations = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "undoOperations");
+        var resolvedConflicts = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "resolvedConflicts");
+
+        return new ResolveConflictResult
+        {
+            Operations = ParseGetOperations((resolveResult?.Elements() ?? Enumerable.Empty<XElement>())
+                .Where(e => e.Name.LocalName == "GetOperation")),
+            UndoOperations = ParseGetOperations((undoOperations?.Elements() ?? Enumerable.Empty<XElement>())
+                .Where(e => e.Name.LocalName == "GetOperation")),
+            ResolvedConflicts = ParseConflicts((resolvedConflicts?.Elements() ?? Enumerable.Empty<XElement>())
+                .Where(e => e.Name.LocalName == "Conflict"), unresolvedOnly: false),
+        };
+    }
+
+    private static IReadOnlyList<SoapMergeOperation> ParseGetOperations(IEnumerable<XElement> operations)
+    {
+        return operations.Select(op => new SoapMergeOperation
+        {
+            ItemId = TryParseInt(AttrAny(op, "itemid")) ?? 0,
+            SourceServerItem = AttrAny(op, "sitem") ?? AttrAny(op, "srcitem") ?? string.Empty,
+            TargetServerItem = AttrAny(op, "titem")
+                               ?? AttrAny(op, "targetitem")
+                               ?? AttrAny(op, "sitem")
+                               ?? string.Empty,
+            // GetOperation exposes the pending change type as the `chg` attribute (ChangeType list).
+            ChangeType = AttrAny(op, "chg") ?? AttrAny(op, "ct") ?? string.Empty,
+            VersionFrom = TryParseInt(AttrAny(op, "vrevto"))
+                          ?? TryParseInt(AttrAny(op, "mvfrom")),
+            VersionTo = TryParseInt(AttrAny(op, "sver"))
+                        ?? TryParseInt(AttrAny(op, "mvto")),
+            IsPending = true,
+        }).ToList();
+    }
+
+    private static IReadOnlyList<SoapMergeConflict> ParseConflicts(IEnumerable<XElement> conflicts, bool unresolvedOnly)
+    {
+        var result = new List<SoapMergeConflict>();
+        foreach (var c in conflicts)
         {
             var isResolved = string.Equals(AttrAny(c, "isresolved"), "true", StringComparison.OrdinalIgnoreCase);
-            if (isResolved)
+            if (unresolvedOnly && isResolved)
                 continue;
-            conflicts.Add(new SoapMergeConflict
+
+            result.Add(new SoapMergeConflict
             {
-                TargetServerItem = AttrAny(c, "ysitem") ?? string.Empty,
-                SourceServerItem = AttrAny(c, "tsitem") ?? string.Empty,
+                ConflictId = TryParseInt(AttrAny(c, "cid")) ?? 0,
+                TargetServerItem = AttrAny(c, "ysitem") ?? AttrAny(c, "tgtitem") ?? string.Empty,
+                SourceServerItem = AttrAny(c, "tsitem") ?? AttrAny(c, "srcitem") ?? string.Empty,
                 ConflictType = AttrAny(c, "ctype") ?? string.Empty,
                 BaseChangeType = AttrAny(c, "bchg") ?? string.Empty,
             });
         }
 
-        return new PendMergeResult { Operations = ops, Conflicts = conflicts };
+        return result;
+    }
+
+    private static string NormalizeSoapResolution(string resolution)
+    {
+        if (string.Equals(resolution, "AcceptTheirs", StringComparison.OrdinalIgnoreCase))
+            return "AcceptTheirs";
+        if (string.Equals(resolution, "AcceptYours", StringComparison.OrdinalIgnoreCase))
+            return "AcceptYours";
+        if (string.Equals(resolution, "AcceptMerge", StringComparison.OrdinalIgnoreCase))
+            return "AcceptMerge";
+
+        throw new ArgumentException($"Unsupported SOAP conflict resolution: {resolution}", nameof(resolution));
+    }
+
+    private static string NormalizeSoapLockLevel(string lockLevel)
+    {
+        if (string.Equals(lockLevel, "None", StringComparison.OrdinalIgnoreCase))
+            return "None";
+        if (string.Equals(lockLevel, "Checkin", StringComparison.OrdinalIgnoreCase))
+            return "Checkin";
+        if (string.Equals(lockLevel, "CheckOut", StringComparison.OrdinalIgnoreCase))
+            return "CheckOut";
+        if (string.Equals(lockLevel, "Unchanged", StringComparison.OrdinalIgnoreCase))
+            return "Unchanged";
+
+        throw new ArgumentException($"Unsupported SOAP lock level: {lockLevel}", nameof(lockLevel));
     }
 
     /// <summary>

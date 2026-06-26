@@ -337,6 +337,12 @@
         "icon": "$(copy)"
       },
       {
+        "command": "armTfs.serverExplorer.openLocalPath",
+        "title": "%command.serverExplorerOpenLocalPath%",
+        "category": "arm-tfs",
+        "icon": "$(folder-opened)"
+      },
+      {
         "command": "armTfs.sidebar.setBranchScope",
         "title": "%command.sidebarSetBranchScope%",
         "category": "arm-tfs",
@@ -357,6 +363,12 @@
         "title": "%command.sidebarCopyTfvcPath%",
         "category": "arm-tfs",
         "icon": "$(copy)"
+      },
+      {
+        "command": "armTfs.sidebar.openLocalPath",
+        "title": "%command.sidebarOpenLocalPath%",
+        "category": "arm-tfs",
+        "icon": "$(folder-opened)"
       },
       {
         "command": "armTfs.sidebar.pullBranch",
@@ -681,6 +693,11 @@
           "group": "3_info@2"
         },
         {
+          "command": "armTfs.serverExplorer.openLocalPath",
+          "when": "view == armTfs.serverExplorer && viewItem =~ /armTfsServer(Folder|File)/",
+          "group": "3_info@2.5"
+        },
+        {
           "command": "armTfs.checkoutServerPathToFolder",
           "when": "view == armTfs.serverExplorer && viewItem == armTfsServerFolder",
           "group": "1_sync@4"
@@ -774,6 +791,11 @@
           "command": "armTfs.sidebar.copyTfvcPath",
           "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
           "group": "3_info@2"
+        },
+        {
+          "command": "armTfs.sidebar.openLocalPath",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "3_info@2.5"
         },
         {
           "command": "armTfs.serverExplorer.deleteItem",

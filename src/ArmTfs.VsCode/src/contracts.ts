@@ -303,6 +303,8 @@ export interface MergeExecuteResponse extends JsonEnvelope {
     sourcePath: string;
     targetPath: string;
     sourceChangesetId: number;
+    sourceFromChangesetId?: number;
+    sourceToChangesetId?: number;
     comment: string;
     dryRun: boolean;
     createdChangesetId?: number;

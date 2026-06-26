@@ -20,6 +20,7 @@ public static class GetCommand
         var recursiveOpt = new Option<bool>(new[] { "--recursive", "-r" }, getDefaultValue: () => true) { Description = "Get all files recursively (default: true)" };
         var dryRunOpt = new Option<bool>("--dry-run") { Description = "Show what would be downloaded without writing files" };
         var localPathOpt = new Option<string?>("--local-path") { Description = "Local directory override when auto-creating a workspace from a server path" };
+        var parallelOpt = new Option<int>("--parallel", () => 6) { Description = "Maximum concurrent file downloads (default: 6, range: 1-32)" };
 
         cmd.AddArgument(pathArg);
         cmd.AddOption(versionOpt);
@@ -27,8 +28,9 @@ public static class GetCommand
         cmd.AddOption(recursiveOpt);
         cmd.AddOption(dryRunOpt);
         cmd.AddOption(localPathOpt);
+        cmd.AddOption(parallelOpt);
 
-        cmd.SetHandler(async (path, versionSpec, force, recursive, dryRun, localPathOverride) =>
+        cmd.SetHandler(async (path, versionSpec, force, recursive, dryRun, localPathOverride, parallel) =>
         {
             // Parse version spec → int? (changeset) for REST
             int? version = ParseVersionSpec(versionSpec);
@@ -111,16 +113,19 @@ public static class GetCommand
 
             Console.WriteLine($"Found {files.Count} file(s).");
 
+            var maxParallel = Math.Clamp(parallel, 1, 32);
             int downloaded = 0, skipped = 0, errors = 0;
+            var consoleLock = new object();
 
-            foreach (var item in files)
+            async Task ProcessItemAsync(ArmTfs.Core.Models.TfsServerItem item)
             {
                 var localPath = ws.ServerToLocalPath(item.ServerPath, meta);
                 if (localPath is null)
                 {
-                    Console.Error.WriteLine($"  [SKIP] No mapping for {item.ServerPath}");
-                    skipped++;
-                    continue;
+                    lock (consoleLock)
+                        Console.Error.WriteLine($"  [SKIP] No mapping for {item.ServerPath}");
+                    Interlocked.Increment(ref skipped);
+                    return;
                 }
 
                 // 检查是否需要更新
@@ -133,16 +138,16 @@ public static class GetCommand
                     {
                         if (ws.GetCachedBaseFilePath(localPath) is null)
                             ws.SaveBaseFileFromDisk(localPath);
-                        skipped++;
-                        continue;
+                        Interlocked.Increment(ref skipped);
+                        return;
                     }
                 }
 
                 if (dryRun)
                 {
                     Console.WriteLine($"  [WOULD GET] {localPath}  (cs#{item.ChangesetId})");
-                    downloaded++;
-                    continue;
+                    Interlocked.Increment(ref downloaded);
+                    return;
                 }
 
                 try
@@ -150,9 +155,10 @@ public static class GetCommand
                     var dir = Path.GetDirectoryName(localPath)!;
                     Directory.CreateDirectory(dir);
 
-                    await using var fileStream = File.Create(localPath);
-                    await svc.DownloadFileAsync(item.ServerPath, fileStream, version).ConfigureAwait(false);
-                    fileStream.Close();
+                    await using (var fileStream = File.Create(localPath))
+                    {
+                        await svc.DownloadFileAsync(item.ServerPath, fileStream, version).ConfigureAwait(false);
+                    }
 
                     var hash = WorkspaceManager.ComputeFileHash(localPath);
                     ws.SaveTrackedVersion(new Core.Models.TrackedFileVersion
@@ -164,21 +170,47 @@ public static class GetCommand
                     });
                     ws.SaveBaseFileFromDisk(localPath);
 
-                    Console.WriteLine($"  {localPath}  (cs#{item.ChangesetId})");
-                    downloaded++;
+                    lock (consoleLock)
+                        Console.WriteLine($"  {localPath}  (cs#{item.ChangesetId})");
+                    Interlocked.Increment(ref downloaded);
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine($"  [ERROR] {item.ServerPath}: {ex.Message}");
-                    errors++;
+                    lock (consoleLock)
+                        Console.Error.WriteLine($"  [ERROR] {item.ServerPath}: {ex.Message}");
+                    Interlocked.Increment(ref errors);
                 }
+            }
+
+            if (dryRun || maxParallel == 1)
+            {
+                foreach (var item in files)
+                    await ProcessItemAsync(item).ConfigureAwait(false);
+            }
+            else
+            {
+                Console.WriteLine($"Downloading with parallelism: {maxParallel}");
+                using var semaphore = new SemaphoreSlim(maxParallel);
+                var tasks = files.Select(async item =>
+                {
+                    await semaphore.WaitAsync().ConfigureAwait(false);
+                    try
+                    {
+                        await ProcessItemAsync(item).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        semaphore.Release();
+                    }
+                });
+                await Task.WhenAll(tasks).ConfigureAwait(false);
             }
 
             Console.WriteLine();
             Console.WriteLine($"Downloaded: {downloaded}  Skipped (up-to-date): {skipped}  Errors: {errors}");
 
             if (errors > 0) Environment.ExitCode = 1;
-        }, pathArg, versionOpt, forceOpt, recursiveOpt, dryRunOpt, localPathOpt);
+        }, pathArg, versionOpt, forceOpt, recursiveOpt, dryRunOpt, localPathOpt, parallelOpt);
 
         return cmd;
     }

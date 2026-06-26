@@ -1253,6 +1253,8 @@ public sealed class TfvcClientService
                 SourcePath = normalizedSource,
                 TargetPath = normalizedTarget,
                 SourceChangesetId = sourceChangesetId,
+                SourceFromChangesetId = sourceChangesetId,
+                SourceToChangesetId = sourceChangesetId,
                 Comment = effectiveComment,
                 DryRun = dryRun,
                 BaseInfo = mergeBase,
@@ -1299,6 +1301,8 @@ public sealed class TfvcClientService
             SourcePath = normalizedSource,
             TargetPath = normalizedTarget,
             SourceChangesetId = sourceChangesetId,
+            SourceFromChangesetId = sourceChangesetId,
+            SourceToChangesetId = sourceChangesetId,
             Comment = commentWithMarker,
             DryRun = false,
             CreatedChangesetId = created.ChangesetId,
@@ -1345,6 +1349,7 @@ public sealed class TfvcClientService
 
         var soap = new Soap.TfvcSoapClient(_connection);
         var resolutionBySource = BuildResolutionBySource(resolutions);
+        var resolutionByTarget = BuildResolutionByTarget(resolutions);
         var warnings = new List<string>();
 
         // Resolve the workspace owner = the authenticated user's identity GUID. TFS CreateWorkspace
@@ -1364,9 +1369,9 @@ public sealed class TfvcClientService
                 + "Pass --soap-owner explicitly, or ensure the PAT is valid.");
         }
 
-        // Conflict pre-check (same logic as the REST path). Unresolved conflicts block the merge;
-        // content-level resolutions (source/manual) cannot be honored by the naive SOAP PendMerge+CheckIn
-        // flow, so they fall back to the REST execute path which handles per-file content correctly.
+        // Conflict pre-check (same logic as the REST path). Unresolved conflicts block the merge.
+        // Explicit source/target choices are later resolved through SOAP Resolve; manual content
+        // falls back to REST because Repository.asmx Resolve does not accept file bytes.
         var detail = await GetChangesetAsync(sourceChangesetId, ct).ConfigureAwait(false);
         var conflictAssessments = await AssessMergeConflictsAsync(
             detail, normalizedSource, normalizedTarget, mergeBase, resolutionBySource, ct).ConfigureAwait(false);
@@ -1383,6 +1388,8 @@ public sealed class TfvcClientService
                 SourcePath = normalizedSource,
                 TargetPath = normalizedTarget,
                 SourceChangesetId = sourceChangesetId,
+                SourceFromChangesetId = sourceChangesetId,
+                SourceToChangesetId = sourceChangesetId,
                 Comment = commentWithMarker,
                 DryRun = false,
                 CreatedChangesetId = null,
@@ -1400,14 +1407,14 @@ public sealed class TfvcClientService
             };
         }
 
-        // Any conflict resolution (source/target/manual) means there are conflicts to resolve.
-        // The SOAP flow can't apply per-file conflict resolutions without ResolveConflict plumbing,
-        // so fall back to REST (which handles source/target/manual correctly). The cost: no server
-        // merge history for that changeset (dedup still via comment marker + local merge-history).
-        // Clean merges (no resolutions) proceed via SOAP and write real merge history.
-        if (resolutionBySource.Count > 0)
+        // SOAP Resolve can ask the server to take either side directly:
+        // source -> AcceptTheirs, target -> AcceptYours. Manual content is different: Repository.asmx
+        // Resolve(AcceptMerge) expects a real local workspace file that already contains the merged
+        // content. This tool currently uses a temporary server workspace, so manual content still
+        // falls back to the REST content check-in path.
+        if (resolutionBySource.Values.Any(r => NormalizeResolutionChoice(r.Choice) == "manual"))
         {
-            warnings.Add("SOAP merge fell back to REST for conflict resolutions (source/target/manual); TFVC merge history not recorded for this changeset. Candidate dedup is preserved via the comment marker + local merge-history.");
+            warnings.Add("SOAP merge fell back to REST for manual conflict content; TFVC merge history is not recorded for this changeset. Source/target resolutions are handled via SOAP Resolve.");
             var restResult = await MergeChangesetAsync(
                 normalizedSource, normalizedTarget, sourceChangesetId, comment,
                 dryRun: false, resolutions, mergeMode: "rest", soapOwner: soapOwner, ct).ConfigureAwait(false);
@@ -1416,6 +1423,8 @@ public sealed class TfvcClientService
                 SourcePath = restResult.SourcePath,
                 TargetPath = restResult.TargetPath,
                 SourceChangesetId = restResult.SourceChangesetId,
+                SourceFromChangesetId = restResult.SourceFromChangesetId,
+                SourceToChangesetId = restResult.SourceToChangesetId,
                 Comment = restResult.Comment,
                 DryRun = restResult.DryRun,
                 CreatedChangesetId = restResult.CreatedChangesetId,
@@ -1456,56 +1465,136 @@ public sealed class TfvcClientService
                 normalizedSource, normalizedTarget,
                 sourceChangesetId, sourceChangesetId,
                 ct).ConfigureAwait(false);
-            var ops = pendResult.Operations;
+            var ops = pendResult.Operations.ToList();
+            var resolvedConflictChanges = new List<MergeExecutionChange>();
 
             // The server's 3-way merge may have pended CONFLICTS (both sides changed the same file).
-            // These cannot be checked in without resolution. Abort with the conflict list — never
-            // silently take one side (problem 2: 不再静默用源覆盖目标). This also corrects the old
-            // false "already merged" report that happened when conflicts left Operations empty.
+            // Resolve source/target choices via SOAP Resolve, never silently take one side. If any
+            // conflict lacks a user choice, abort with the full list so the workbench can display it.
             if (pendResult.Conflicts.Count > 0)
             {
-                warnings.Add($"Merge aborted: {pendResult.Conflicts.Count} conflict(s) detected by the server's 3-way merge. Resolve each (source/target/manual) and retry.");
-                return new MergeExecutionResult
+                var missingResolutions = new List<Models.Soap.SoapMergeConflict>();
+                var resolvedOps = new List<Models.Soap.SoapMergeOperation>();
+                foreach (var conflict in pendResult.Conflicts)
                 {
-                    SourcePath = normalizedSource,
-                    TargetPath = normalizedTarget,
-                    SourceChangesetId = sourceChangesetId,
-                    Comment = commentWithMarker,
-                    DryRun = false,
-                    CreatedChangesetId = null,
-                    BaseInfo = mergeBase,
-                    Changes = pendResult.Conflicts.Select(c => new MergeExecutionChange
+                    var resolution = FindResolutionForSoapConflict(conflict, resolutionBySource, resolutionByTarget);
+                    var choice = NormalizeResolutionChoice(resolution?.Choice);
+                    if (choice is null)
                     {
-                        SourceServerPath = c.SourceServerItem,
-                        TargetServerPath = c.TargetServerItem,
+                        missingResolutions.Add(conflict);
+                        continue;
+                    }
+
+                    var conflictId = await ResolveSoapConflictIdAsync(
+                        soap, workspaceName, owner, conflict, normalizedTarget, ct).ConfigureAwait(false);
+                    if (conflictId <= 0)
+                    {
+                        missingResolutions.Add(conflict);
+                        continue;
+                    }
+
+                    var soapResolution = MapToSoapResolution(choice);
+                    var resolveResult = await soap.ResolveConflictAsync(
+                        workspaceName, owner, conflictId, soapResolution, ct: ct).ConfigureAwait(false);
+                    resolvedOps.AddRange(resolveResult.Operations.Select(op =>
+                        NormalizeResolvedOperation(op, conflict, sourceChangesetId)));
+                    resolvedConflictChanges.Add(new MergeExecutionChange
+                    {
+                        SourceServerPath = conflict.SourceServerItem,
+                        TargetServerPath = conflict.TargetServerItem,
                         SourceChangesetId = sourceChangesetId,
-                        Status = "conflict",
+                        SourceChangeType = conflict.BaseChangeType,
+                        TargetChangeType = conflict.ConflictType,
+                        Status = choice == "source" ? "resolvedSource" : "resolvedTarget",
+                        Resolution = choice,
                         TargetExists = true,
-                        Note = "Both source and target modified this file (server 3-way merge conflict). Provide a resolution (source/target/manual) to proceed.",
-                    }).ToList(),
-                    Warnings = warnings,
-                };
+                        Note = choice == "source"
+                            ? "SOAP Resolve accepted the source branch version (AcceptTheirs)."
+                            : "SOAP Resolve kept the target branch version (AcceptYours).",
+                    });
+                }
+
+                if (missingResolutions.Count > 0)
+                {
+                    warnings.Add($"Merge aborted: {missingResolutions.Count} conflict(s) detected by the server's 3-way merge. Resolve each (source/target/manual) and retry.");
+                    return new MergeExecutionResult
+                    {
+                        SourcePath = normalizedSource,
+                        TargetPath = normalizedTarget,
+                        SourceChangesetId = sourceChangesetId,
+                        SourceFromChangesetId = sourceChangesetId,
+                        SourceToChangesetId = sourceChangesetId,
+                        Comment = commentWithMarker,
+                        DryRun = false,
+                        CreatedChangesetId = null,
+                        BaseInfo = mergeBase,
+                        Changes = missingResolutions.Select(c => new MergeExecutionChange
+                        {
+                            SourceServerPath = c.SourceServerItem,
+                            TargetServerPath = c.TargetServerItem,
+                            SourceChangesetId = sourceChangesetId,
+                            Status = "conflict",
+                            TargetExists = true,
+                            Note = "Both source and target modified this file (server 3-way merge conflict). Provide a resolution (source/target/manual) to proceed.",
+                        }).ToList(),
+                        Warnings = warnings,
+                    };
+                }
+
+                ops.AddRange(resolvedOps);
+
+                var remainingConflicts = await soap.QueryConflictsAsync(
+                    workspaceName, owner, new[] { normalizedTarget }, ct).ConfigureAwait(false);
+                if (remainingConflicts.Count > 0)
+                {
+                    warnings.Add($"Merge aborted: {remainingConflicts.Count} conflict(s) remain after SOAP Resolve.");
+                    return new MergeExecutionResult
+                    {
+                        SourcePath = normalizedSource,
+                        TargetPath = normalizedTarget,
+                        SourceChangesetId = sourceChangesetId,
+                        SourceFromChangesetId = sourceChangesetId,
+                        SourceToChangesetId = sourceChangesetId,
+                        Comment = commentWithMarker,
+                        DryRun = false,
+                        CreatedChangesetId = null,
+                        BaseInfo = mergeBase,
+                        Changes = remainingConflicts.Select(c => new MergeExecutionChange
+                        {
+                            SourceServerPath = c.SourceServerItem,
+                            TargetServerPath = c.TargetServerItem,
+                            SourceChangesetId = sourceChangesetId,
+                            Status = "conflict",
+                            TargetExists = true,
+                            Note = "Conflict remained after SOAP Resolve. Re-open the merge plan and resolve it again.",
+                        }).ToList(),
+                        Warnings = warnings,
+                    };
+                }
             }
 
             if (ops.Count == 0)
             {
-                warnings.Add("Server returned no merge operations — nothing to commit. The source changeset may already be merged.");
+                warnings.Add(resolvedConflictChanges.Count > 0
+                    ? "SOAP Resolve completed, but the server returned no merge operations to commit. Target-side resolutions may not require a changeset."
+                    : "Server returned no merge operations — nothing to commit. The source changeset may already be merged.");
                 return new MergeExecutionResult
                 {
                     SourcePath = normalizedSource,
                     TargetPath = normalizedTarget,
                     SourceChangesetId = sourceChangesetId,
+                    SourceFromChangesetId = sourceChangesetId,
+                    SourceToChangesetId = sourceChangesetId,
                     Comment = commentWithMarker,
                     DryRun = false,
                     CreatedChangesetId = null,
                     BaseInfo = mergeBase,
-                    Changes = Array.Empty<MergeExecutionChange>(),
+                    Changes = resolvedConflictChanges,
                     Warnings = warnings,
                 };
             }
 
-            // No resolutions reach here (any resolution triggers REST fallback above), so commit all ops.
-            var committedOps = ops;
+            var committedOps = DeduplicateSoapMergeOperations(ops);
 
             if (committedOps.Count == 0)
             {
@@ -1515,11 +1604,13 @@ public sealed class TfvcClientService
                     SourcePath = normalizedSource,
                     TargetPath = normalizedTarget,
                     SourceChangesetId = sourceChangesetId,
+                    SourceFromChangesetId = sourceChangesetId,
+                    SourceToChangesetId = sourceChangesetId,
                     Comment = commentWithMarker,
                     DryRun = false,
                     CreatedChangesetId = null,
                     BaseInfo = mergeBase,
-                    Changes = Array.Empty<MergeExecutionChange>(),
+                    Changes = resolvedConflictChanges,
                     Warnings = warnings,
                 };
             }
@@ -1560,14 +1651,39 @@ public sealed class TfvcClientService
                 TargetExists = true,
                 HasContent = false,
                 Status = "created",
+                Resolution = ResolveOperationResolution(op, resolutionBySource),
                 Note = "SOAP merge — server-recorded merge history",
             }).ToList();
+            foreach (var resolvedConflictChange in resolvedConflictChanges)
+            {
+                if (executionChanges.Any(change =>
+                    string.Equals(change.TargetServerPath, resolvedConflictChange.TargetServerPath, StringComparison.OrdinalIgnoreCase)))
+                {
+                    continue;
+                }
+
+                executionChanges.Add(new MergeExecutionChange
+                {
+                    SourceServerPath = resolvedConflictChange.SourceServerPath,
+                    TargetServerPath = resolvedConflictChange.TargetServerPath,
+                    SourceChangesetId = resolvedConflictChange.SourceChangesetId,
+                    SourceChangeType = resolvedConflictChange.SourceChangeType,
+                    TargetChangeType = resolvedConflictChange.TargetChangeType,
+                    TargetExists = resolvedConflictChange.TargetExists,
+                    HasContent = resolvedConflictChange.HasContent,
+                    Status = "created",
+                    Resolution = resolvedConflictChange.Resolution,
+                    Note = resolvedConflictChange.Note,
+                });
+            }
 
             return new MergeExecutionResult
             {
                 SourcePath = normalizedSource,
                 TargetPath = normalizedTarget,
                 SourceChangesetId = sourceChangesetId,
+                SourceFromChangesetId = sourceChangesetId,
+                SourceToChangesetId = sourceChangesetId,
                 Comment = commentWithMarker,
                 DryRun = false,
                 CreatedChangesetId = newChangesetId,
@@ -1594,6 +1710,316 @@ public sealed class TfvcClientService
     }
 
     private sealed record SoapWorkspaceCreated(string Name, string Owner);
+
+    private static Dictionary<string, MergeExecutionResolution> BuildResolutionByTarget(
+        IReadOnlyList<MergeExecutionResolution>? resolutions)
+    {
+        return (resolutions ?? Array.Empty<MergeExecutionResolution>())
+            .Where(item => !string.IsNullOrWhiteSpace(item.TargetServerPath))
+            .GroupBy(item => NormalizeServerPath(item.TargetServerPath), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Last(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static MergeExecutionResolution? FindResolutionForSoapConflict(
+        Models.Soap.SoapMergeConflict conflict,
+        IReadOnlyDictionary<string, MergeExecutionResolution> resolutionBySource,
+        IReadOnlyDictionary<string, MergeExecutionResolution> resolutionByTarget)
+    {
+        if (!string.IsNullOrWhiteSpace(conflict.SourceServerItem)
+            && resolutionBySource.TryGetValue(NormalizeServerPath(conflict.SourceServerItem), out var bySource))
+        {
+            return bySource;
+        }
+
+        if (!string.IsNullOrWhiteSpace(conflict.TargetServerItem)
+            && resolutionByTarget.TryGetValue(NormalizeServerPath(conflict.TargetServerItem), out var byTarget))
+        {
+            return byTarget;
+        }
+
+        return null;
+    }
+
+    private async Task<int> ResolveSoapConflictIdAsync(
+        Soap.TfvcSoapClient soap,
+        string workspaceName,
+        string owner,
+        Models.Soap.SoapMergeConflict conflict,
+        string normalizedTarget,
+        CancellationToken ct)
+    {
+        if (conflict.ConflictId > 0)
+            return conflict.ConflictId;
+
+        var queryScope = !string.IsNullOrWhiteSpace(conflict.TargetServerItem)
+            ? conflict.TargetServerItem
+            : normalizedTarget;
+        var conflicts = await soap.QueryConflictsAsync(
+            workspaceName,
+            owner,
+            new[] { queryScope },
+            ct).ConfigureAwait(false);
+
+        var match = conflicts.FirstOrDefault(candidate => SameSoapConflict(candidate, conflict));
+        return match?.ConflictId ?? 0;
+    }
+
+    private static bool SameSoapConflict(
+        Models.Soap.SoapMergeConflict candidate,
+        Models.Soap.SoapMergeConflict expected)
+    {
+        var sourceMatches = string.IsNullOrWhiteSpace(expected.SourceServerItem)
+            || string.Equals(NormalizeServerPath(candidate.SourceServerItem), NormalizeServerPath(expected.SourceServerItem), StringComparison.OrdinalIgnoreCase);
+        var targetMatches = string.IsNullOrWhiteSpace(expected.TargetServerItem)
+            || string.Equals(NormalizeServerPath(candidate.TargetServerItem), NormalizeServerPath(expected.TargetServerItem), StringComparison.OrdinalIgnoreCase);
+        return sourceMatches && targetMatches;
+    }
+
+    private static string MapToSoapResolution(string choice) => choice switch
+    {
+        "source" => "AcceptTheirs",
+        "target" => "AcceptYours",
+        _ => throw new InvalidOperationException($"SOAP Resolve only supports source/target choices, got '{choice}'."),
+    };
+
+    private static Models.Soap.SoapMergeOperation NormalizeResolvedOperation(
+        Models.Soap.SoapMergeOperation operation,
+        Models.Soap.SoapMergeConflict conflict,
+        int sourceChangesetId)
+    {
+        return new Models.Soap.SoapMergeOperation
+        {
+            ItemId = operation.ItemId,
+            SourceServerItem = string.IsNullOrWhiteSpace(operation.SourceServerItem)
+                ? conflict.SourceServerItem
+                : operation.SourceServerItem,
+            TargetServerItem = string.IsNullOrWhiteSpace(operation.TargetServerItem)
+                ? conflict.TargetServerItem
+                : operation.TargetServerItem,
+            ChangeType = string.IsNullOrWhiteSpace(operation.ChangeType) ? "Merge" : operation.ChangeType,
+            VersionFrom = operation.VersionFrom ?? sourceChangesetId,
+            VersionTo = operation.VersionTo ?? sourceChangesetId,
+            IsPending = operation.IsPending,
+        };
+    }
+
+    private static IReadOnlyList<Models.Soap.SoapMergeOperation> DeduplicateSoapMergeOperations(
+        IEnumerable<Models.Soap.SoapMergeOperation> operations)
+    {
+        var result = new List<Models.Soap.SoapMergeOperation>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var op in operations)
+        {
+            if (string.IsNullOrWhiteSpace(op.TargetServerItem))
+                continue;
+            var key = $"{NormalizeServerPath(op.TargetServerItem)}|{NormalizeServerPath(op.SourceServerItem)}|{op.VersionFrom}|{op.VersionTo}|{op.ChangeType}";
+            if (seen.Add(key))
+                result.Add(op);
+        }
+
+        return result;
+    }
+
+    private static string? ResolveOperationResolution(
+        Models.Soap.SoapMergeOperation operation,
+        IReadOnlyDictionary<string, MergeExecutionResolution> resolutionBySource)
+    {
+        if (string.IsNullOrWhiteSpace(operation.SourceServerItem))
+            return null;
+
+        return resolutionBySource.TryGetValue(NormalizeServerPath(operation.SourceServerItem), out var resolution)
+            ? NormalizeResolutionChoice(resolution.Choice)
+            : null;
+    }
+
+    /// <summary>
+    /// 走 TFVC SOAP 协议对一段 source changeset 做一次服务器端 merge plan / merge。
+    /// dry-run 时只 PendMerge 并返回全量 operations/conflicts；非 dry-run 且无冲突时一次 CheckIn。
+    /// </summary>
+    public async Task<MergeExecutionResult> MergeChangesetRangeViaSoapAsync(
+        string sourcePath,
+        string targetPath,
+        int fromChangeset,
+        int toChangeset,
+        string? comment = null,
+        bool dryRun = false,
+        string? soapOwner = null,
+        CancellationToken ct = default)
+    {
+        if (fromChangeset <= 0 || toChangeset <= 0)
+            throw new ArgumentOutOfRangeException(nameof(fromChangeset), "Changeset range must be positive.");
+        if (fromChangeset > toChangeset)
+            throw new InvalidOperationException("--from must be less than or equal to --to.");
+
+        var normalizedSource = NormalizeServerPath(sourcePath);
+        var normalizedTarget = NormalizeServerPath(targetPath);
+        var mergeBase = await ResolveMergeBaseAsync(normalizedSource, normalizedTarget, ct).ConfigureAwait(false);
+        var effectiveComment = string.IsNullOrWhiteSpace(comment)
+            ? $"Merge cs#{fromChangeset}~cs#{toChangeset} from {normalizedSource} to {normalizedTarget}"
+            : comment.Trim();
+
+        var soap = new Soap.TfvcSoapClient(_connection);
+        var owner = soapOwner;
+        if (string.IsNullOrWhiteSpace(owner))
+            owner = await _connection.GetAuthenticatedUserGuidAsync(ct).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(owner))
+        {
+            throw new InvalidOperationException(
+                "SOAP range merge could not resolve the authenticated user identity for the workspace owner. "
+                + "Pass --soap-owner explicitly, or ensure the PAT is valid.");
+        }
+
+        var workspaceName = $"arm-tfs-soap-range-{Guid.NewGuid():N}";
+        var computer = Environment.MachineName;
+        var mergeTempRoot = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "arm-tfs-merge", workspaceName);
+        var workingFolders = new[]
+        {
+            (normalizedTarget, System.IO.Path.Combine(mergeTempRoot, "target")),
+            (normalizedSource, System.IO.Path.Combine(mergeTempRoot, "source")),
+        };
+        SoapWorkspaceCreated? createdWs = null;
+
+        try
+        {
+            var createdWorkspace = await soap.CreateWorkspaceAsync(
+                workspaceName, owner, computer, "arm-tfs SOAP range merge", workingFolders, ct).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(createdWorkspace.Owner))
+                owner = createdWorkspace.Owner;
+            createdWs = new SoapWorkspaceCreated(workspaceName, owner);
+
+            var pendResult = await soap.PendMergeAsync(
+                workspaceName, owner,
+                normalizedSource, normalizedTarget,
+                fromChangeset, toChangeset,
+                ct).ConfigureAwait(false);
+
+            var warnings = new List<string>();
+            var plannedChanges = pendResult.Operations.Select(op => new MergeExecutionChange
+            {
+                SourceServerPath = op.SourceServerItem,
+                TargetServerPath = op.TargetServerItem,
+                SourceChangesetId = op.VersionTo ?? toChangeset,
+                SourceChangeType = op.ChangeType,
+                TargetChangeType = op.ChangeType,
+                TargetExists = !op.ChangeType.Contains("Add", StringComparison.OrdinalIgnoreCase),
+                HasContent = false,
+                Status = dryRun ? "planned" : "ready",
+                Note = "SOAP merge plan — server-computed operation",
+            }).ToList();
+
+            if (pendResult.Conflicts.Count > 0)
+            {
+                warnings.Add($"Merge range has {pendResult.Conflicts.Count} unresolved conflict(s). Resolve every listed file before executing.");
+                plannedChanges.AddRange(pendResult.Conflicts.Select(c => new MergeExecutionChange
+                {
+                    SourceServerPath = c.SourceServerItem,
+                    TargetServerPath = c.TargetServerItem,
+                    SourceChangesetId = toChangeset,
+                    SourceChangeType = c.BaseChangeType,
+                    TargetChangeType = c.ConflictType,
+                    TargetExists = true,
+                    HasContent = false,
+                    Status = "conflict",
+                    Note = "Server 3-way merge conflict for the requested range.",
+                }));
+            }
+
+            if (dryRun || pendResult.Conflicts.Count > 0 || pendResult.Operations.Count == 0)
+            {
+                if (pendResult.Operations.Count == 0 && pendResult.Conflicts.Count == 0)
+                    warnings.Add("Server returned no merge operations for the requested range. It may already be merged.");
+
+                return new MergeExecutionResult
+                {
+                    SourcePath = normalizedSource,
+                    TargetPath = normalizedTarget,
+                    SourceChangesetId = toChangeset,
+                    SourceFromChangesetId = fromChangeset,
+                    SourceToChangesetId = toChangeset,
+                    Comment = effectiveComment,
+                    DryRun = dryRun,
+                    CreatedChangesetId = null,
+                    BaseInfo = mergeBase,
+                    Changes = plannedChanges,
+                    Warnings = warnings,
+                };
+            }
+
+            var pendingChanges = pendResult.Operations.Select(op => new Models.Soap.SoapPendingChange
+            {
+                ItemId = op.ItemId,
+                ServerItem = op.TargetServerItem,
+                ChangeType = string.IsNullOrEmpty(op.ChangeType) ? "Merge" : op.ChangeType,
+                SourceServerItem = op.SourceServerItem,
+                VersionFrom = op.VersionFrom ?? fromChangeset,
+                VersionTo = op.VersionTo ?? toChangeset,
+            }).ToList();
+
+            var newChangesetId = await soap.CheckInAsync(
+                workspaceName, owner,
+                effectiveComment,
+                pendingChanges,
+                ct).ConfigureAwait(false);
+
+            foreach (var mergedSourceChangeset in pendingChanges
+                         .Select(c => c.VersionTo)
+                         .Where(id => id.HasValue)
+                         .Select(id => id!.Value)
+                         .Distinct())
+            {
+                _workspaceManager?.RecordMerge(new Models.MergeRecord
+                {
+                    SourceChangesetId = mergedSourceChangeset,
+                    SourcePath = normalizedSource,
+                    TargetPath = normalizedTarget,
+                    TargetChangesetId = newChangesetId,
+                    MergedAtUtc = DateTime.UtcNow,
+                    Method = "soap-merge-range",
+                });
+            }
+
+            return new MergeExecutionResult
+            {
+                SourcePath = normalizedSource,
+                TargetPath = normalizedTarget,
+                SourceChangesetId = toChangeset,
+                SourceFromChangesetId = fromChangeset,
+                SourceToChangesetId = toChangeset,
+                Comment = effectiveComment,
+                DryRun = false,
+                CreatedChangesetId = newChangesetId,
+                BaseInfo = mergeBase,
+                Changes = plannedChanges.Select(change => new MergeExecutionChange
+                {
+                    SourceServerPath = change.SourceServerPath,
+                    TargetServerPath = change.TargetServerPath,
+                    SourceChangesetId = change.SourceChangesetId,
+                    SourceChangeType = change.SourceChangeType,
+                    TargetChangeType = change.TargetChangeType,
+                    TargetExists = change.TargetExists,
+                    HasContent = change.HasContent,
+                    Status = "created",
+                    Resolution = change.Resolution,
+                    Note = "SOAP range merge — server-recorded merge history",
+                }).ToList(),
+                Warnings = warnings,
+            };
+        }
+        finally
+        {
+            if (createdWs is not null)
+            {
+                try
+                {
+                    await soap.DeleteWorkspaceAsync(createdWs.Name, createdWs.Owner, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"warning: failed to delete temp SOAP range workspace '{createdWs.Name}': {ex.Message}");
+                }
+            }
+        }
+    }
 
     /// <summary>
     /// 用 SOAP 服务器 3-way merge 预检一段 changeset 范围 [fromChangeset, toChangeset] 的冲突，
@@ -2163,15 +2589,21 @@ public sealed class TfvcClientService
         }
     }
 
-    private static string NormalizeResolutionChoice(string? choice)
+    internal static string? NormalizeResolutionChoice(string? choice)
     {
+        if (string.IsNullOrWhiteSpace(choice))
+            return null;
+
         if (string.Equals(choice, "target", StringComparison.OrdinalIgnoreCase))
             return "target";
 
         if (string.Equals(choice, "manual", StringComparison.OrdinalIgnoreCase))
             return "manual";
 
-        return "source";
+        if (string.Equals(choice, "source", StringComparison.OrdinalIgnoreCase))
+            return "source";
+
+        throw new InvalidOperationException($"Unsupported merge resolution choice: {choice}.");
     }
 
     private static bool CanForceSourceContentMerge(VersionControlChangeType sourceChangeType)

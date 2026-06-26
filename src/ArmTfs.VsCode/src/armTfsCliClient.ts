@@ -357,6 +357,38 @@ export class ArmTfsCliClient {
     return this.executeJson<MergeExecuteResponse>(args, runOptions);
   }
 
+  mergeExecuteRangeJson(
+    sourcePath: string,
+    targetPath: string,
+    fromChangesetId: number,
+    toChangesetId: number,
+    options?: { comment?: string; dryRun?: boolean },
+    runOptions?: ArmTfsRunOptions,
+  ): Promise<MergeExecuteResponse> {
+    const args = [
+      'merge',
+      'execute',
+      '--source',
+      sourcePath,
+      '--target',
+      targetPath,
+      '--from',
+      String(fromChangesetId),
+      '--to',
+      String(toChangesetId),
+      '--format',
+      'json',
+    ];
+    if (options?.comment) {
+      args.push('--comment', options.comment);
+    }
+    if (options?.dryRun) {
+      args.push('--dry-run');
+    }
+
+    return this.executeJson<MergeExecuteResponse>(args, runOptions);
+  }
+
   mergePreviewConflictsJson(
     sourcePath: string,
     targetPath: string,

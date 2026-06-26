@@ -4,7 +4,9 @@ This VS Code extension is intentionally thin. It delegates all TFVC work to the 
 
 - CLI discovery and launch
 - typed JSON parsing for stable command envelopes
-- simple commands that open JSON results in the editor
+- branch, history, merge, and server-explorer views over the CLI JSON API
+- native VS Code diff editors for source-vs-target comparisons
+- native VS Code conflict-marker editors for manual merge resolution
 - an exported `ArmTfsCliClient` for future tree views or webviews
 
 ## Settings
@@ -25,6 +27,13 @@ This VS Code extension is intentionally thin. It delegates all TFVC work to the 
 - `arm-tfs: Show Label JSON`
 - `arm-tfs: Show Merge Base JSON`
 - `arm-tfs: Show Merge Candidates JSON`
+
+## Merge Workbench
+
+The merge workbench loads per-changeset previews, then asks the server for one SOAP range dry-run
+so all conflicts in the selected range are visible before execution. Source/target conflict choices
+are passed to the CLI and resolved with SOAP `Resolve`. Manual resolution opens a temporary result
+file with standard conflict markers, so VS Code's built-in conflict actions can be used directly.
 
 ## Build
 

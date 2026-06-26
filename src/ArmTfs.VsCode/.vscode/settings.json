@@ -1,6 +1,8 @@
 {
     "armTfs.serverExplorer.rootPath": "$/",
-    "armTfs.branch.scope": "$/C02_PTL_P090_BussinessCommon/MindrayApp.FlowDesignVue-P_V20250623",
+    "armTfs.branch.scope": "$/C02_PTL_P088_Comm",
     "armTfs.ui.language": "zh-CN",
-    "armTfs.merge.sourcePath": "$/C02_AD_P002_行政门户及应用/MindrayApp.Administration-P20200914"
+    "armTfs.merge.sourcePath": "$/C02_AD_P002_行政门户及应用/MindrayApp.Administration-P20200914",
+    "armTfs.cli.command": "d:\\ProgramFiles\\armtfs-win-arm64\\arm-tfs.exe",
+    "armTfs.cli.commandArgs": []
 }

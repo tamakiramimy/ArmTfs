@@ -146,31 +146,25 @@ export class ArmTfsMergeWorkbench {
         selectedChangesetId: candidates[0]?.changesetId,
       };
 
-      // SOAP 3-way conflict preview for the whole candidate range. The REST dry-run above is
-      // unreliable for conflicts (misses add/add and edit/edit when the branch point can't be
-      // detected), so ask the server directly. Mark any candidate change whose target path is a
-      // real conflict as status='conflict' so the conflict list surfaces it.
+      // SOAP 3-way merge plan for the whole candidate range. The per-changeset REST dry-run above
+      // is useful for mapping changes to candidates, but it can miss conflicts. A single server
+      // PendMerge over the range returns every unresolved conflict up front, so the workbench no
+      // longer discovers new conflict files halfway through executing selected changesets.
       if (candidates.length > 0) {
         try {
           const ids = candidates.map((c) => c.changesetId);
           const from = Math.min(...ids);
           const to = Math.max(...ids);
-          const preview = await this.client.mergePreviewConflictsJson(sourcePath, targetPath, from, to);
-          const conflictedTargets = new Set(
-            preview.conflicts.map((c) => c.targetServerPath.toLowerCase()),
+          const rangePlan = await this.client.mergeExecuteRangeJson(sourcePath, targetPath, from, to, {
+            dryRun: true,
+          });
+          this.applyRangeConflictsToCandidates(
+            candidates,
+            rangePlan.result.changes.filter((change) => change.status.toLowerCase() === 'conflict'),
           );
-          if (conflictedTargets.size > 0) {
-            for (const cand of candidates) {
-              cand.changes = cand.changes.map((ch) =>
-                conflictedTargets.has(ch.targetServerPath.toLowerCase())
-                  ? { ...ch, status: 'conflict', note: 'Both source and target modified this file (server 3-way merge conflict). Resolve (source/target/manual).' }
-                  : ch,
-              );
-            }
-          }
         } catch (previewError) {
           // Preview is best-effort; if it fails, fall back to REST-detected conflicts only.
-          this.output.appendLine(`merge preview-conflicts failed: ${getErrorMessage(previewError)}`);
+          this.output.appendLine(`merge range dry-run failed: ${getErrorMessage(previewError)}`);
         }
       }
 
@@ -417,6 +411,35 @@ export class ArmTfsMergeWorkbench {
     }
   }
 
+  /** 把 range SOAP dry-run 中发现的全部冲突补进候选计划。 */
+  private applyRangeConflictsToCandidates(
+    candidates: MergeWorkbenchCandidate[],
+    conflictChanges: MergePlanChange[],
+  ): void {
+    for (const conflict of conflictChanges) {
+      for (const candidate of candidates) {
+        const existing = candidate.changes.find((change) =>
+          change.targetServerPath.toLowerCase() === conflict.targetServerPath.toLowerCase());
+        if (existing) {
+          existing.status = 'conflict';
+          existing.sourceServerPath = conflict.sourceServerPath || existing.sourceServerPath;
+          existing.note = conflict.note || 'Both source and target modified this file (server 3-way merge conflict). Resolve (source/target/manual).';
+        } else {
+          // Some conflicts are returned by the server without appearing in a single changeset dry-run.
+          // Attach them to every candidate so the selected execution passes the user's resolution file
+          // before whichever changeset first encounters that conflict.
+          candidate.changes.push({
+            ...conflict,
+            sourceChangesetId: candidate.changesetId,
+            status: 'conflict',
+            targetExists: true,
+            note: conflict.note || 'Server range merge conflict. Resolve (source/target/manual) before executing.',
+          });
+        }
+      }
+    }
+  }
+
   private buildResolutionItems(
     selected: MergeWorkbenchCandidate[],
   ): Map<number, MergeExecutionResolutionFileItem[]> {
@@ -463,13 +486,13 @@ export class ArmTfsMergeWorkbench {
         readServerText(this.client, change.sourceServerPath, change.sourceChangesetId),
         change.targetExists ? readServerText(this.client, change.targetServerPath) : Promise.resolve(''),
       ]);
-      const content = await openManualMergePanel(
+      const content = await openNativeConflictEditor(
         `${path.posix.basename(change.sourceServerPath)} 手动合并`,
         source,
         target,
-        this.manualMergeContents.get(conflictId) ?? source,
-        this.state.sourcePath,
-        this.state.targetPath,
+        this.manualMergeContents.get(conflictId),
+        change.sourceServerPath,
+        change.targetServerPath,
       );
       if (content !== undefined) {
         this.manualMergeContents.set(conflictId, content);
@@ -973,6 +996,15 @@ function buildFileTree(candidates: MergeWorkbenchCandidate[], targetPath: string
       const existing = byPath.get(ch.targetServerPath);
       if (existing) {
         if (!existing.changesets.includes(cand.changesetId)) existing.changesets.push(cand.changesetId);
+        if (ch.sourceChangesetId >= existing.sourceChangesetId) {
+          existing.sourceServerPath = ch.sourceServerPath;
+          existing.sourceChangeType = ch.sourceChangeType;
+          existing.targetChangeType = ch.targetChangeType;
+          existing.status = ch.status;
+          existing.note = ch.note;
+          existing.sourceChangesetId = ch.sourceChangesetId;
+          existing.targetExists = ch.targetExists;
+        }
       } else {
         byPath.set(ch.targetServerPath, {
           targetServerPath: ch.targetServerPath,
@@ -1232,6 +1264,116 @@ async function readServerText(client: ArmTfsCliClient, serverPath: string, versi
     throw new Error(`无法手动合并二进制文件：${serverPath}`);
   }
   return Buffer.from(response.item.contentBase64, 'base64').toString('utf8');
+}
+
+async function openNativeConflictEditor(
+  title: string,
+  sourceContent: string,
+  targetContent: string,
+  initialResult: string | undefined,
+  sourceServerPath: string,
+  targetServerPath: string,
+): Promise<string | undefined> {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'arm-tfs-conflict-'));
+  const baseName = sanitizeLocalFileName(path.posix.basename(targetServerPath || sourceServerPath) || 'merge.txt');
+  const sourcePath = path.join(directory, `source-${baseName}`);
+  const targetPath = path.join(directory, `target-${baseName}`);
+  const resultPath = path.join(directory, `result-${baseName}`);
+
+  await Promise.all([
+    fs.writeFile(sourcePath, sourceContent, 'utf8'),
+    fs.writeFile(targetPath, targetContent, 'utf8'),
+    fs.writeFile(
+      resultPath,
+      initialResult ?? buildConflictMarkerContent(sourceContent, targetContent, sourceServerPath, targetServerPath),
+      'utf8',
+    ),
+  ]);
+
+  const sourceUri = vscode.Uri.file(sourcePath);
+  const targetUri = vscode.Uri.file(targetPath);
+  const resultUri = vscode.Uri.file(resultPath);
+
+  await vscode.commands.executeCommand(
+    'vscode.diff',
+    sourceUri,
+    targetUri,
+    `${title}: 源分支 -> 目标分支`,
+    { preview: false, viewColumn: vscode.ViewColumn.Beside },
+  );
+
+  const doc = await vscode.workspace.openTextDocument(resultUri);
+  await vscode.window.showTextDocument(doc, {
+    preview: false,
+    viewColumn: vscode.ViewColumn.Active,
+  });
+
+  for (;;) {
+    const action = await vscode.window.showInformationMessage(
+      '已打开 VS Code 原生冲突文件。使用编辑器中的 Accept Current / Incoming / Both 或直接编辑，保存后点击使用当前内容。',
+      '使用当前内容',
+      '取消',
+    );
+    if (action !== '使用当前内容') {
+      return undefined;
+    }
+
+    await doc.save();
+    const content = await fs.readFile(resultPath, 'utf8');
+    if (!hasConflictMarkers(content)) {
+      return content;
+    }
+
+    const markerAction = await vscode.window.showWarningMessage(
+      '合并结果仍包含冲突标记。继续编辑可使用 VS Code 冲突操作清理标记。',
+      '继续编辑',
+      '仍然使用',
+      '取消',
+    );
+    if (markerAction === '仍然使用') {
+      return content;
+    }
+    if (markerAction !== '继续编辑') {
+      return undefined;
+    }
+
+    await vscode.window.showTextDocument(doc, {
+      preview: false,
+      viewColumn: vscode.ViewColumn.Active,
+    });
+  }
+}
+
+function buildConflictMarkerContent(
+  sourceContent: string,
+  targetContent: string,
+  sourceServerPath: string,
+  targetServerPath: string,
+): string {
+  const eol = sourceContent.includes('\r\n') || targetContent.includes('\r\n') ? '\r\n' : '\n';
+  return [
+    `<<<<<<< 源分支 ${sourceServerPath}`,
+    trimTrailingLineBreak(sourceContent),
+    '=======',
+    trimTrailingLineBreak(targetContent),
+    `>>>>>>> 目标分支 ${targetServerPath}`,
+    '',
+  ].join(eol);
+}
+
+function trimTrailingLineBreak(value: string): string {
+  return value.replace(/(?:\r\n|\r|\n)+$/u, '');
+}
+
+function hasConflictMarkers(value: string): boolean {
+  return /(^|\n)<<<<<<< .+(\r?\n)/u.test(value)
+    || /(^|\n)=======(\r?\n)/u.test(value)
+    || /(^|\n)>>>>>>> .+(\r?\n?)/u.test(value);
+}
+
+function sanitizeLocalFileName(value: string): string {
+  const sanitized = value.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').trim();
+  return sanitized || 'merge.txt';
 }
 
 function openManualMergePanel(

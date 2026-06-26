@@ -101,9 +101,9 @@ public class TfvcSoapClientTests
     public async Task QueryWorkspaces_passes_owner_and_computer_filters_in_body()
     {
         string capturedBody = string.Empty;
-        var soap = BuildSoapWithFakeHandler(req =>
+        var soap = BuildSoapWithFakeHandler(async req =>
         {
-            capturedBody = req.Content!.ReadAsStringAsync().Result;
+            capturedBody = await req.Content!.ReadAsStringAsync();
             return CreateXmlResponse("""
                 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
                   <soap:Body><QueryWorkspacesResponse><QueryWorkspacesResult /></QueryWorkspacesResponse></soap:Body>
@@ -162,9 +162,9 @@ public class TfvcSoapClientTests
     public async Task CreateWorkspace_sends_server_location_in_request()
     {
         string capturedBody = string.Empty;
-        var soap = BuildSoapWithFakeHandler(req =>
+        var soap = BuildSoapWithFakeHandler(async req =>
         {
-            capturedBody = req.Content!.ReadAsStringAsync().Result;
+            capturedBody = await req.Content!.ReadAsStringAsync();
             return CreateXmlResponse("""
                 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
                   <soap:Body>
@@ -256,9 +256,108 @@ public class TfvcSoapClientTests
         Assert.Empty(result.Operations);
         // Only the UNRESOLVED conflict (isresolved="false") is reported; the resolved one is skipped.
         Assert.Single(result.Conflicts);
+        Assert.Equal(0, result.Conflicts[0].ConflictId);
         Assert.Equal("$/P/Tgt/a.cs", result.Conflicts[0].TargetServerItem);
         Assert.Equal("$/P/Src/a.cs", result.Conflicts[0].SourceServerItem);
         Assert.Equal("Merge", result.Conflicts[0].ConflictType);
+    }
+
+    [Fact]
+    public async Task PendMerge_parses_conflict_id()
+    {
+        var soap = BuildSoapWithFakeHandler(_ => CreateXmlResponse("""
+            <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+              <soap:Body>
+                <MergeResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                  <MergeResult />
+                  <conflicts>
+                    <Conflict cid="42" ysitem="$/P/Tgt/a.cs" tsitem="$/P/Src/a.cs" ctype="Merge" bchg="Edit Merge" isresolved="false" />
+                  </conflicts>
+                </MergeResponse>
+              </soap:Body>
+            </soap:Envelope>
+            """));
+
+        var result = await soap.PendMergeAsync("ws", "alice", "$/P/Src", "$/P/Tgt", 100, 100);
+
+        Assert.Single(result.Conflicts);
+        Assert.Equal(42, result.Conflicts[0].ConflictId);
+    }
+
+    [Fact]
+    public async Task QueryConflicts_sends_item_specs_and_parses_conflict_id()
+    {
+        string capturedBody = string.Empty;
+        var soap = BuildSoapWithFakeHandler(async req =>
+        {
+            capturedBody = await req.Content!.ReadAsStringAsync();
+            return CreateXmlResponse("""
+                <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                  <soap:Body>
+                    <QueryConflictsResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                      <QueryConflictsResult>
+                        <Conflict cid="99" ysitem="$/P/Tgt/a.cs" tsitem="$/P/Src/a.cs" ctype="Merge" bchg="Edit Merge" isresolved="false" />
+                      </QueryConflictsResult>
+                    </QueryConflictsResponse>
+                  </soap:Body>
+                </soap:Envelope>
+                """);
+        });
+
+        var conflicts = await soap.QueryConflictsAsync("ws", "alice", new[] { "$/P/Tgt" });
+
+        Assert.Contains("<tns:QueryConflicts>", capturedBody);
+        Assert.Contains("<tns:workspaceName>ws</tns:workspaceName>", capturedBody);
+        Assert.Contains("<tns:ownerName>alice</tns:ownerName>", capturedBody);
+        Assert.Contains("<tns:ItemSpec item=\"$/P/Tgt\" recurse=\"Full\" did=\"0\" />", capturedBody);
+        Assert.Single(conflicts);
+        Assert.Equal(99, conflicts[0].ConflictId);
+    }
+
+    [Fact]
+    public async Task ResolveConflict_sends_accept_theirs_and_parses_operations()
+    {
+        string capturedBody = string.Empty;
+        string capturedAction = string.Empty;
+        var soap = BuildSoapWithFakeHandler(async req =>
+        {
+            capturedBody = await req.Content!.ReadAsStringAsync();
+            capturedAction = req.Headers.GetValues("SOAPAction").First();
+            return CreateXmlResponse("""
+                <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                  <soap:Body>
+                    <ResolveResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                      <ResolveResult>
+                        <GetOperation itemid="555" sitem="$/P/Src/a.cs" titem="$/P/Tgt/a.cs" chg="Merge|Edit" mvfrom="100" mvto="101" />
+                      </ResolveResult>
+                      <undoOperations />
+                      <resolvedConflicts>
+                        <Conflict cid="42" ysitem="$/P/Tgt/a.cs" tsitem="$/P/Src/a.cs" ctype="Merge" bchg="Edit Merge" isresolved="true" />
+                      </resolvedConflicts>
+                    </ResolveResponse>
+                  </soap:Body>
+                </soap:Envelope>
+                """);
+        });
+
+        var result = await soap.ResolveConflictAsync("ws", "alice", 42, "AcceptTheirs");
+
+        Assert.Contains("Resolve", capturedAction);
+        Assert.Contains("<tns:Resolve>", capturedBody);
+        Assert.Contains("<tns:conflictId>42</tns:conflictId>", capturedBody);
+        Assert.Contains("<tns:resolution>AcceptTheirs</tns:resolution>", capturedBody);
+        Assert.Contains("<tns:newPath xsi:nil=\"true\" />", capturedBody);
+        Assert.Contains("<tns:encoding>-2</tns:encoding>", capturedBody);
+        Assert.Contains("<tns:lockLevel>Unchanged</tns:lockLevel>", capturedBody);
+        Assert.Single(result.Operations);
+        Assert.Equal("$/P/Src/a.cs", result.Operations[0].SourceServerItem);
+        Assert.Equal("$/P/Tgt/a.cs", result.Operations[0].TargetServerItem);
+        Assert.Equal("Merge|Edit", result.Operations[0].ChangeType);
+        Assert.Equal(100, result.Operations[0].VersionFrom);
+        Assert.Equal(101, result.Operations[0].VersionTo);
+        Assert.Empty(result.UndoOperations);
+        Assert.Single(result.ResolvedConflicts);
+        Assert.Equal(42, result.ResolvedConflicts[0].ConflictId);
     }
 
     [Fact]
@@ -387,6 +486,26 @@ public class TfvcSoapClientTests
         Assert.DoesNotContain("<tns:cs>", capturedBody);
         // optionsEx is required (minOccurs=1).
         Assert.Contains("<tns:optionsEx>0</tns:optionsEx>", capturedBody);
+    }
+
+    [Fact]
+    public async Task PendMerge_sends_changeset_range_for_batch_plan()
+    {
+        string capturedBody = string.Empty;
+        var soap = BuildSoapWithFakeHandler(req =>
+        {
+            capturedBody = req.Content!.ReadAsStringAsync().Result;
+            return CreateXmlResponse("""
+                <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                  <soap:Body><MergeResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03"><MergeResult /></MergeResponse></soap:Body>
+                </soap:Envelope>
+                """);
+        });
+
+        await soap.PendMergeAsync("ws", "alice", "$/P/Src", "$/P/Tgt", 100, 110);
+
+        Assert.Contains("<tns:from xsi:type=\"tns:ChangesetVersionSpec\" cs=\"100\" />", capturedBody);
+        Assert.Contains("<tns:to xsi:type=\"tns:ChangesetVersionSpec\" cs=\"110\" />", capturedBody);
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────

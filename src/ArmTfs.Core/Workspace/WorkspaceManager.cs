@@ -34,6 +34,8 @@ public sealed class WorkspaceManager
     };
 
     private readonly string _rootPath;
+    private Dictionary<string, TrackedFileVersion>? _trackedByLocalPath;
+    private Dictionary<string, TrackedFileVersion>? _trackedByServerPath;
 
     /// <summary>初始化，使用指定目录作为工作区根目录。</summary>
     /// <param name="rootPath">工作区根目录（内部会转为绝对路径）</param>
@@ -139,15 +141,36 @@ public sealed class WorkspaceManager
     /// <summary>获取指定本地文件的版本追踪信息；文件未被追踪时返回 <c>null</c>。</summary>
     public TrackedFileVersion? GetTrackedVersion(string localPath)
     {
-        var file = GetVersionFilePath(localPath);
+        var normalizedLocalPath = NormalizeLocalPath(localPath);
+        var file = GetVersionFilePath(normalizedLocalPath);
         if (File.Exists(file))
         {
             var json = File.ReadAllText(file);
             var direct = JsonSerializer.Deserialize<TrackedFileVersion>(json, _jsonOptions);
-            return direct is null ? null : WithCurrentLocalPath(direct, NormalizeLocalPath(localPath));
+            return direct is null ? null : WithCurrentLocalPath(direct, normalizedLocalPath);
         }
 
-        return FindTrackedVersionByNormalizedPath(localPath);
+        var byLocalPath = FindTrackedVersionByNormalizedPath(normalizedLocalPath);
+        if (byLocalPath is not null)
+            return byLocalPath;
+
+        try
+        {
+            var metadata = LoadMetadata();
+            var serverPath = LocalToServerPath(normalizedLocalPath, metadata);
+            if (!string.IsNullOrWhiteSpace(serverPath))
+            {
+                var byServerPath = FindTrackedVersionByServerPath(serverPath);
+                if (byServerPath is not null)
+                    return WithCurrentLocalPath(byServerPath, normalizedLocalPath);
+            }
+        }
+        catch
+        {
+            // If workspace metadata is unavailable/corrupt, fall back to the direct lookup result.
+        }
+
+        return null;
     }
 
     /// <summary>将文件的版本快照序列化写入 .tf/versions/ 目录。</summary>
@@ -156,6 +179,8 @@ public sealed class WorkspaceManager
         Directory.CreateDirectory(VersionsPath);
         var file = GetVersionFilePath(version.LocalPath);
         File.WriteAllText(file, JsonSerializer.Serialize(version, _jsonOptions));
+        _trackedByLocalPath = null;
+        _trackedByServerPath = null;
     }
 
     /// <summary>返回本地工作区中所有已追踪文件的最大 ChangesetId；无追踪文件时返回 null。</summary>
@@ -188,6 +213,8 @@ public sealed class WorkspaceManager
     {
         var file = GetVersionFilePath(localPath);
         if (File.Exists(file)) File.Delete(file);
+        _trackedByLocalPath = null;
+        _trackedByServerPath = null;
     }
 
     /// <summary>获取对应本地文件的基线缓存文件路径；不存在时返回 <c>null</c>。</summary>
@@ -294,16 +321,16 @@ public sealed class WorkspaceManager
     /// <summary>将服务器路径转换为本地路径（按工作区映射规则）</summary>
     public string? ServerToLocalPath(string serverPath, WorkspaceMetadata metadata)
     {
-        foreach (var mapping in metadata.Mappings.OrderByDescending(m => m.ServerPath.Length))
+        foreach (var mapping in metadata.Mappings
+                     .Where(m => serverPath.StartsWith(m.ServerPath, StringComparison.OrdinalIgnoreCase))
+                     .OrderByDescending(m => m.ServerPath.Length)
+                     .ThenByDescending(GetLocalMappingPreference))
         {
-            if (serverPath.StartsWith(mapping.ServerPath, StringComparison.OrdinalIgnoreCase))
-            {
-                var relative = serverPath[mapping.ServerPath.Length..].TrimStart('/');
-                var localRelative = relative.Replace('/', Path.DirectorySeparatorChar);
-                return string.IsNullOrEmpty(localRelative)
-                    ? NormalizeLocalPath(mapping.LocalPath)
-                    : NormalizeLocalPath(Path.Combine(mapping.LocalPath, localRelative));
-            }
+            var relative = serverPath[mapping.ServerPath.Length..].TrimStart('/');
+            var localRelative = relative.Replace('/', Path.DirectorySeparatorChar);
+            return string.IsNullOrEmpty(localRelative)
+                ? NormalizeLocalPath(mapping.LocalPath)
+                : NormalizeLocalPath(Path.Combine(mapping.LocalPath, localRelative));
         }
         return null;
     }
@@ -347,10 +374,31 @@ public sealed class WorkspaceManager
 
     private TrackedFileVersion? FindTrackedVersionByNormalizedPath(string localPath)
     {
-        if (!Directory.Exists(VersionsPath))
-            return null;
-
         var normalizedLocalPath = NormalizeLocalPath(localPath);
+        EnsureTrackedVersionIndex();
+        return _trackedByLocalPath!.TryGetValue(NormalizeLocalKey(normalizedLocalPath), out var version)
+            ? WithCurrentLocalPath(version, normalizedLocalPath)
+            : null;
+    }
+
+    private TrackedFileVersion? FindTrackedVersionByServerPath(string serverPath)
+    {
+        EnsureTrackedVersionIndex();
+        return _trackedByServerPath!.TryGetValue(NormalizeServerKey(serverPath), out var version)
+            ? version
+            : null;
+    }
+
+    private void EnsureTrackedVersionIndex()
+    {
+        if (_trackedByLocalPath is not null && _trackedByServerPath is not null)
+            return;
+
+        _trackedByLocalPath = new Dictionary<string, TrackedFileVersion>(StringComparer.OrdinalIgnoreCase);
+        _trackedByServerPath = new Dictionary<string, TrackedFileVersion>(StringComparer.OrdinalIgnoreCase);
+        if (!Directory.Exists(VersionsPath))
+            return;
+
         foreach (var versionFile in Directory.EnumerateFiles(VersionsPath, "*.json"))
         {
             try
@@ -360,16 +408,15 @@ public sealed class WorkspaceManager
                 if (candidate is null)
                     continue;
 
-                if (string.Equals(NormalizeLocalPath(candidate.LocalPath), normalizedLocalPath, StringComparison.OrdinalIgnoreCase))
-                    return WithCurrentLocalPath(candidate, normalizedLocalPath);
+                _trackedByLocalPath.TryAdd(NormalizeLocalKey(candidate.LocalPath), candidate);
+                if (!string.IsNullOrWhiteSpace(candidate.ServerPath))
+                    _trackedByServerPath.TryAdd(NormalizeServerKey(candidate.ServerPath), candidate);
             }
             catch
             {
                 // Ignore corrupt or partially written version metadata.
             }
         }
-
-        return null;
     }
 
     private static TrackedFileVersion WithCurrentLocalPath(TrackedFileVersion version, string localPath)
@@ -396,6 +443,42 @@ public sealed class WorkspaceManager
 
         return fullPath;
     }
+
+    private int GetLocalMappingPreference(WorkspaceMapping mapping)
+    {
+        var score = 0;
+        var mappedPath = NormalizeLocalPath(mapping.LocalPath);
+        if (IsSameOrChildPath(_rootPath, mappedPath))
+            score += 10_000;
+
+        if (Directory.Exists(mappedPath) || File.Exists(mappedPath))
+            score += 1_000;
+
+        if (OperatingSystem.IsWindows() == IsWindowsDrivePath(mapping.LocalPath))
+            score += 100;
+        if ((OperatingSystem.IsMacOS() || OperatingSystem.IsLinux()) && Path.IsPathRooted(mapping.LocalPath) && !IsWindowsDrivePath(mapping.LocalPath))
+            score += 100;
+
+        return score;
+    }
+
+    private static bool IsSameOrChildPath(string candidatePath, string parentPath)
+    {
+        var candidate = NormalizeLocalPath(candidatePath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var parent = NormalizeLocalPath(parentPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return string.Equals(candidate, parent, StringComparison.OrdinalIgnoreCase)
+               || candidate.StartsWith(parent + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+               || candidate.StartsWith(parent + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsWindowsDrivePath(string path)
+    {
+        return path.Length >= 3 && char.IsLetter(path[0]) && path[1] == ':' && (path[2] == '\\' || path[2] == '/');
+    }
+
+    private static string NormalizeLocalKey(string path) => NormalizeLocalPath(path).ToLowerInvariant();
+
+    private static string NormalizeServerKey(string path) => NormalizeTfvcPath(path).ToLowerInvariant();
 
     private static string TranslatePlatformSharedPath(string path)
     {

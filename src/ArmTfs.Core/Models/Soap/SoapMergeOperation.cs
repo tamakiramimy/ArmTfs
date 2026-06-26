@@ -33,6 +33,9 @@ public sealed class SoapMergeOperation
 /// <summary>PendMerge 返回的冲突（服务器 3-way merge 检测到双方都改了同一文件）。</summary>
 public sealed class SoapMergeConflict
 {
+    /// <summary>服务器端 conflict ID；SOAP Resolve 需要这个 ID。</summary>
+    public int ConflictId { get; init; }
+
     /// <summary>目标分支上的服务器路径（"your" side）。</summary>
     public string TargetServerItem { get; init; } = string.Empty;
 
@@ -51,4 +54,12 @@ public sealed class PendMergeResult
 {
     public IReadOnlyList<SoapMergeOperation> Operations { get; init; } = Array.Empty<SoapMergeOperation>();
     public IReadOnlyList<SoapMergeConflict> Conflicts { get; init; } = Array.Empty<SoapMergeConflict>();
+}
+
+/// <summary>Resolve 返回的服务器端操作与被联动解决的冲突。</summary>
+public sealed class ResolveConflictResult
+{
+    public IReadOnlyList<SoapMergeOperation> Operations { get; init; } = Array.Empty<SoapMergeOperation>();
+    public IReadOnlyList<SoapMergeOperation> UndoOperations { get; init; } = Array.Empty<SoapMergeOperation>();
+    public IReadOnlyList<SoapMergeConflict> ResolvedConflicts { get; init; } = Array.Empty<SoapMergeConflict>();
 }

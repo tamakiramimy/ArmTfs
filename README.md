@@ -41,7 +41,7 @@ TEE-CLC relies on JNI (Java Native Interface) for critical features: NTLM authen
 
 ### The arm-tfs approach
 
-`arm-tfs` uses the **TFS/Azure DevOps REST API** exclusively — no JNI, no native TF client, no COM, no P/Invoke. It runs anywhere .NET 8 runs.
+`arm-tfs` uses cross-platform **TFS/Azure DevOps REST APIs** for regular item/history/workspace operations and the legacy **TFVC SOAP Repository.asmx protocol** for operations REST cannot model correctly, such as branch, merge, label, lock, and shelveset workflows. It still uses no JNI, no native TF client, no COM, and no P/Invoke, so it runs anywhere .NET 8 runs.
 
 ## Requirements
 
@@ -318,19 +318,37 @@ Options:
 
 ### `merge`
 
-Read-only merge analysis built from branch ancestry plus TFVC history.
+Merge analysis and execution built from branch ancestry plus TFVC history. Execution uses TFVC
+SOAP `Repository.asmx` by default so the server records real merge history.
 
 ```
 arm-tfs merge base --source <path> --target <path> [options]
 arm-tfs merge candidate --source <path> --target <path> [options]
+arm-tfs merge execute --source <path> --target <path> --changeset <id> [options]
+arm-tfs merge execute --source <path> --target <path> --from <id> --to <id> [options]
+arm-tfs merge preview-conflicts --source <path> --target <path> --from <id> --to <id> [options]
 
 Options:
   --top <n>              Maximum candidate changesets to return [default: 20]
   --scan <n>             Source/target history window to scan [default: 80]
+  --dry-run              Build a merge plan without checking in
+  --resolution-file <f>  Per-file source/target/manual conflict resolutions
+  --mode <mode>          Merge protocol: soap | rest [default: soap]
   --format <fmt>         Output format: table | json [default: table]
 ```
 
-`merge` output is inferential: it uses branch ancestry, branch creation-time history, and merge source ranges found in target changesets. It does not call a server merge-execution API.
+`merge candidate` output is inferential: it uses branch ancestry, branch creation-time history,
+and merge source ranges found in target changesets. `merge execute --from/--to --dry-run` asks
+the server for one SOAP merge plan across the whole range, so all server-detected conflicts are
+listed up front instead of being discovered one changeset at a time.
+
+Conflict resolution behavior:
+
+- `source` uses SOAP `Resolve(AcceptTheirs)` and keeps TFVC merge history.
+- `target` uses SOAP `Resolve(AcceptYours)` and keeps TFVC merge history when the server returns
+  merge operations to check in.
+- `manual` uses the supplied merged file content and falls back to a REST content check-in because
+  SOAP `Resolve(AcceptMerge)` expects a real local workspace file, not raw file bytes.
 
 ## JSON Contracts
 
@@ -356,7 +374,9 @@ A minimal VS Code extension now lives in [src/ArmTfs.VsCode](src/ArmTfs.VsCode).
 - resolves an `arm-tfs` CLI invocation
 - executes CLI commands with `--format json`
 - parses the stable envelopes into typed TypeScript contracts
-- exposes commands and an exported client API for future views/webviews
+- exposes commands and an exported client API for tree views/webviews
+- uses VS Code's native diff editor for source-vs-target comparisons
+- uses VS Code's native conflict marker editor for manual merge resolution
 
 Build it with:
 
@@ -403,7 +423,7 @@ dotnet publish src/ArmTfs.Cli -c Release -r win-arm64 --self-contained true -p:P
 ```
 arm-tfs.sln
 ├── src/
-│   ├── ArmTfs.Core/          # REST client, workspace management, models
+│   ├── ArmTfs.Core/          # TFVC REST/SOAP clients, workspace management, models
 │   │   ├── Client/
 │   │   │   ├── TfsConnection.cs       # VssConnection wrapper (PAT auth)
 │   │   │   └── TfvcClientService.cs   # TFVC operations via TfvcHttpClient
@@ -432,9 +452,8 @@ arm-tfs.sln
 
 ## Known Limitations
 
-- **No merge conflict resolution** — `get` overwrites local files if `--force` is passed; conflicts must be resolved manually.
-- **No merge execution** — current `merge` support is read-only analysis for merge base and candidate discovery.
-- **Merge candidate detection is inferential** — results are derived from branch ancestry plus scanned history windows, so old or atypical merge flows may require a larger `--scan` value.
+- **Manual merge content does not use SOAP Resolve yet** — source/target conflict resolutions use SOAP Resolve, but manual merged content falls back to a REST content check-in.
+- **Merge candidate detection is inferential** — results are derived from branch ancestry plus scanned history windows, so old or atypical merge flows may require a larger `--scan` value. Use SOAP range dry-run to validate the final conflict plan before executing.
 - **No workspace locking** — concurrent edits by multiple clients on the same workspace folder are not protected.
 - **PAT required for macOS** — Windows Integrated Auth (NTLM/Kerberos) is not supported cross-platform.
 

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { ArmTfsCliClient, ArmTfsCliError } from './armTfsCliClient';
@@ -364,13 +364,18 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
     }
 
     const result = new Set<string>();
-    for (const mapping of mappings) {
+    for (const p of readTrackedPathsFromVersionMetadata(workspaceRoot, mappings)) {
+      result.add(p);
+    }
+
+    for (const mapping of selectMappingsForWorkspaceRoot(workspaceRoot, mappings)) {
       if (!mapping.serverPath || !mapping.localPath) {
         continue;
       }
       try {
         const listing = await this.client.itemsList(mapping.serverPath, true, { cwdOverride: workspaceRoot });
         const serverRoot = mapping.serverPath.replace(/\/+$/, '');
+        const mappingLocalPath = translatePlatformSharedPath(mapping.localPath);
         for (const entry of listing.items) {
           if (entry.isFolder) {
             continue;
@@ -379,7 +384,7 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
           const relative = entry.serverPath.startsWith(serverRoot + '/')
             ? entry.serverPath.slice(serverRoot.length + 1)
             : entry.serverPath.replace(/^\$\//, '');
-          const localFile = path.join(mapping.localPath, ...relative.split('/'));
+          const localFile = path.join(mappingLocalPath, ...relative.split('/'));
           result.add(normalizeLocalPath(localFile));
         }
       } catch (error) {
@@ -587,6 +592,140 @@ function getBaseFilePath(rootPath: string, localPath: string): string {
   const normalizedPath = normalizeLocalPath(localPath).toLowerCase();
   const hash = createHash('sha256').update(normalizedPath).digest('hex').toUpperCase().slice(0, 16);
   return path.join(rootPath, '.tf', 'base', `${hash}${path.extname(normalizedPath)}`);
+}
+
+function readTrackedPathsFromVersionMetadata(
+  workspaceRoot: string,
+  mappings: Array<{ serverPath: string; localPath: string }>,
+): Set<string> {
+  const result = new Set<string>();
+  const versionsRoot = path.join(workspaceRoot, '.tf', 'versions');
+  if (!existsSync(versionsRoot)) {
+    return result;
+  }
+
+  let entries;
+  try {
+    entries = readdirSync(versionsRoot, { withFileTypes: true });
+  } catch {
+    return result;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) {
+      continue;
+    }
+
+    try {
+      const raw = JSON.parse(readFileSync(path.join(versionsRoot, entry.name), 'utf8')) as {
+        ServerPath?: string;
+        serverPath?: string;
+        LocalPath?: string;
+        localPath?: string;
+      };
+      const serverPath = raw.ServerPath ?? raw.serverPath;
+      const localPath = raw.LocalPath ?? raw.localPath;
+
+      const mappedLocalPath = serverPath ? resolveServerPathToLocalPath(serverPath, mappings, workspaceRoot) : undefined;
+      if (mappedLocalPath) {
+        result.add(normalizeLocalPath(mappedLocalPath));
+        continue;
+      }
+
+      if (localPath) {
+        const translated = normalizeLocalPath(localPath);
+        if (isSameOrChildPath(translated, workspaceRoot)) {
+          result.add(translated);
+        }
+      }
+    } catch {
+      // Ignore corrupt or partially written tracking files.
+    }
+  }
+
+  return result;
+}
+
+function resolveServerPathToLocalPath(
+  serverPath: string,
+  mappings: Array<{ serverPath: string; localPath: string }>,
+  workspaceRoot: string,
+): string | undefined {
+  const normalizedServerPath = normalizeServerPath(serverPath);
+  const candidates = mappings
+    .filter((mapping) => {
+      const mappingServerPath = normalizeServerPath(mapping.serverPath);
+      return normalizedServerPath === mappingServerPath || normalizedServerPath.startsWith(`${mappingServerPath}/`);
+    })
+    .sort((left, right) => {
+      const serverDiff = normalizeServerPath(right.serverPath).length - normalizeServerPath(left.serverPath).length;
+      if (serverDiff !== 0) {
+        return serverDiff;
+      }
+      return getLocalMappingPreference(right.localPath, workspaceRoot) - getLocalMappingPreference(left.localPath, workspaceRoot);
+    });
+
+  const best = candidates[0];
+  if (!best) {
+    return undefined;
+  }
+
+  const mappingServerPath = normalizeServerPath(best.serverPath);
+  const suffix = normalizedServerPath === mappingServerPath
+    ? ''
+    : normalizedServerPath.slice(mappingServerPath.length + 1);
+  const mappingLocalPath = translatePlatformSharedPath(best.localPath);
+  return suffix ? path.join(mappingLocalPath, ...suffix.split('/')) : mappingLocalPath;
+}
+
+function selectMappingsForWorkspaceRoot(
+  workspaceRoot: string,
+  mappings: Array<{ serverPath: string; localPath: string }>,
+): Array<{ serverPath: string; localPath: string }> {
+  const bestByServerPath = new Map<string, { mapping: { serverPath: string; localPath: string }; score: number }>();
+  for (const mapping of mappings) {
+    const key = normalizeServerPath(mapping.serverPath);
+    const score = getLocalMappingPreference(mapping.localPath, workspaceRoot);
+    const existing = bestByServerPath.get(key);
+    if (!existing || score > existing.score) {
+      bestByServerPath.set(key, { mapping, score });
+    }
+  }
+  return [...bestByServerPath.values()]
+    .filter((entry) => entry.score > 0)
+    .map((entry) => entry.mapping);
+}
+
+function getLocalMappingPreference(localPath: string, workspaceRoot: string): number {
+  const normalized = normalizeLocalPath(localPath);
+  let score = 0;
+  if (isSameOrChildPath(normalized, workspaceRoot)) {
+    score += 10_000;
+  }
+  if (existsSync(normalized)) {
+    score += 1_000;
+  }
+  if ((process.platform === 'win32') === isWindowsDrivePath(localPath)) {
+    score += 100;
+  }
+  if (process.platform !== 'win32' && path.isAbsolute(localPath) && !isWindowsDrivePath(localPath)) {
+    score += 100;
+  }
+  return score;
+}
+
+function normalizeServerPath(serverPath: string): string {
+  return serverPath.trim().replace(/\/+$/, '');
+}
+
+function isSameOrChildPath(candidatePath: string, parentPath: string): boolean {
+  const candidate = normalizeLocalPath(candidatePath);
+  const parent = normalizeLocalPath(parentPath);
+  return candidate === parent || candidate.startsWith(`${parent}${path.sep}`);
+}
+
+function isWindowsDrivePath(localPath: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(localPath);
 }
 
 function normalizeLocalPath(localPath: string): string {

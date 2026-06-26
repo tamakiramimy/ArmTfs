@@ -191,6 +191,26 @@ public class WorkspaceManagerTests : IDisposable
     }
 
     [Fact]
+    public void ServerToLocalPath_PrefersMappingUnderCurrentWorkspaceRoot_WhenServerPathIsDuplicated()
+    {
+        var macLikeMapping = Path.Combine(_tempDir, "Project");
+        Directory.CreateDirectory(macLikeMapping);
+        var meta = new WorkspaceMetadata
+        {
+            Name = "WS", ServerCollectionUrl = "https://tfs.example.com/tfs/DefaultCollection",
+            Mappings = new List<WorkspaceMapping>
+            {
+                new() { ServerPath = "$/Project/Main", LocalPath = @"D:\TFS\Project\Main" },
+                new() { ServerPath = "$/Project/Main", LocalPath = macLikeMapping }
+            }
+        };
+
+        var localPath = _ws.ServerToLocalPath("$/Project/Main/src/MyFile.cs", meta);
+
+        Assert.Equal(Path.Combine(macLikeMapping, "src", "MyFile.cs"), localPath);
+    }
+
+    [Fact]
     public void LocalToServerPath_ReturnsNull_WhenNoMapping()
     {
         var meta = new WorkspaceMetadata
@@ -228,6 +248,29 @@ public class WorkspaceManagerTests : IDisposable
         Assert.NotNull(loaded);
         Assert.Equal(42, loaded!.ChangesetId);
         Assert.Equal("abc123", loaded.ContentHash);
+    }
+
+    [Fact]
+    public void GetTrackedVersion_FallsBackToServerPath_WhenLocalPathWasWrittenOnAnotherPlatform()
+    {
+        var meta = CreateTestWorkspace();
+        var currentLocalFile = Path.Combine(_tempDir, "src", "tracked.cs");
+        Directory.CreateDirectory(Path.GetDirectoryName(currentLocalFile)!);
+        File.WriteAllText(currentLocalFile, "// hello");
+
+        _ws.SaveTrackedVersion(new TrackedFileVersion
+        {
+            ServerPath = "$/P/src/tracked.cs",
+            LocalPath = @"D:\TFS\P\src\tracked.cs",
+            ChangesetId = 108,
+            ContentHash = "abc123",
+        });
+
+        var loaded = _ws.GetTrackedVersion(currentLocalFile);
+
+        Assert.NotNull(loaded);
+        Assert.Equal(108, loaded!.ChangesetId);
+        Assert.Equal(currentLocalFile, loaded.LocalPath);
     }
 
     [Fact]

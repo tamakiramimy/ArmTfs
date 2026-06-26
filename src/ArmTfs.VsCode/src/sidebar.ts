@@ -236,6 +236,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       vscode.commands.registerCommand('armTfs.sidebar.setMergeSource', async (node?: BranchNode | ServerExplorerNode) => this.setMergePath(MERGE_SOURCE_KEY, t('sidebar.prompt.mergeSourcePath'), getNodeServerPath(node))),
       vscode.commands.registerCommand('armTfs.sidebar.setMergeTarget', async (node?: BranchNode | ServerExplorerNode) => this.setMergePath(MERGE_TARGET_KEY, t('sidebar.prompt.mergeTargetPath'), getNodeServerPath(node))),
       vscode.commands.registerCommand('armTfs.sidebar.copyTfvcPath', async (node?: BranchNode | MergeTargetOptionNode | string) => this.copyTfvcPath(node)),
+      vscode.commands.registerCommand('armTfs.sidebar.openLocalPath', async (node?: BranchNode | ServerExplorerNode) => this.openLocalPath(node)),
       vscode.commands.registerCommand('armTfs.sidebar.pullBranch', async (node?: BranchNode | ServerExplorerNode) => this.pullBranch(node)),
       vscode.commands.registerCommand('armTfs.sidebar.checkoutBranch', async (node?: BranchNode | ServerExplorerNode) => this.checkoutBranch(node)),
       vscode.commands.registerCommand('armTfs.sidebar.showBranchHistory', async (node?: BranchNode | ServerExplorerNode) => this.showBranchHistory(node)),
@@ -1000,6 +1001,25 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     }
   }
 
+  private async openLocalPath(node?: BranchNode | ServerExplorerNode): Promise<void> {
+    const mapped = this.resolveMappedBranchPath(node, 'pull');
+    if (!mapped) {
+      return;
+    }
+
+    const revealPath = getNearestExistingPath(mapped.localPath);
+    if (!revealPath) {
+      void vscode.window.showWarningMessage(t('sidebar.warning.localPathUnavailable', { path: mapped.serverPath }));
+      return;
+    }
+
+    await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(revealPath));
+    vscode.window.setStatusBarMessage(
+      t('sidebar.status.openedLocalPath', { path: revealPath }),
+      2500,
+    );
+  }
+
   private async showBranchHistory(node?: BranchNode | ServerExplorerNode): Promise<void> {
     const branchPath = getNodeServerPath(node);
     if (!branchPath) {
@@ -1552,7 +1572,7 @@ function resolveMappedLocalPathForServerPath(
       const suffix = getServerPathSuffix(serverPath, mapping.serverPath);
       const mappingLocalPath = translatePlatformSharedPath(mapping.localPath);
       const localPath = suffix ? path.join(mappingLocalPath, ...suffix.split('/')) : mappingLocalPath;
-      const score = mapping.serverPath.length + 1000;
+      const score = mapping.serverPath.length + 1000 + getLocalMappingPreference(mapping.localPath, workspaceRoot);
       if (!bestMatch || score > bestMatch.score) {
         bestMatch = { localPath, score };
       }
@@ -1560,7 +1580,7 @@ function resolveMappedLocalPathForServerPath(
     }
 
     if (isSameOrChildServerPath(mapping.serverPath, serverPath)) {
-      const score = mapping.serverPath.length;
+      const score = mapping.serverPath.length + getLocalMappingPreference(mapping.localPath, workspaceRoot);
       if (!bestMatch || score > bestMatch.score) {
         bestMatch = { localPath: translatePlatformSharedPath(mapping.localPath), score };
       }
@@ -1598,6 +1618,38 @@ function getServerPathSuffix(candidate: string, parent: string): string {
   return normalizedCandidate === normalizedParent
     ? ''
     : normalizedCandidate.slice(normalizedParent.length + 1);
+}
+
+function getLocalMappingPreference(localPath: string, workspaceRoot: string): number {
+  const normalizedLocalPath = normalizeForCompare(localPath);
+  const normalizedWorkspaceRoot = normalizeForCompare(workspaceRoot);
+
+  let score = 0;
+  if (
+    normalizedWorkspaceRoot === normalizedLocalPath
+    || normalizedWorkspaceRoot.startsWith(`${normalizedLocalPath}${path.sep}`)
+    || normalizedLocalPath.startsWith(`${normalizedWorkspaceRoot}${path.sep}`)
+  ) {
+    score += 10_000;
+  }
+
+  if (existsSync(translatePlatformSharedPath(localPath))) {
+    score += 1_000;
+  }
+
+  if ((process.platform === 'win32') === isWindowsDrivePath(localPath)) {
+    score += 100;
+  }
+
+  if (process.platform !== 'win32' && path.isAbsolute(localPath) && !isWindowsDrivePath(localPath)) {
+    score += 100;
+  }
+
+  return score;
+}
+
+function isWindowsDrivePath(localPath: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(localPath);
 }
 
 function cleanServerPath(serverPath: string): string {
@@ -1646,6 +1698,43 @@ function getPlatformSharedHomeDirectory(): string | undefined {
     return 'C:\\Mac\\Home';
   }
   return undefined;
+}
+
+async function resolveLocalPathForServerPath(
+  client: ArmTfsCliClient,
+  serverPath: string,
+  anchorPath?: string,
+): Promise<string | undefined> {
+  const workspaceRoot = await findTfvcWorkspaceRoot(anchorPath);
+  if (workspaceRoot) {
+    try {
+      const status = await client.status(workspaceRoot, false, { cwdOverride: workspaceRoot });
+      const mapped = resolveMappedLocalPathForServerPath(serverPath, status, workspaceRoot);
+      if (mapped) {
+        return mapped.localPath;
+      }
+    } catch {
+      // Fall back to configured mappings below.
+    }
+  }
+
+  return computeLocalPathForServerPath(serverPath);
+}
+
+function getNearestExistingPath(targetPath: string): string | undefined {
+  let current = path.resolve(targetPath);
+  while (true) {
+    if (existsSync(current)) {
+      return current;
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return undefined;
+    }
+
+    current = parent;
+  }
 }
 
 function getServerParentPath(serverPath: string): string | undefined {
@@ -2058,6 +2147,28 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
 
         const serverPath = node.entry.serverPath;
         await this.historyBrowser?.open(serverPath);
+      }),
+
+      vscode.commands.registerCommand('armTfs.serverExplorer.openLocalPath', async (node?: ServerExplorerNode) => {
+        if (!node) {
+          return;
+        }
+
+        const workspaceAnchor = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        const localPath = await resolveLocalPathForServerPath(this.client, node.entry.serverPath, workspaceAnchor);
+        if (!localPath) {
+          void vscode.window.showWarningMessage(t('serverExplorer.warning.localPathUnavailable', { path: node.entry.serverPath }));
+          return;
+        }
+
+        const revealPath = getNearestExistingPath(localPath);
+        if (!revealPath) {
+          void vscode.window.showWarningMessage(t('serverExplorer.warning.localPathUnavailable', { path: node.entry.serverPath }));
+          return;
+        }
+
+        await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(revealPath));
+        vscode.window.setStatusBarMessage(t('serverExplorer.status.openedLocalPath', { path: revealPath }), 2500);
       }),
 
       vscode.commands.registerCommand('armTfs.serverExplorer.copyPath', async (node?: ServerExplorerNode) => {

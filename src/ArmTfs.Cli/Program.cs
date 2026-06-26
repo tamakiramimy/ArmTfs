@@ -17,7 +17,7 @@ var config = provider.GetRequiredService<TfsConfig>();
 // ─── 根命令 ────────────────────────────────────────────────────────────────────
 var rootCommand = new RootCommand(
     "arm-tfs — Cross-platform TFVC CLI for ARM64 macOS & Windows 11 ARM\n" +
-    "Replaces tf.exe using pure REST APIs, no native DLL required.\n\n" +
+    "Replaces tf.exe using TFVC REST + SOAP APIs, no native DLL required.\n\n" +
     "Quick start:\n" +
     "  arm-tfs configure --url https://tfs.company.com/tfs/DefaultCollection --pat <token>\n" +
     "  arm-tfs workspace new --name MyWS --server-path $/Project/Main --local-path .\n" +
