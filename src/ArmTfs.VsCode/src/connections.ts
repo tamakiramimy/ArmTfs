@@ -3,19 +3,29 @@ import * as vscode from 'vscode';
 import type { ArmTfsCliClient, ArmTfsConnectionEnvironment } from './armTfsCliClient';
 import { t } from './i18n';
 import type { ConfiguredWorkspaceMapping } from './tfvcContext';
-import { getConfiguredWorkspaceMappings, setWorkspaceMappingsProvider } from './tfvcContext';
+import { setWorkspaceMappingsProvider } from './tfvcContext';
+import {
+  getActiveConnectionId,
+  getConfigValue,
+  getStoredConnectionProfiles,
+  setActiveConnectionId,
+  setConfigValue,
+  setStoredConnectionProfiles,
+  type ArmTfsStoredConnectionProfile,
+} from './userConfig';
 
 const PROFILES_KEY = 'armTfs.connections';
 const ACTIVE_PROFILE_KEY = 'armTfs.activeConnection';
 const PAT_SECRET_PREFIX = 'armTfs.connection.pat.';
 
-export interface TfsConnectionProfile {
+export interface TfsConnectionProfile extends ArmTfsStoredConnectionProfile {
   id: string;
   name: string;
   serverUrl: string;
   rootPath: string;
   displayName?: string;
   mappings?: ConfiguredWorkspaceMapping[];
+  pat?: string;
 }
 
 class ConnectionTreeItem extends vscode.TreeItem {
@@ -153,12 +163,13 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
   }
 
   async initialize(): Promise<void> {
+    await this.migrateLegacyConnectionState();
     await this.refreshCliDescription();
     const profiles = this.getProfiles();
     let active = this.getActiveProfile();
     if (!active && profiles.length) {
       active = profiles[0];
-      await this.context.globalState.update(ACTIVE_PROFILE_KEY, profiles[0].id);
+      setActiveConnectionId(profiles[0].id);
     }
     await this.activateProfile(active);
   }
@@ -169,11 +180,11 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
   }
 
   getProfiles(): TfsConnectionProfile[] {
-    return this.context.globalState.get<TfsConnectionProfile[]>(PROFILES_KEY, []);
+    return getStoredConnectionProfiles();
   }
 
   getActiveProfile(): TfsConnectionProfile | undefined {
-    const id = this.context.globalState.get<string>(ACTIVE_PROFILE_KEY);
+    const id = getActiveConnectionId();
     return this.getProfiles().find((profile) => profile.id === id);
   }
 
@@ -200,7 +211,7 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
     const profiles = this.getProfiles().map((profile) =>
       profile.id === profileId ? { ...profile, mappings } : profile,
     );
-    await this.context.globalState.update(PROFILES_KEY, profiles);
+    setStoredConnectionProfiles(profiles);
     this.provider.refresh();
   }
 
@@ -217,7 +228,7 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
     if (!profile) {
       return undefined;
     }
-    const pat = await this.context.secrets.get(`${PAT_SECRET_PREFIX}${profile.id}`);
+    const pat = profile.pat ?? await this.context.secrets.get(`${PAT_SECRET_PREFIX}${profile.id}`);
     if (!pat) {
       return undefined;
     }
@@ -229,7 +240,7 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
   }
 
   async refreshCliDescription(): Promise<void> {
-    const configuredCommand = vscode.workspace.getConfiguration('armTfs').get<string>('cli.command')?.trim();
+    const configuredCommand = getConfigValue<string>('cli.command', '').trim();
     if (!configuredCommand) {
       this.cliDescription = '';
       this.provider.refresh();
@@ -249,10 +260,7 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
       return;
     }
     const updated = { ...active, rootPath };
-    await this.context.globalState.update(
-      PROFILES_KEY,
-      this.getProfiles().map((profile) => profile.id === active.id ? updated : profile),
-    );
+    setStoredConnectionProfiles(this.getProfiles().map((profile) => profile.id === active.id ? updated : profile));
     this.provider.refresh();
   }
 
@@ -266,9 +274,8 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
       return;
     }
     const profiles = [...this.getProfiles(), profile.metadata];
-    await this.context.globalState.update(PROFILES_KEY, profiles);
-    await this.context.globalState.update(ACTIVE_PROFILE_KEY, profile.metadata.id);
-    await this.context.secrets.store(`${PAT_SECRET_PREFIX}${profile.metadata.id}`, profile.pat);
+    setStoredConnectionProfiles(profiles);
+    setActiveConnectionId(profile.metadata.id);
     await this.activateProfile(profile.metadata);
   }
 
@@ -280,13 +287,7 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
     if (!edited) {
       return;
     }
-    await this.context.globalState.update(
-      PROFILES_KEY,
-      this.getProfiles().map((item) => item.id === profile.id ? edited.metadata : item),
-    );
-    if (edited.pat) {
-      await this.context.secrets.store(`${PAT_SECRET_PREFIX}${profile.id}`, edited.pat);
-    }
+    setStoredConnectionProfiles(this.getProfiles().map((item) => item.id === profile.id ? edited.metadata : item));
     if (this.getActiveProfile()?.id === profile.id) {
       await this.activateProfile(edited.metadata);
     } else {
@@ -308,10 +309,10 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
     }
     const wasActive = this.getActiveProfile()?.id === profile.id;
     const remaining = this.getProfiles().filter((item) => item.id !== profile.id);
-    await this.context.globalState.update(PROFILES_KEY, remaining);
+    setStoredConnectionProfiles(remaining);
     await this.context.secrets.delete(`${PAT_SECRET_PREFIX}${profile.id}`);
     if (wasActive) {
-      await this.context.globalState.update(ACTIVE_PROFILE_KEY, remaining[0]?.id);
+      setActiveConnectionId(remaining[0]?.id);
       await this.activateProfile(remaining[0]);
     } else {
       this.provider.refresh();
@@ -322,7 +323,7 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
     if (!profile) {
       return;
     }
-    await this.context.globalState.update(ACTIVE_PROFILE_KEY, profile.id);
+    setActiveConnectionId(profile.id);
     await this.activateProfile(profile);
   }
 
@@ -332,17 +333,34 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
       // We deliberately do NOT touch branch.scope here — the active branch must come from
       // the workspace's .tf/workspace.json (auto-discovery), not from the profile's root.
       // Otherwise opening a specific branch checkout would silently get re-pointed to '$/'.
-      const target = vscode.workspace.workspaceFolders?.length
-        ? vscode.ConfigurationTarget.Workspace
-        : vscode.ConfigurationTarget.Global;
-      const config = vscode.workspace.getConfiguration('armTfs');
-      const currentRoot = config.get<string>('serverExplorer.rootPath')?.trim();
+      const currentRoot = getConfigValue<string>('serverExplorer.rootPath', '').trim();
       if (!currentRoot) {
-        await config.update('serverExplorer.rootPath', profile.rootPath, target);
+        setConfigValue('serverExplorer.rootPath', profile.rootPath);
       }
     }
     this.provider.refresh();
     await this.onConnectionChanged(profile);
+  }
+
+  private async migrateLegacyConnectionState(): Promise<void> {
+    if (getStoredConnectionProfiles().length) {
+      return;
+    }
+
+    const legacyProfiles = this.context.globalState.get<TfsConnectionProfile[]>(PROFILES_KEY, []);
+    if (!legacyProfiles.length) {
+      return;
+    }
+
+    const migrated: TfsConnectionProfile[] = [];
+    for (const profile of legacyProfiles) {
+      const pat = profile.pat ?? await this.context.secrets.get(`${PAT_SECRET_PREFIX}${profile.id}`);
+      migrated.push({ ...profile, pat });
+    }
+
+    setStoredConnectionProfiles(migrated);
+    const legacyActiveId = this.context.globalState.get<string>(ACTIVE_PROFILE_KEY);
+    setActiveConnectionId(legacyActiveId ?? migrated[0]?.id);
   }
 
   private async promptProfile(existing?: TfsConnectionProfile): Promise<{
@@ -367,7 +385,7 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
     if (!serverUrl) {
       return undefined;
     }
-    const existingPat = existing ? await this.context.secrets.get(`${PAT_SECRET_PREFIX}${existing.id}`) : undefined;
+    const existingPat = existing?.pat ?? (existing ? await this.context.secrets.get(`${PAT_SECRET_PREFIX}${existing.id}`) : undefined);
     const pat = await vscode.window.showInputBox({
       prompt: existingPat ? t('connections.prompt.patOptional') : t('extension.prompt.pat'),
       password: true,
@@ -439,6 +457,7 @@ export class ArmTfsConnectionsController implements vscode.Disposable {
         rootPath: trimmedRoot,
         displayName: displayName.trim() || undefined,
         mappings,
+        pat: pat.trim() || existingPat!,
       },
       pat: pat.trim() || existingPat!,
     };

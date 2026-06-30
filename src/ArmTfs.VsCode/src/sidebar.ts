@@ -9,6 +9,7 @@ import { t, translateCliMessage } from './i18n';
 import { ArmTfsMergeWorkbench } from './mergeWorkbench';
 import { checkoutServerPathToLocalFolder } from './serverPathCheckout';
 import { computeLocalPathForServerPath, discoverTfvcMappingForPath, findTfvcWorkspaceRoot, findTfvcWorkspaceRootSync, getCommandCwd, isPathWithin } from './tfvcContext';
+import { getConfigValue, setConfigValue } from './userConfig';
 import { openServerVersionDiff } from './versionedFiles';
 
 const MERGE_SOURCE_KEY = 'armTfs.merge.sourcePath';
@@ -340,7 +341,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     }
 
     const targetPath = this.getHistoryTargetPath(workspaceRoot);
-    const top = vscode.workspace.getConfiguration('armTfs').get<number>('history.top', 30);
+    const top = getConfigValue<number>('history.top', 30);
 
     try {
       const response = await this.client.history(targetPath, top, undefined, { cwdOverride: getCommandCwd(workspaceRoot, targetPath) });
@@ -368,7 +369,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
   }
 
   private async refreshServerHistory(targetPath: string): Promise<void> {
-    const top = vscode.workspace.getConfiguration('armTfs').get<number>('history.top', 30);
+    const top = getConfigValue<number>('history.top', 30);
 
     try {
       const response = await this.client.history(targetPath, top);
@@ -554,8 +555,8 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     }
 
     try {
-      const top = vscode.workspace.getConfiguration('armTfs').get<number>('merge.candidateTop', 20);
-      const scan = vscode.workspace.getConfiguration('armTfs').get<number>('merge.candidateScan', 80);
+      const top = getConfigValue<number>('merge.candidateTop', 20);
+      const scan = getConfigValue<number>('merge.candidateScan', 80);
       const [mergeBase, candidates] = await Promise.all([
         this.client.mergeBase(sourcePath, targetPath),
         this.client.mergeCandidates(sourcePath, targetPath, top, scan),
@@ -593,7 +594,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       return;
     }
 
-    const mode = vscode.workspace.getConfiguration('armTfs').get<string>('autoCheckout.mode', 'firstEdit');
+    const mode = getConfigValue<string>('autoCheckout.mode', 'firstEdit');
     if (mode !== 'firstEdit') {
       return;
     }
@@ -602,7 +603,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
   }
 
   async handleWillSave(document: vscode.TextDocument): Promise<readonly vscode.TextEdit[]> {
-    const mode = vscode.workspace.getConfiguration('armTfs').get<string>('autoCheckout.mode', 'firstEdit');
+    const mode = getConfigValue<string>('autoCheckout.mode', 'firstEdit');
     if (mode !== 'onSave') {
       return [];
     }
@@ -634,7 +635,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
         return;
       }
 
-      const requireConfirm = vscode.workspace.getConfiguration('armTfs').get<boolean>('autoCheckout.confirm', false);
+      const requireConfirm = getConfigValue<boolean>('autoCheckout.confirm', false);
       if (requireConfirm) {
         const action = await vscode.window.showInformationMessage(
           t('sidebar.autoCheckoutPrompt', { file: path.basename(filePath) }),
@@ -697,7 +698,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       return discovered;
     }
 
-    const configuredScope = vscode.workspace.getConfiguration('armTfs').get<string>('branch.scope')?.trim();
+    const configuredScope = getConfigValue<string>('branch.scope', '').trim();
     if (configuredScope) {
       return cleanServerPath(configuredScope);
     }
@@ -847,7 +848,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
   }
 
   private async useMergeTarget(targetPath: string): Promise<void> {
-    await vscode.workspace.getConfiguration('armTfs').update('merge.targetPath', cleanServerPath(targetPath), getConfigTarget());
+    setConfigValue('merge.targetPath', cleanServerPath(targetPath));
     await this.refreshMerge();
   }
 
@@ -877,24 +878,23 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     serverPath: string,
     options: { syncBranchScope: boolean; syncMergeSource: boolean },
   ): Promise<void> {
-    const target = getConfigTarget();
     if (options.syncBranchScope) {
       const branchScope = cleanServerPath(serverPath);
-      await vscode.workspace.getConfiguration('armTfs').update('branch.scope', branchScope, target);
+      setConfigValue('branch.scope', branchScope);
     }
     if (options.syncMergeSource) {
-      await vscode.workspace.getConfiguration('armTfs').update('merge.sourcePath', serverPath, target);
+      setConfigValue('merge.sourcePath', serverPath);
     }
   }
 
   private getConfiguredServerExplorerRoot(): string | undefined {
-    const value = vscode.workspace.getConfiguration('armTfs').get<string>('serverExplorer.rootPath')?.trim();
+    const value = getConfigValue<string>('serverExplorer.rootPath', '').trim();
     return value?.startsWith('$/') ? cleanServerPath(value) : undefined;
   }
 
   private getStoredPath(key: string): string | undefined {
     const configKey = key === MERGE_SOURCE_KEY ? 'merge.sourcePath' : 'merge.targetPath';
-    const value = vscode.workspace.getConfiguration('armTfs').get<string>(configKey)?.trim();
+    const value = getConfigValue<string>(configKey, '').trim();
     return value || undefined;
   }
 
@@ -915,7 +915,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
 
     const trimmed = cleanServerPath(value);
     this.activeBranchPath = trimmed;
-    await vscode.workspace.getConfiguration('armTfs').update('branch.scope', trimmed, getConfigTarget());
+    setConfigValue('branch.scope', trimmed);
     await this.refreshBranches();
   }
 
@@ -935,17 +935,16 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       return;
     }
 
-    await vscode.workspace.getConfiguration('armTfs').update(configKey, value.trim(), getConfigTarget());
+    setConfigValue(configKey, value.trim());
     await this.refreshMerge();
   }
 
   private async swapMergePaths(): Promise<void> {
     const sourcePath = this.getStoredPath(MERGE_SOURCE_KEY);
     const targetPath = this.getStoredPath(MERGE_TARGET_KEY);
-    const target = getConfigTarget();
 
-    await vscode.workspace.getConfiguration('armTfs').update('merge.sourcePath', targetPath ?? '', target);
-    await vscode.workspace.getConfiguration('armTfs').update('merge.targetPath', sourcePath ?? '', target);
+    setConfigValue('merge.sourcePath', targetPath ?? '');
+    setConfigValue('merge.targetPath', sourcePath ?? '');
     await this.refreshMerge();
   }
 
@@ -1055,8 +1054,8 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       return;
     }
 
-    const top = vscode.workspace.getConfiguration('armTfs').get<number>('merge.candidateTop', 20);
-    const scan = vscode.workspace.getConfiguration('armTfs').get<number>('merge.candidateScan', 80);
+    const top = getConfigValue<number>('merge.candidateTop', 20);
+    const scan = getConfigValue<number>('merge.candidateScan', 80);
     try {
       const response = await this.client.mergeCandidates(sourcePath, target.targetPath, top, scan);
       if (!response.items.length) {
@@ -1546,10 +1545,6 @@ function normalizeForCompare(targetPath: string): string {
   return path.resolve(translatePlatformSharedPath(targetPath)).toLowerCase();
 }
 
-function getConfigTarget(): vscode.ConfigurationTarget {
-  return vscode.workspace.workspaceFolders?.length ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
-}
-
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : `${error}`;
 }
@@ -1842,7 +1837,7 @@ class ServerExplorerProvider implements vscode.TreeDataProvider<vscode.TreeItem>
   private filteredChildrenByParent: Map<string, ServerItemEntry[]> | undefined;
 
   constructor(private readonly client: ArmTfsCliClient, private readonly output: vscode.OutputChannel) {
-    this.rootPath = vscode.workspace.getConfiguration('armTfs').get<string>('serverExplorer.rootPath')?.trim() || undefined;
+    this.rootPath = getConfigValue<string>('serverExplorer.rootPath', '').trim() || undefined;
   }
 
   setRootPath(rootPath: string): void {
@@ -2068,7 +2063,7 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
 
       vscode.commands.registerCommand('armTfs.serverExplorer.setRoot', async (node?: ServerExplorerNode) => {
         const current = node?.entry.serverPath
-          ?? vscode.workspace.getConfiguration('armTfs').get<string>('serverExplorer.rootPath')?.trim()
+          ?? getConfigValue<string>('serverExplorer.rootPath', '').trim()
           ?? '$/';
         const value = await vscode.window.showInputBox({
           prompt: t('serverExplorer.prompt.rootPath'),
@@ -2081,7 +2076,7 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
         }
 
         const trimmed = value.trim();
-        await vscode.workspace.getConfiguration('armTfs').update('serverExplorer.rootPath', trimmed, getConfigTarget());
+        setConfigValue('serverExplorer.rootPath', trimmed);
         await this.onRootPathChanged?.(trimmed);
         this.provider.setRootPath(trimmed);
         // Note: setting the explorer root no longer affects the branches view.

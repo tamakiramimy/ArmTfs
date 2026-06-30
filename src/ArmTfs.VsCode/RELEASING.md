@@ -59,19 +59,19 @@ xattr -rd com.apple.quarantine /Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.Cli/
 ```bash
 cd /Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.VsCode
 ./node_modules/.bin/tsc -p .
-npx @vscode/vsce package -o arm-tfs-vscode-0.1.0.vsix
+npx @vscode/vsce package -o arm-tfs-vscode-0.1.4.vsix
 ```
 
 Output:
 
-- `/Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.VsCode/arm-tfs-vscode-0.1.0.vsix`
+- `/Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.VsCode/arm-tfs-vscode-0.1.4.vsix`
 
 ## 5. Install VSIX locally
 
 ### From command line
 
 ```bash
-code --install-extension /Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.VsCode/arm-tfs-vscode-0.1.0.vsix --force
+code --install-extension /Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.VsCode/arm-tfs-vscode-0.1.4.vsix --force
 ```
 
 ### From VS Code UI
@@ -80,7 +80,7 @@ code --install-extension /Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.VsCode/arm
 2. Open Extensions view
 3. Click the `...` menu in the top-right corner
 4. Click `Install from VSIX...`
-5. Pick `/Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.VsCode/arm-tfs-vscode-0.1.0.vsix`
+5. Pick `/Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.VsCode/arm-tfs-vscode-0.1.4.vsix`
 
 ## 6. Prepare for Marketplace publishing
 
@@ -145,7 +145,7 @@ npx @vscode/vsce publish 0.1.1
 
 ```bash
 cd /Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.VsCode
-npx @vscode/vsce publish --packagePath arm-tfs-vscode-0.1.0.vsix
+npx @vscode/vsce publish --packagePath arm-tfs-vscode-0.1.4.vsix
 ```
 
 ## 11. Verify after publishing

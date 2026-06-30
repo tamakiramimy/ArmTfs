@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { getConfigValue } from './userConfig';
 
 export type UiLanguage = 'auto' | 'en' | 'zh-CN';
 
@@ -36,6 +37,22 @@ const dictionaries: Record<'en' | 'zh-CN', Messages> = {
     'changesView.revertLocal.confirm': "Overwrite local '{file}' with server version?",
     'changesView.revertLocal.action': 'Overwrite',
     'changesView.revertLocal.failed': 'Revert failed: {message}',
+    'changesView.bulkAdd.none': 'No untracked files to add.',
+    'changesView.bulkAdd.title': 'arm-tfs add all untracked',
+    'changesView.undoPendingAdds.none': 'No pending added files to undo.',
+    'changesView.undoPendingAdds.title': 'arm-tfs undo added files',
+    'changesView.stageAll.none': 'No local changes to add to pending changes.',
+    'changesView.stageAll.title': 'arm-tfs add all changes to pending',
+    'changesView.unstage.title': 'arm-tfs unstage pending change',
+    'changesView.unstageAll.none': 'No pending changes to unstage.',
+    'changesView.unstageAll.title': 'arm-tfs unstage all pending changes',
+    'changesView.discard.confirm': 'Discard pending change for "{file}"?',
+    'changesView.discard.detail': 'This will remove the pending change and restore the file from the latest server version where applicable. The local change record will be lost.\n\n{path}',
+    'changesView.discard.action': 'Discard',
+    'changesView.discard.title': 'arm-tfs discard pending change',
+    'changesView.ignore.title': 'arm-tfs ignore file',
+    'changesView.ignore.added': 'Added ignore pattern {pattern} to {file}',
+    'changesView.ignore.already': 'Ignore pattern {pattern} already exists in {file}',
     'historyBrowser.dialog.checkoutFolder': 'Choose checkout folder',
     'historyBrowser.status.downloadedChangeset': 'Downloaded cs{changeset} to {path}',
     'historyBrowser.error': 'arm-tfs {operation}: {message}',
@@ -71,6 +88,7 @@ const dictionaries: Record<'en' | 'zh-CN', Messages> = {
     'connections.workspaceMappings.autoRegistered': 'Auto-registered workspace mapping: {serverPath} → {localPath}',
     'error.localFolderMapped': 'Local folder "{localPath}" is already mapped to "{serverPath}". Choose another folder or remove the existing mapping first.',
     'scm.input.placeholder': 'Enter TFVC check-in comment',
+    'scm.group.pendingChanges': 'Pending Changes',
     'scm.group.changes': 'Changes',
     'scm.group.localChanges': 'Local Modifications',
     'scm.group.conflicts': 'Conflicts',
@@ -80,12 +98,14 @@ const dictionaries: Record<'en' | 'zh-CN', Messages> = {
     'warning.noFile.add': 'No file selected for add.',
     'warning.noFile.undo': 'No file selected for undo.',
     'warning.noFile.diff': 'No file selected for diff.',
+    'warning.noFile.ignore': 'No file selected to ignore.',
     'warning.noWorkspace.file': 'No arm-tfs workspace found for this file.',
     'warning.noWorkspace.path': 'No arm-tfs workspace found for this path. Create or configure a TFVC workspace first.',
     'warning.noWorkspace.general': 'No arm-tfs workspace found. Create or configure a TFVC workspace first.',
     'warning.checkin.comment': 'Enter a TFVC check-in comment in the Source Control input box.',
     'info.diff.added': 'Added file has no TFVC base yet. Opened the working file instead.',
     'info.diff.deleted': 'Deleted file has no local working copy to diff. Use history or undo to inspect it.',
+    'info.diff.noServerVersion': 'No server version exists at this path. Showing an empty-baseline diff instead.',
     'status.completed': '{title} completed',
     'error.failed': '{title} failed: {message}',
     'command.output.completed': '{title} completed',
@@ -330,6 +350,22 @@ const dictionaries: Record<'en' | 'zh-CN', Messages> = {
     'changesView.revertLocal.confirm': '用服务器版本覆盖本地文件 "{file}"？',
     'changesView.revertLocal.action': '覆盖',
     'changesView.revertLocal.failed': '恢复失败：{message}',
+    'changesView.bulkAdd.none': '没有可添加的未跟踪文件。',
+    'changesView.bulkAdd.title': 'arm-tfs 添加所有未跟踪文件',
+    'changesView.undoPendingAdds.none': '没有可撤销的新增文件。',
+    'changesView.undoPendingAdds.title': 'arm-tfs 撤销新增文件',
+    'changesView.stageAll.none': '没有可添加到未提交变更的本地变更。',
+    'changesView.stageAll.title': 'arm-tfs 全部添加到未提交变更',
+    'changesView.unstage.title': 'arm-tfs 取消暂存变更',
+    'changesView.unstageAll.none': '没有可取消暂存的未提交变更。',
+    'changesView.unstageAll.title': 'arm-tfs 全部取消暂存',
+    'changesView.discard.confirm': '撤销 "{file}" 的未提交变更？',
+    'changesView.discard.detail': '该操作会移除未提交变更记录，并在适用时用服务器最新版本覆盖本地文件。撤销后这条变更记录会消失。\n\n{path}',
+    'changesView.discard.action': '撤销变更',
+    'changesView.discard.title': 'arm-tfs 撤销未提交变更',
+    'changesView.ignore.title': 'arm-tfs 忽略文件',
+    'changesView.ignore.added': '已将忽略规则 {pattern} 添加到 {file}',
+    'changesView.ignore.already': '忽略规则 {pattern} 已存在于 {file}',
     'historyBrowser.dialog.checkoutFolder': '选择签出目录',
     'historyBrowser.status.downloadedChangeset': '已将 cs{changeset} 获取到 {path}',
     'historyBrowser.error': 'arm-tfs {operation}：{message}',
@@ -365,6 +401,7 @@ const dictionaries: Record<'en' | 'zh-CN', Messages> = {
     'connections.workspaceMappings.autoRegistered': '已自动注册工作区映射：{serverPath} → {localPath}',
     'error.localFolderMapped': '本地目录“{localPath}”已经映射到“{serverPath}”。请更换目录，或先移除现有映射。',
     'scm.input.placeholder': '输入 TFVC 签入备注',
+    'scm.group.pendingChanges': '未提交的变更',
     'scm.group.changes': '变更',
     'scm.group.localChanges': '本地修改',
     'scm.group.conflicts': '冲突',
@@ -374,12 +411,14 @@ const dictionaries: Record<'en' | 'zh-CN', Messages> = {
     'warning.noFile.add': '没有选中要添加的文件。',
     'warning.noFile.undo': '没有选中要撤销的文件。',
     'warning.noFile.diff': '没有选中要比较的文件。',
+    'warning.noFile.ignore': '没有选中要忽略的文件。',
     'warning.noWorkspace.file': '当前文件没有找到 arm-tfs 工作区。',
     'warning.noWorkspace.path': '当前路径没有找到 arm-tfs 工作区，请先创建或配置 TFVC 工作区。',
     'warning.noWorkspace.general': '没有找到 arm-tfs 工作区，请先创建或配置 TFVC 工作区。',
     'warning.checkin.comment': '请先在 Source Control 输入框里填写 TFVC 签入备注。',
     'info.diff.added': '新增文件还没有 TFVC 基线，已直接打开当前工作文件。',
     'info.diff.deleted': '已删除文件没有本地工作副本，建议通过历史或 undo 查看。',
+    'info.diff.noServerVersion': '服务器当前路径没有对应版本，已改为用空白基线对比本地文件。',
     'status.completed': '{title} 已完成',
     'error.failed': '{title} 失败：{message}',
     'command.output.completed': '{title} 已完成',
@@ -596,7 +635,7 @@ const dictionaries: Record<'en' | 'zh-CN', Messages> = {
 };
 
 export function getUiLanguage(): 'en' | 'zh-CN' {
-  const configured = vscode.workspace.getConfiguration('armTfs').get<UiLanguage>('ui.language', 'auto');
+  const configured = getConfigValue<UiLanguage>('ui.language', 'auto');
   if (configured === 'en' || configured === 'zh-CN') {
     return configured;
   }

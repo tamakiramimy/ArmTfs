@@ -2,5 +2,10 @@ src/**
 tsconfig.json
 README.md
 .vscodeignore
+.vscode/**
+*.vsix
+*.zip
+.DS_Store
+out/**/*.map
 node_modules/typescript/**
 node_modules/@types/**

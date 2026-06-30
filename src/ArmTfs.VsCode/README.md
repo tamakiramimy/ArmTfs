@@ -11,6 +11,16 @@ This VS Code extension is intentionally thin. It delegates all TFVC work to the 
 
 ## Settings
 
+arm-tfs extension settings are stored in a fixed user-level JSON file instead of the
+current VS Code workspace settings:
+
+- macOS: `~/Library/Application Support/arm-tfs/vscode-config.json`
+- Windows: `%APPDATA%\arm-tfs\vscode-config.json`
+- Linux: `${XDG_CONFIG_HOME:-~/.config}/arm-tfs/vscode-config.json`
+
+Existing VS Code `armTfs.*` settings are migrated into that file on activation and kept
+as a backward-compatible fallback.
+
 - `armTfs.cli.command`: explicit command, for example `dotnet` or `/custom/path/arm-tfs`
 - `armTfs.cli.commandArgs`: prefix arguments, for example `["/path/to/arm-tfs.dll"]`
 - `armTfs.cli.cwd`: working directory for CLI execution

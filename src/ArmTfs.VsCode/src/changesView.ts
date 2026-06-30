@@ -4,10 +4,10 @@ import type { ArmTfsCliClient } from './armTfsCliClient';
 import type { ArmTfsScmController, ArmTfsResourceState, ArmTfsUntrackedResourceState } from './scm';
 import { t } from './i18n';
 
-type ChangeKind = 'pending' | 'localChanges' | 'conflicts' | 'untracked';
+type ChangeGroupKind = 'pending' | 'working' | 'conflicts';
 
 class ChangeGroupItem extends vscode.TreeItem {
-  constructor(public readonly kind: ChangeKind, count: number) {
+  constructor(public readonly kind: ChangeGroupKind, count: number) {
     super(labelForKind(kind), vscode.TreeItemCollapsibleState.Expanded);
     this.contextValue = `armTfsChangeGroup.${kind}`;
     this.description = count.toString();
@@ -17,18 +17,16 @@ class ChangeGroupItem extends vscode.TreeItem {
 
 class ChangeFileItem extends vscode.TreeItem {
   constructor(
-    public readonly kind: ChangeKind,
+    public readonly kind: ChangeGroupKind,
     public readonly resource: ArmTfsResourceState | ArmTfsUntrackedResourceState,
   ) {
     const label = path.basename(resource.resourceUri.fsPath);
     super(label, vscode.TreeItemCollapsibleState.None);
-    this.contextValue = kind === 'untracked' ? 'armTfsChangeFile.untracked' : `armTfsChangeFile.${kind}`;
+    this.contextValue = contextForResource(kind, resource);
     this.resourceUri = resource.resourceUri;
     this.description = path.dirname(resource.resourceUri.fsPath);
     this.tooltip = resource.resourceUri.fsPath;
-    this.command = kind === 'untracked'
-      ? { command: 'vscode.open', title: 'Open', arguments: [resource.resourceUri] }
-      : { command: 'armTfs.openResourceDiff', title: t('command.openTfsDiff'), arguments: [resource] };
+    this.command = { command: 'armTfs.openResourceDiff', title: t('command.openTfsDiff'), arguments: [resource] };
   }
 }
 
@@ -52,14 +50,12 @@ class ChangesProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
       if (this.scm.pendingChanges.length) {
         groups.push(new ChangeGroupItem('pending', this.scm.pendingChanges.length));
       }
-      if (this.scm.localChanges.length) {
-        groups.push(new ChangeGroupItem('localChanges', this.scm.localChanges.length));
-      }
       if (this.scm.conflicts.length) {
         groups.push(new ChangeGroupItem('conflicts', this.scm.conflicts.length));
       }
-      if (this.scm.untrackedFiles.length) {
-        groups.push(new ChangeGroupItem('untracked', this.scm.untrackedFiles.length));
+      const workingCount = this.scm.localChanges.length + this.scm.untrackedFiles.length;
+      if (workingCount) {
+        groups.push(new ChangeGroupItem('working', workingCount));
       }
       if (groups.length === 0) {
         const empty = new vscode.TreeItem(t('changesView.empty'), vscode.TreeItemCollapsibleState.None);
@@ -74,12 +70,13 @@ class ChangesProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
       switch (element.kind) {
         case 'pending':
           return this.scm.pendingChanges.map((r) => new ChangeFileItem('pending', r));
-        case 'localChanges':
-          return this.scm.localChanges.map((r) => new ChangeFileItem('localChanges', r));
+        case 'working':
+          return [
+            ...this.scm.localChanges.map((r) => new ChangeFileItem('working', r)),
+            ...this.scm.untrackedFiles.map((r) => new ChangeFileItem('working', r)),
+          ];
         case 'conflicts':
           return this.scm.conflicts.map((r) => new ChangeFileItem('conflicts', r));
-        case 'untracked':
-          return this.scm.untrackedFiles.map((r) => new ChangeFileItem('untracked', r));
       }
     }
     return [];
@@ -119,7 +116,14 @@ export class ArmTfsChangesViewController implements vscode.Disposable {
       }),
       vscode.commands.registerCommand('armTfs.changes.add', (item?: ChangeFileItem) => {
         if (item?.resource) {
-          return this.scm.add(item.resource);
+          return this.scm.stage(item.resource);
+        }
+      }),
+      vscode.commands.registerCommand('armTfs.changes.addAllUntracked', () => this.scm.stageAllWorkingChanges()),
+      vscode.commands.registerCommand('armTfs.changes.stageAll', () => this.scm.stageAllWorkingChanges()),
+      vscode.commands.registerCommand('armTfs.changes.ignore', (item?: ChangeFileItem) => {
+        if (item?.resource) {
+          return this.scm.ignore(item.resource);
         }
       }),
       vscode.commands.registerCommand('armTfs.changes.checkout', (item?: ChangeFileItem) => {
@@ -129,12 +133,19 @@ export class ArmTfsChangesViewController implements vscode.Disposable {
       }),
       vscode.commands.registerCommand('armTfs.changes.undo', (item?: ChangeFileItem) => {
         if (item?.resource) {
-          return this.scm.undo(item.resource as ArmTfsResourceState);
+          return this.scm.discardPendingChange(item.resource as ArmTfsResourceState);
         }
       }),
+      vscode.commands.registerCommand('armTfs.changes.unstage', (item?: ChangeFileItem) => {
+        if (item?.resource) {
+          return this.scm.unstage(item.resource as ArmTfsResourceState);
+        }
+      }),
+      vscode.commands.registerCommand('armTfs.changes.unstageAll', () => this.scm.unstageAllPendingChanges()),
+      vscode.commands.registerCommand('armTfs.changes.undoPendingAdds', () => this.scm.unstageAllPendingChanges()),
       vscode.commands.registerCommand('armTfs.changes.openDiff', (item?: ChangeFileItem) => {
         if (item?.resource) {
-          return this.scm.openDiff(item.resource as ArmTfsResourceState);
+          return this.scm.openDiff(item.resource);
         }
       }),
       vscode.commands.registerCommand('armTfs.changes.deleteUntracked', async (item?: ChangeFileItem) => {
@@ -164,23 +175,7 @@ export class ArmTfsChangesViewController implements vscode.Disposable {
         if (!item?.resource) {
           return;
         }
-        const fsPath = item.resource.resourceUri.fsPath;
-        const choice = await vscode.window.showWarningMessage(
-          t('changesView.revertLocal.confirm', { file: path.basename(fsPath) }),
-          { modal: true, detail: fsPath },
-          t('changesView.revertLocal.action'),
-        );
-        if (choice !== t('changesView.revertLocal.action')) {
-          return;
-        }
-        try {
-          await this.client.get(fsPath, { force: true, recursive: false });
-          await this.scm.refresh();
-        } catch (error) {
-          void vscode.window.showErrorMessage(
-            t('changesView.revertLocal.failed', { message: error instanceof Error ? error.message : String(error) }),
-          );
-        }
+        return this.scm.discardPendingChange(item.resource as ArmTfsResourceState);
       }),
     );
   }
@@ -206,28 +201,37 @@ export class ArmTfsChangesViewController implements vscode.Disposable {
   }
 }
 
-function labelForKind(kind: ChangeKind): string {
+function labelForKind(kind: ChangeGroupKind): string {
   switch (kind) {
     case 'pending':
+      return t('scm.group.pendingChanges');
+    case 'working':
       return t('scm.group.changes');
-    case 'localChanges':
-      return t('scm.group.localChanges');
     case 'conflicts':
       return t('scm.group.conflicts');
-    case 'untracked':
-      return t('scm.group.untracked');
   }
 }
 
-function iconForKind(kind: ChangeKind): string {
+function iconForKind(kind: ChangeGroupKind): string {
   switch (kind) {
     case 'pending':
       return 'git-commit';
-    case 'localChanges':
+    case 'working':
       return 'edit';
     case 'conflicts':
       return 'warning';
-    case 'untracked':
-      return 'new-file';
   }
+}
+
+function contextForResource(
+  kind: ChangeGroupKind,
+  resource: ArmTfsResourceState | ArmTfsUntrackedResourceState,
+): string {
+  if ('localPath' in resource) {
+    return 'armTfsChangeFile.untracked';
+  }
+  if (kind === 'working') {
+    return 'armTfsChangeFile.localChanges';
+  }
+  return `armTfsChangeFile.${kind}`;
 }

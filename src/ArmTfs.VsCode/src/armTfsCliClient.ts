@@ -20,6 +20,7 @@ import type {
   MergePreviewConflictsResponse,
   StatusResponse,
 } from './contracts';
+import { getConfigValue } from './userConfig';
 
 const execFileAsync = promisify(execFile);
 
@@ -559,10 +560,9 @@ export class ArmTfsCliClient {
   }
 
   private async resolveInvocation(commandArgs: string[], cwdOverride?: string): Promise<ArmTfsInvocation> {
-    const config = vscode.workspace.getConfiguration('armTfs');
-    const configuredCommand = config.get<string>('cli.command')?.trim() ?? '';
-    const configuredArgs = config.get<string[]>('cli.commandArgs') ?? [];
-    const configuredCwd = config.get<string>('cli.cwd')?.trim() ?? '';
+    const configuredCommand = getConfigValue<string>('cli.command', '').trim();
+    const configuredArgs = getConfigValue<string[]>('cli.commandArgs', []);
+    const configuredCwd = getConfigValue<string>('cli.cwd', '').trim();
     const cwd = cwdOverride || configuredCwd || this.getDefaultCwd();
 
     if (configuredCommand) {
@@ -573,7 +573,7 @@ export class ArmTfsCliClient {
       };
     }
 
-    const preferWorkspaceBuild = config.get<boolean>('cli.preferWorkspaceBuild', true);
+    const preferWorkspaceBuild = getConfigValue<boolean>('cli.preferWorkspaceBuild', true);
     if (preferWorkspaceBuild) {
       const workspaceBuild = await this.tryResolveWorkspaceBuild(commandArgs, cwd);
       if (workspaceBuild) {

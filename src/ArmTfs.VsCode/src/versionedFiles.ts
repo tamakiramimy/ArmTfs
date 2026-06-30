@@ -136,6 +136,21 @@ export async function openLocalWorkingDiff(
   );
 }
 
+export async function openLocalWorkingDiffFromEmpty(
+  localPath: string,
+  options?: { title?: string },
+): Promise<void> {
+  const displayPath = localPath.replace(/\\/g, '/');
+  const leftFile = await materializeEmptyVersion(displayPath);
+  await vscode.commands.executeCommand(
+    'vscode.diff',
+    leftFile.uri,
+    vscode.Uri.file(localPath),
+    options?.title ?? `${leftFile.displayLabel} ↔ ${path.basename(localPath)} (${t('version.workingTree')})`,
+    { preview: false },
+  );
+}
+
 function buildTempPath(serverPath: string, version?: number): string {
   const ext = path.posix.extname(serverPath);
   const base = sanitize(path.posix.basename(serverPath, ext)) || 'file';

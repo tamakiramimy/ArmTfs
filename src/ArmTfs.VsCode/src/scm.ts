@@ -5,8 +5,14 @@ import * as vscode from 'vscode';
 import { ArmTfsCliClient, ArmTfsCliError } from './armTfsCliClient';
 import type { StatusItem } from './contracts';
 import { t, translateChangeType, translateStatusLabel } from './i18n';
+import { addIgnorePatternForPath, type IgnoreMatcher, loadIgnoreMatcher } from './ignore';
 import { findConfiguredMappingForLocalPath, findTfvcWorkspaceRoot, findTfvcWorkspaceRootSync, getCommandCwd } from './tfvcContext';
-import { openLocalWorkingDiff } from './versionedFiles';
+import { openLocalWorkingDiff, openLocalWorkingDiffFromEmpty } from './versionedFiles';
+
+interface TrackedPathSnapshot {
+  paths: Set<string>;
+  reliable: boolean;
+}
 
 export class ArmTfsResourceState implements vscode.SourceControlResourceState {
   readonly resourceUri: vscode.Uri;
@@ -44,9 +50,9 @@ export class ArmTfsUntrackedResourceState implements vscode.SourceControlResourc
   constructor(public readonly localPath: string) {
     this.resourceUri = vscode.Uri.file(localPath);
     this.command = {
-      command: 'vscode.open',
-      title: 'Open',
-      arguments: [this.resourceUri],
+      command: 'armTfs.openResourceDiff',
+      title: t('command.openTfsDiff'),
+      arguments: [this],
     };
     this.decorations = {
       tooltip: t('scm.tooltip.untracked'),
@@ -70,8 +76,8 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
   conflicts: ArmTfsResourceState[] = [];
   untrackedFiles: ArmTfsUntrackedResourceState[] = [];
   lastWorkspaceRoot: string | undefined;
-  /** Cached set of TFS-tracked local paths. Invalidated on workspace switch and after add/checkin/undo. */
-  private knownPathsCache: Set<string> | undefined;
+  /** Cached set of TFS-tracked relative paths. Invalidated on workspace switch and after add/checkin/undo. */
+  private knownPathsCache: TrackedPathSnapshot | undefined;
 
   readonly onDidChangeFileDecorations = this.onDidChangeDecorationsEmitter.event;
   /** Fires whenever pendingChanges/localChanges/conflicts/untrackedFiles is replaced. */
@@ -180,7 +186,105 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
     return result as unknown as void;
   }
 
+  async addAllUntracked(): Promise<void> {
+    const paths = this.untrackedFiles.map((resource) => resource.localPath);
+    if (!paths.length) {
+      void vscode.window.showInformationMessage(t('changesView.bulkAdd.none'));
+      return;
+    }
+
+    const workspaceRoot = await findTfvcWorkspaceRoot(paths[0] ?? this.rootPath);
+    if (!workspaceRoot) {
+      void vscode.window.showWarningMessage(t('warning.noWorkspace.general'));
+      return;
+    }
+
+    await this.runTextCommand(
+      t('changesView.bulkAdd.title'),
+      () => runPathBatches(paths, (batch) => this.client.add(batch, false, { cwdOverride: workspaceRoot })),
+      true,
+    );
+  }
+
+  async ignore(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
+    const targetPath = resolveResourcePath(resource) ?? getActivePath();
+    if (!targetPath) {
+      void vscode.window.showWarningMessage(t('warning.noFile.ignore'));
+      return;
+    }
+
+    const workspaceRoot = await findTfvcWorkspaceRoot(targetPath ?? this.rootPath);
+    if (!workspaceRoot) {
+      void vscode.window.showWarningMessage(t('warning.noWorkspace.file'));
+      return;
+    }
+
+    const item = resource instanceof ArmTfsResourceState
+      ? resource.item
+      : this.resourcesByPath.get(normalizeLocalPath(targetPath))?.item;
+    const isPending = item?.state === 'pending';
+
+    await this.runTextCommand(
+      t('changesView.ignore.title'),
+      async () => {
+        const outputs: string[] = [];
+        if (isPending) {
+          outputs.push(await this.client.undo([targetPath], true, { cwdOverride: getCommandCwd(workspaceRoot, targetPath) }));
+        }
+
+        const result = addIgnorePatternForPath(workspaceRoot, targetPath);
+        outputs.push(result.added
+          ? t('changesView.ignore.added', { pattern: result.pattern, file: result.filePath })
+          : t('changesView.ignore.already', { pattern: result.pattern, file: result.filePath }));
+        return outputs.filter((item) => item.trim()).join('\n');
+      },
+      true,
+    );
+  }
+
+  async stage(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
+    if (resource instanceof ArmTfsResourceState && resource.item.state === 'modifiedNotCheckedOut') {
+      return this.checkout(resource);
+    }
+    return this.add(resource);
+  }
+
+  async stageAllWorkingChanges(): Promise<void> {
+    const modifiedPaths = this.localChanges.map((resource) => resource.resourceUri.fsPath);
+    const untrackedPaths = this.untrackedFiles.map((resource) => resource.localPath);
+    if (!modifiedPaths.length && !untrackedPaths.length) {
+      void vscode.window.showInformationMessage(t('changesView.stageAll.none'));
+      return;
+    }
+
+    const firstPath = modifiedPaths[0] ?? untrackedPaths[0] ?? this.rootPath;
+    const workspaceRoot = await findTfvcWorkspaceRoot(firstPath);
+    if (!workspaceRoot) {
+      void vscode.window.showWarningMessage(t('warning.noWorkspace.general'));
+      return;
+    }
+
+    await this.runTextCommand(
+      t('changesView.stageAll.title'),
+      async () => {
+        const outputs: string[] = [];
+        if (modifiedPaths.length) {
+          outputs.push(await runPathBatches(modifiedPaths, (batch) => this.client.checkout(batch, false, { cwdOverride: workspaceRoot })));
+        }
+        if (untrackedPaths.length) {
+          outputs.push(await runPathBatches(untrackedPaths, (batch) => this.client.add(batch, false, { cwdOverride: workspaceRoot })));
+        }
+        return outputs.filter((item) => item.trim()).join('\n');
+      },
+      true,
+    );
+  }
+
   async undo(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
+    return this.discardPendingChange(resource);
+  }
+
+  async unstage(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
     const targetPath = resolveResourcePath(resource) ?? getActivePath();
     if (!targetPath) {
       void vscode.window.showWarningMessage(t('warning.noFile.undo'));
@@ -193,7 +297,65 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
       return;
     }
 
-    await this.runTextCommand('arm-tfs undo', () => this.client.undo([targetPath], false, { cwdOverride: getCommandCwd(workspaceRoot, targetPath) }), true);
+    await this.runTextCommand(
+      t('changesView.unstage.title'),
+      () => this.client.undo([targetPath], true, { cwdOverride: getCommandCwd(workspaceRoot, targetPath) }),
+      true,
+    );
+  }
+
+  async undoPendingAdds(): Promise<void> {
+    return this.unstageAllPendingChanges();
+  }
+
+  async unstageAllPendingChanges(): Promise<void> {
+    const paths = this.pendingChanges.map((resource) => resource.resourceUri.fsPath);
+
+    if (!paths.length) {
+      void vscode.window.showInformationMessage(t('changesView.unstageAll.none'));
+      return;
+    }
+
+    const workspaceRoot = await findTfvcWorkspaceRoot(paths[0] ?? this.rootPath);
+    if (!workspaceRoot) {
+      void vscode.window.showWarningMessage(t('warning.noWorkspace.general'));
+      return;
+    }
+
+    await this.runTextCommand(
+      t('changesView.unstageAll.title'),
+      () => runPathBatches(paths, (batch) => this.client.undo(batch, true, { cwdOverride: workspaceRoot })),
+      true,
+    );
+  }
+
+  async discardPendingChange(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
+    const targetPath = resolveResourcePath(resource) ?? getActivePath();
+    if (!targetPath) {
+      void vscode.window.showWarningMessage(t('warning.noFile.undo'));
+      return;
+    }
+
+    const choice = await vscode.window.showWarningMessage(
+      t('changesView.discard.confirm', { file: path.basename(targetPath) }),
+      { modal: true, detail: t('changesView.discard.detail', { path: targetPath }) },
+      t('changesView.discard.action'),
+    );
+    if (choice !== t('changesView.discard.action')) {
+      return;
+    }
+
+    const workspaceRoot = await findTfvcWorkspaceRoot(targetPath ?? this.rootPath);
+    if (!workspaceRoot) {
+      void vscode.window.showWarningMessage(t('warning.noWorkspace.file'));
+      return;
+    }
+
+    await this.runTextCommand(
+      t('changesView.discard.title'),
+      () => this.client.undo([targetPath], false, { cwdOverride: getCommandCwd(workspaceRoot, targetPath) }),
+      true,
+    );
   }
 
   async checkin(comment?: string): Promise<void> {
@@ -224,12 +386,6 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
     }
 
     const item = targetPath ? this.resourcesByPath.get(normalizeLocalPath(targetPath))?.item : undefined;
-    if (item?.changeType === 'add') {
-      await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(targetPath));
-      void vscode.window.showInformationMessage(t('info.diff.added'));
-      return;
-    }
-
     if (item && isDeleteLike(item)) {
       void vscode.window.showInformationMessage(t('info.diff.deleted'));
       return;
@@ -242,27 +398,58 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
         return;
       }
 
-      const version = shouldUseBase(item)
-        ? item?.baselineChangesetId ?? item?.trackedChangesetId
-        : undefined;
+      const serverPath = await this.resolveServerPathForLocalFile(targetPath, workspaceRoot, item);
+      const title = `${path.basename(targetPath)} (${t('version.latest')}) ↔ ${path.basename(targetPath)} (${t('version.workingTree')})`;
 
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Window,
           title: `arm-tfs diff ${path.basename(targetPath)}`,
         },
-        () => openLocalWorkingDiff(
-          this.client,
-          targetPath,
-          item?.serverPath ?? targetPath,
-          {
-            version,
-            title: `${path.basename(targetPath)} (${version ? `cs${version}` : t('version.server')}) ↔ ${path.basename(targetPath)} (${t('version.workingTree')})`,
-          },
-        ),
+        async () => {
+          if (!serverPath) {
+            await openLocalWorkingDiffFromEmpty(targetPath, { title });
+            void vscode.window.showInformationMessage(t('info.diff.noServerVersion'));
+            return;
+          }
+
+          try {
+            await openLocalWorkingDiff(
+              this.client,
+              targetPath,
+              serverPath,
+              { title },
+            );
+          } catch (error) {
+            if (!isServerItemNotFoundError(error)) {
+              throw error;
+            }
+
+            await openLocalWorkingDiffFromEmpty(targetPath, { title });
+            void vscode.window.showInformationMessage(t('info.diff.noServerVersion'));
+          }
+        },
       );
     } catch (error) {
       this.showError('arm-tfs diff', error);
+    }
+  }
+
+  private async resolveServerPathForLocalFile(
+    localPath: string,
+    workspaceRoot: string,
+    item?: StatusItem,
+  ): Promise<string | undefined> {
+    if (item?.serverPath) {
+      return item.serverPath;
+    }
+
+    try {
+      const status = await this.client.status(workspaceRoot, false, { cwdOverride: workspaceRoot });
+      return resolveLocalPathToServerPath(localPath, workspaceRoot, status.workspace.mappings);
+    } catch (error) {
+      this.output.appendLine(`arm-tfs resolve server path ${localPath}: ${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
     }
   }
 
@@ -305,10 +492,11 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
     this.lastWorkspaceRoot = workspaceRoot;
 
     try {
+      const ignoreMatcher = loadIgnoreMatcher(workspaceRoot);
       const status = await this.client.status(workspaceRoot, true, { cwdOverride: workspaceRoot });
       const pending = status.items.filter((item) => item.state === 'pending').map((item) => new ArmTfsResourceState(item));
       const localChanges = status.items
-        .filter((item) => item.state === 'modifiedNotCheckedOut')
+        .filter((item) => item.state === 'modifiedNotCheckedOut' && !ignoreMatcher.isIgnored(item.localPath))
         .map((item) => new ArmTfsResourceState(item));
       const conflicts = status.items
         .filter((item) => item.state.toLowerCase().includes('conflict'))
@@ -320,15 +508,23 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
       const knownPaths = new Set<string>();
       for (const item of status.items) {
         if (item.localPath) {
-          knownPaths.add(normalizeLocalPath(item.localPath));
+          addKnownPath(knownPaths, workspaceRoot, item.localPath);
+        }
+        if (item.serverPath) {
+          addKnownServerPath(knownPaths, workspaceRoot, item.serverPath, status.workspace.mappings);
         }
       }
-      const trackedPaths = await this.getTrackedPaths(workspaceRoot, status.workspace.mappings);
-      for (const p of trackedPaths) {
+      const trackedSnapshot = await this.getTrackedRelativePaths(workspaceRoot, status.workspace.mappings);
+      for (const p of trackedSnapshot.paths) {
         knownPaths.add(p);
       }
 
-      const untracked = await scanUntrackedFiles(workspaceRoot, knownPaths);
+      const untracked = trackedSnapshot.reliable
+        ? await scanUntrackedFiles(workspaceRoot, knownPaths, { ignoreMatcher })
+        : [];
+      if (!trackedSnapshot.reliable) {
+        this.output.appendLine('arm-tfs untracked scan skipped: server items list is unavailable, avoiding false untracked files.');
+      }
       const untrackedStates = untracked.map((filePath) => new ArmTfsUntrackedResourceState(filePath));
 
       this.pendingChanges = pending;
@@ -350,15 +546,13 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
   }
 
   /**
-   * Returns every local path the TFS workspace tracks. Pulled via `arm-tfs items list --recursive`
-   * for each mapping and translated server-path → local-path. Cached per workspace root to avoid
-   * re-fetching the entire tree on every status refresh; invalidate via {@link invalidateTrackedCache}
-   * when add/checkin succeeds.
+   * Returns every workspace-relative path TFS tracks. Relative keys avoid false positives when
+   * the same TFVC workspace metadata is opened from different local roots on macOS and Windows.
    */
-  private async getTrackedPaths(
+  private async getTrackedRelativePaths(
     workspaceRoot: string,
     mappings: Array<{ serverPath: string; localPath: string }>,
-  ): Promise<Set<string>> {
+  ): Promise<TrackedPathSnapshot> {
     if (this.knownPathsCache) {
       return this.knownPathsCache;
     }
@@ -368,32 +562,34 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
       result.add(p);
     }
 
-    for (const mapping of selectMappingsForWorkspaceRoot(workspaceRoot, mappings)) {
+    const selectedMappings = selectMappingsForWorkspaceRoot(workspaceRoot, mappings);
+    let reliable = selectedMappings.length > 0;
+
+    for (const mapping of selectedMappings) {
       if (!mapping.serverPath || !mapping.localPath) {
+        reliable = false;
         continue;
       }
       try {
         const listing = await this.client.itemsList(mapping.serverPath, true, { cwdOverride: workspaceRoot });
         const serverRoot = mapping.serverPath.replace(/\/+$/, '');
-        const mappingLocalPath = translatePlatformSharedPath(mapping.localPath);
         for (const entry of listing.items) {
           if (entry.isFolder) {
             continue;
           }
-          // Translate server path to local path: serverPath - serverRoot → relative → join localPath
           const relative = entry.serverPath.startsWith(serverRoot + '/')
             ? entry.serverPath.slice(serverRoot.length + 1)
             : entry.serverPath.replace(/^\$\//, '');
-          const localFile = path.join(mappingLocalPath, ...relative.split('/'));
-          result.add(normalizeLocalPath(localFile));
+          result.add(normalizeRelativePathKey(relative));
         }
       } catch (error) {
-        // Network/CLI errors should not break status; we'll just see more "untracked" files.
+        reliable = false;
         this.output.appendLine(`arm-tfs items list ${mapping.serverPath}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
-    this.knownPathsCache = result;
-    return result;
+
+    this.knownPathsCache = { paths: result, reliable };
+    return this.knownPathsCache;
   }
 
   /**
@@ -490,8 +686,84 @@ function resolveResourcePath(resource: ArmTfsResourceState | ArmTfsUntrackedReso
   return resource.resourceUri.fsPath;
 }
 
-function shouldUseBase(item: StatusItem | undefined): boolean {
-  return item?.baselineChangesetId !== undefined || item?.trackedChangesetId !== undefined || item?.state === 'modifiedNotCheckedOut';
+async function runPathBatches(
+  paths: string[],
+  runner: (batch: string[]) => Promise<string>,
+  batchSize = 50,
+): Promise<string> {
+  const outputs: string[] = [];
+  for (let index = 0; index < paths.length; index += batchSize) {
+    const batch = paths.slice(index, index + batchSize);
+    outputs.push(await runner(batch));
+  }
+  return outputs.filter((item) => item.trim()).join('\n');
+}
+
+function resolveLocalPathToServerPath(
+  localPath: string,
+  workspaceRoot: string,
+  mappings: Array<{ serverPath: string; localPath: string }>,
+): string | undefined {
+  const normalizedLocal = normalizeLocalPath(localPath);
+  const candidates = mappings
+    .map((mapping) => {
+      if (!mapping.serverPath || !mapping.localPath) {
+        return undefined;
+      }
+      const mappingLocalPath = normalizeLocalPath(mapping.localPath);
+      if (!isSameOrChildPath(normalizedLocal, mappingLocalPath)) {
+        return undefined;
+      }
+      return {
+        mapping,
+        mappingLocalPath,
+        score: mappingLocalPath.length + getLocalMappingPreference(mapping.localPath, workspaceRoot),
+      };
+    })
+    .filter((candidate): candidate is { mapping: { serverPath: string; localPath: string }; mappingLocalPath: string; score: number } => candidate !== undefined)
+    .sort((left, right) => right.score - left.score);
+
+  const best = candidates[0];
+  if (best) {
+    return joinServerPath(best.mapping.serverPath, path.relative(best.mappingLocalPath, normalizedLocal));
+  }
+
+  const selectedMapping = selectMappingsForWorkspaceRoot(workspaceRoot, mappings)[0];
+  const relativePath = getWorkspaceRelativeServerPath(workspaceRoot, localPath);
+  return selectedMapping && relativePath !== undefined
+    ? joinServerPath(selectedMapping.serverPath, relativePath)
+    : undefined;
+}
+
+function joinServerPath(serverRoot: string, relativePath: string): string {
+  const root = normalizeServerPath(serverRoot);
+  const suffix = normalizeServerRelativePath(relativePath);
+  return suffix ? `${root}/${suffix}` : root;
+}
+
+function getWorkspaceRelativeServerPath(workspaceRoot: string, localPath: string): string | undefined {
+  const normalizedRoot = normalizeLocalPath(workspaceRoot);
+  const normalizedLocal = normalizeLocalPath(localPath);
+  if (!isSameOrChildPath(normalizedLocal, normalizedRoot)) {
+    return undefined;
+  }
+  return normalizeServerRelativePath(path.relative(normalizedRoot, normalizedLocal));
+}
+
+function normalizeServerRelativePath(relativePath: string): string {
+  return relativePath
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '');
+}
+
+function isServerItemNotFoundError(error: unknown): boolean {
+  const message = error instanceof ArmTfsCliError
+    ? `${error.message}\n${error.stdout}\n${error.stderr}`
+    : error instanceof Error
+      ? error.message
+      : String(error);
+  return /(not\s+found|does\s+not\s+exist|unable\s+to\s+find|no\s+item|TF14019|TF10169|TF10122|404)/i.test(message);
 }
 
 function buildTooltip(item: StatusItem): string {
@@ -626,17 +898,14 @@ function readTrackedPathsFromVersionMetadata(
       const serverPath = raw.ServerPath ?? raw.serverPath;
       const localPath = raw.LocalPath ?? raw.localPath;
 
-      const mappedLocalPath = serverPath ? resolveServerPathToLocalPath(serverPath, mappings, workspaceRoot) : undefined;
-      if (mappedLocalPath) {
-        result.add(normalizeLocalPath(mappedLocalPath));
+      const serverRelativePath = serverPath ? resolveServerPathToRelativePath(serverPath, mappings) : undefined;
+      if (serverRelativePath) {
+        result.add(serverRelativePath);
         continue;
       }
 
       if (localPath) {
-        const translated = normalizeLocalPath(localPath);
-        if (isSameOrChildPath(translated, workspaceRoot)) {
-          result.add(translated);
-        }
+        addKnownPath(result, workspaceRoot, localPath);
       }
     } catch {
       // Ignore corrupt or partially written tracking files.
@@ -646,10 +915,9 @@ function readTrackedPathsFromVersionMetadata(
   return result;
 }
 
-function resolveServerPathToLocalPath(
+function resolveServerPathToRelativePath(
   serverPath: string,
   mappings: Array<{ serverPath: string; localPath: string }>,
-  workspaceRoot: string,
 ): string | undefined {
   const normalizedServerPath = normalizeServerPath(serverPath);
   const candidates = mappings
@@ -658,11 +926,7 @@ function resolveServerPathToLocalPath(
       return normalizedServerPath === mappingServerPath || normalizedServerPath.startsWith(`${mappingServerPath}/`);
     })
     .sort((left, right) => {
-      const serverDiff = normalizeServerPath(right.serverPath).length - normalizeServerPath(left.serverPath).length;
-      if (serverDiff !== 0) {
-        return serverDiff;
-      }
-      return getLocalMappingPreference(right.localPath, workspaceRoot) - getLocalMappingPreference(left.localPath, workspaceRoot);
+      return normalizeServerPath(right.serverPath).length - normalizeServerPath(left.serverPath).length;
     });
 
   const best = candidates[0];
@@ -671,11 +935,9 @@ function resolveServerPathToLocalPath(
   }
 
   const mappingServerPath = normalizeServerPath(best.serverPath);
-  const suffix = normalizedServerPath === mappingServerPath
+  return normalizedServerPath === mappingServerPath
     ? ''
-    : normalizedServerPath.slice(mappingServerPath.length + 1);
-  const mappingLocalPath = translatePlatformSharedPath(best.localPath);
-  return suffix ? path.join(mappingLocalPath, ...suffix.split('/')) : mappingLocalPath;
+    : normalizeRelativePathKey(normalizedServerPath.slice(mappingServerPath.length + 1));
 }
 
 function selectMappingsForWorkspaceRoot(
@@ -796,12 +1058,13 @@ function getPlatformSharedHomeDirectory(): string | undefined {
 export async function scanUntrackedFiles(
   workspaceRoot: string,
   knownPaths: Set<string>,
-  options?: { maxResults?: number; maxDepth?: number },
+  options?: { maxResults?: number; maxDepth?: number; ignoreMatcher?: IgnoreMatcher },
 ): Promise<string[]> {
   const maxResults = options?.maxResults ?? 500;
   const maxDepth = options?.maxDepth ?? 12;
+  const ignoreMatcher = options?.ignoreMatcher;
   const results: string[] = [];
-  const exclude = new Set(['.tf', '.git', 'node_modules', 'bin', 'obj', 'out', 'dist', '.vs', '.idea', '.next', 'target', '.gradle']);
+  const exclude = new Set(['.tf', '.git', 'node_modules', 'packages', 'bin', 'obj', 'out', 'dist', '.vs', '.idea', '.next', 'target', '.gradle']);
 
   const walk = (directory: string, depth: number): boolean => {
     if (depth > maxDepth || results.length >= maxResults) {
@@ -825,15 +1088,20 @@ export async function scanUntrackedFiles(
         }
       }
       if (entry.isDirectory()) {
+        const fullPath = path.join(directory, entry.name);
         if (exclude.has(entry.name)) {
           continue;
         }
-        if (walk(path.join(directory, entry.name), depth + 1)) {
+        if (ignoreMatcher?.isIgnored(fullPath, true)) {
+          continue;
+        }
+        if (walk(fullPath, depth + 1)) {
           return true;
         }
       } else if (entry.isFile()) {
         const fullPath = path.join(directory, entry.name);
-        if (!knownPaths.has(normalizeLocalPath(fullPath))) {
+        const relativeKey = getWorkspaceRelativePathKey(workspaceRoot, fullPath);
+        if (relativeKey !== undefined && !knownPaths.has(relativeKey) && !ignoreMatcher?.isIgnored(fullPath, false)) {
           results.push(fullPath);
         }
       }
@@ -843,6 +1111,59 @@ export async function scanUntrackedFiles(
 
   walk(workspaceRoot, 0);
   return results;
+}
+
+function addKnownPath(knownPaths: Set<string>, workspaceRoot: string, localPath: string): void {
+  const relativeKey = getWorkspaceRelativePathKey(workspaceRoot, localPath);
+  if (relativeKey !== undefined) {
+    knownPaths.add(relativeKey);
+  }
+}
+
+function addKnownServerPath(
+  knownPaths: Set<string>,
+  workspaceRoot: string,
+  serverPath: string,
+  mappings: Array<{ serverPath: string; localPath: string }>,
+): void {
+  const relativeKey = resolveServerPathToRelativePath(serverPath, mappings);
+  if (relativeKey !== undefined) {
+    knownPaths.add(relativeKey);
+    return;
+  }
+
+  const localPath = resolveServerPathToLocalPathForCurrentRoot(serverPath, mappings, workspaceRoot);
+  if (localPath) {
+    addKnownPath(knownPaths, workspaceRoot, localPath);
+  }
+}
+
+function resolveServerPathToLocalPathForCurrentRoot(
+  serverPath: string,
+  mappings: Array<{ serverPath: string; localPath: string }>,
+  workspaceRoot: string,
+): string | undefined {
+  const relativeKey = resolveServerPathToRelativePath(serverPath, mappings);
+  return relativeKey !== undefined
+    ? path.join(workspaceRoot, ...relativeKey.split('/'))
+    : undefined;
+}
+
+function getWorkspaceRelativePathKey(workspaceRoot: string, localPath: string): string | undefined {
+  const normalizedRoot = normalizeLocalPath(workspaceRoot);
+  const normalizedLocal = normalizeLocalPath(localPath);
+  if (!isSameOrChildPath(normalizedLocal, normalizedRoot)) {
+    return undefined;
+  }
+  return normalizeRelativePathKey(path.relative(normalizedRoot, normalizedLocal));
+}
+
+function normalizeRelativePathKey(relativePath: string): string {
+  return relativePath
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '')
+    .toLowerCase();
 }
 
 /**

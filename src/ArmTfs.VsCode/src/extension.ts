@@ -13,6 +13,7 @@ import { ArmTfsScmController, ArmTfsResourceState, isNoMappingError, tryAutoRegi
 import { ArmTfsChangesViewController } from './changesView';
 import { ArmTfsSidebarController, ArmTfsServerExplorerController } from './sidebar';
 import { computeLocalPathForServerPath, discoverTfvcMappingForPath, findTfvcWorkspaceRoot, getCommandCwd } from './tfvcContext';
+import { getConfigValue, migrateArmTfsSettingsToUserConfig, setConfigValue } from './userConfig';
 import { openServerVersionDiff } from './versionedFiles';
 
 export interface ArmTfsExtensionApi {
@@ -20,6 +21,7 @@ export interface ArmTfsExtensionApi {
 }
 
 export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
+  migrateArmTfsSettingsToUserConfig();
   const output = vscode.window.createOutputChannel('arm-tfs');
   const client = new ArmTfsCliClient(output);
   const historyBrowser = new ArmTfsHistoryBrowser(client, output);
@@ -212,15 +214,12 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     }
 
     const selectedPath = picked[0].fsPath;
-    const target = vscode.workspace.workspaceFolders?.length ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
-    const config = vscode.workspace.getConfiguration('armTfs');
-
     if (selectedPath.toLowerCase().endsWith('.dll')) {
-      await config.update('cli.command', 'dotnet', target);
-      await config.update('cli.commandArgs', [selectedPath], target);
+      setConfigValue('cli.command', 'dotnet');
+      setConfigValue('cli.commandArgs', [selectedPath]);
     } else {
-      await config.update('cli.command', selectedPath, target);
-      await config.update('cli.commandArgs', [], target);
+      setConfigValue('cli.command', selectedPath);
+      setConfigValue('cli.commandArgs', []);
     }
 
     const resolved = await client.describeResolvedInvocation();
@@ -230,7 +229,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   });
 
   register('armTfs.switchLanguage', async () => {
-    const configured = vscode.workspace.getConfiguration('armTfs').get<UiLanguage>('ui.language', 'auto');
+    const configured = getConfigValue<UiLanguage>('ui.language', 'auto');
     const selected = await vscode.window.showQuickPick(
       [
         { label: t('language.name.auto'), value: 'auto' as UiLanguage, description: configured === 'auto' ? t('language.current') : undefined },
@@ -243,8 +242,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
       return;
     }
 
-    const target = vscode.workspace.workspaceFolders?.length ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
-    await vscode.workspace.getConfiguration('armTfs').update('ui.language', selected.value, target);
+    setConfigValue('ui.language', selected.value);
     await refreshLanguageUi();
 
     const localeResult = await syncVsCodeDisplayLanguage(selected.value, output);

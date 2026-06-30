@@ -1,12 +1,13 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { getConfigValue } from './userConfig';
 
 const WORKSPACE_METADATA_PATH = path.join('.tf', 'workspace.json');
 const SEARCH_EXCLUDES = '**/{node_modules,.git,bin,obj,out}/**';
 
 export function getConfiguredWorkspaceRoot(): string | undefined {
-  const configured = vscode.workspace.getConfiguration('armTfs').get<string>('workspaceRoot')?.trim();
+  const configured = getConfigValue<string>('workspaceRoot', '').trim();
   return configured ? path.resolve(configured) : undefined;
 }
 
@@ -16,9 +17,8 @@ export function getConfiguredWorkspaceRoot(): string | undefined {
  * destination so the user no longer has to pick a folder manually every time.
  */
 export function getConfiguredLocalRootDirectory(): string | undefined {
-  const config = vscode.workspace.getConfiguration('armTfs');
-  const configured = config.get<string>('tfsRootDirectory')?.trim()
-    || config.get<string>('localRootDirectory')?.trim();
+  const configured = getConfigValue<string>('tfsRootDirectory', '').trim()
+    || getConfigValue<string>('localRootDirectory', '').trim();
   return configured ? path.resolve(configured) : undefined;
 }
 
@@ -55,7 +55,7 @@ export function getConfiguredWorkspaceMappings(): ConfiguredWorkspaceMapping[] {
       }));
   }
 
-  const legacy = vscode.workspace.getConfiguration('armTfs').get<Array<{ serverPath?: string; localPath?: string }>>('workspaceMappings', []);
+  const legacy = getConfigValue<Array<{ serverPath?: string; localPath?: string }>>('workspaceMappings', []);
   return legacy
     .filter((entry) => entry.serverPath?.startsWith('$/') && entry.localPath?.trim())
     .map((entry) => ({
