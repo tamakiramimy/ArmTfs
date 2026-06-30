@@ -2710,11 +2710,12 @@ public sealed class TfvcClientService
         if (content is null)
             return tfvcChange;
 
-        if (TryDecodeUtf8Text(content, out var textContent))
+        if (TryDecodeUtf8Text(content, out var textContent, out var hasBom))
         {
             item.ContentMetadata = new FileContentMetadata
             {
-                Encoding = Encoding.UTF8.CodePage,
+                // UTF-8 with BOM → codepage 65001 with BOM marker; plain UTF-8 → 65001 without
+                Encoding = hasBom ? 65001 : Encoding.UTF8.CodePage,
                 ContentType = "text/plain",
             };
             tfvcChange.NewContent = new ItemContent
@@ -2739,16 +2740,27 @@ public sealed class TfvcClientService
         return tfvcChange;
     }
 
-    private static bool TryDecodeUtf8Text(byte[] content, out string text)
+    private static bool TryDecodeUtf8Text(byte[] content, out string text, out bool hasBom)
     {
         text = string.Empty;
+        hasBom = false;
         if (Array.IndexOf(content, (byte)0) >= 0)
             return false;
+
+        // Detect and strip UTF-8 BOM (EF BB BF) before sending to the server.
+        // TFS rejects content that starts with the BOM bytes as plain text, resulting in
+        // "参数值无效" (invalid parameter value) errors on Windows ARM builds.
+        ReadOnlySpan<byte> payload = content;
+        if (content.Length >= 3 && content[0] == 0xEF && content[1] == 0xBB && content[2] == 0xBF)
+        {
+            hasBom = true;
+            payload = content.AsSpan(3);
+        }
 
         try
         {
             text = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
-                .GetString(content);
+                .GetString(payload);
             return true;
         }
         catch (DecoderFallbackException)

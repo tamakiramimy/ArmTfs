@@ -26,7 +26,7 @@ echo "== Building VS Code extension =="
   cd "$EXT_DIR"
   ./node_modules/.bin/tsc -p .
   VSIX_NAME="arm-tfs-vscode-$(node -p "require('./package.json').version").vsix"
-  npx @vscode/vsce package -o "$VSIX_NAME"
+  echo y | ./node_modules/.bin/vsce package --allow-missing-repository --skip-license -o "$VSIX_NAME"
 )
 
 echo
