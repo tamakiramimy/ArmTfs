@@ -363,8 +363,13 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
             await this.client.rollback(cs.changesetId, `Revert to cs${targetChangesetId}: rollback cs${cs.changesetId}`);
             successCount++;
           } catch (error) {
-            failCount++;
-            errors.push(`cs${cs.changesetId}: ${error instanceof Error ? error.message : String(error)}`);
+            const msg = error instanceof Error ? error.message : String(error);
+            if (msg.includes('No rollback-able changes')) {
+              successCount++;
+            } else {
+              failCount++;
+              errors.push(`cs${cs.changesetId}: ${msg}`);
+            }
           }
         }
       },

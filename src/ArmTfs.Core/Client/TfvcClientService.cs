@@ -396,7 +396,18 @@ public sealed class TfvcClientService
             var path = c.Item!.Path!;
             var ct2 = c.ChangeType;
 
-            if (ct2.HasFlag(VersionControlChangeType.Add))
+            if (ct2.HasFlag(VersionControlChangeType.Undelete))
+            {
+                // The file was undeleted in this changeset — rolling back means deleting it again
+                var ver = await TryGetItemVersionAsync(path, ct).ConfigureAwait(false);
+                if (ver.HasValue)
+                    rollbackChanges.Add(new TfvcChange
+                    {
+                        Item = new TfvcItem { Path = path, ChangesetVersion = ver.Value },
+                        ChangeType = VersionControlChangeType.Delete,
+                    });
+            }
+            else if (ct2.HasFlag(VersionControlChangeType.Add))
             {
                 // The file was added in this changeset — rolling back means deleting it
                 var ver = await TryGetItemVersionAsync(path, ct).ConfigureAwait(false);
