@@ -1045,9 +1045,22 @@ public sealed class TfvcClientService
         var normalizedTarget = NormalizeServerPath(targetPath);
 
         // SOAP path: lets the server record real merge history (REST cannot).
-        // Skip it for dry-run (we still want a plan preview via REST logic).
-        if (string.Equals(mergeMode, "soap", StringComparison.OrdinalIgnoreCase) && !dryRun)
+        // Also use SOAP for dry-run to get accurate 3-way conflict detection.
+        if (string.Equals(mergeMode, "soap", StringComparison.OrdinalIgnoreCase))
         {
+            if (dryRun)
+            {
+                // For dry-run, delegate to range-merge SOAP with from=to=changeset
+                return await MergeChangesetRangeViaSoapAsync(
+                    normalizedSource,
+                    normalizedTarget,
+                    sourceChangesetId,
+                    sourceChangesetId,
+                    comment: null,
+                    dryRun: true,
+                    soapOwner: soapOwner,
+                    ct: ct).ConfigureAwait(false);
+            }
             return await MergeChangesetViaSoapAsync(
                 normalizedSource,
                 normalizedTarget,

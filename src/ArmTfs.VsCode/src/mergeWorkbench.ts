@@ -437,26 +437,10 @@ export class ArmTfsMergeWorkbench {
       byTarget.set(key, { ...conflict, status: 'conflict' });
     }
     this.state.rangeConflicts = [...byTarget.values()];
-    // Only mark existing candidate changes - don't add new ones
-    this.markExistingCandidateChangesAsRangeConflicts(conflictChanges);
+    // Don't propagate range conflicts to individual candidates - just store them separately.
+    // The aggregateConflicts function will merge them when rendering the conflict list.
   }
 
-  private markExistingCandidateChangesAsRangeConflicts(conflictChanges: MergePlanChange[]): void {
-    const conflictByTarget = new Map(
-      conflictChanges.map((c) => [c.targetServerPath.replace(/\\/g, '/').replace(/\/+$/u, '').toLowerCase(), c]),
-    );
-    for (const candidate of this.state.candidates) {
-      for (const change of candidate.changes) {
-        const key = change.targetServerPath.replace(/\\/g, '/').replace(/\/+$/u, '').toLowerCase();
-        const conflict = conflictByTarget.get(key);
-        if (conflict) {
-          change.status = 'conflict';
-          change.sourceServerPath = conflict.sourceServerPath || change.sourceServerPath;
-          change.note = conflict.note || 'Both source and target modified this file.';
-        }
-      }
-    }
-  }
 
   private buildResolutionItems(
     selected: MergeWorkbenchCandidate[],
