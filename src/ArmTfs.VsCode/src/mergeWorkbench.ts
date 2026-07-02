@@ -504,10 +504,11 @@ export class ArmTfsMergeWorkbench {
         readServerText(this.client, change.sourceServerPath, change.sourceChangesetId),
         change.targetExists ? readServerText(this.client, change.targetServerPath) : Promise.resolve(''),
       ]);
-      const content = await openNativeMergeWithToolbar(
+      const content = await openManualMergePanel(
+        `${path.posix.basename(change.sourceServerPath)} 手动合并`,
         source,
         target,
-        this.manualMergeContents.get(conflictId),
+        this.manualMergeContents.get(conflictId) || '',
         change.sourceServerPath,
         change.targetServerPath,
       );
@@ -1616,8 +1617,8 @@ function renderManualMergeHtml(
     button { border: 1px solid var(--border); background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); min-height: 28px; padding: 4px 10px; cursor: pointer; font: inherit; border-radius: 2px; }
     button.primary { background: var(--button); color: var(--button-fg); border-color: var(--button); }
     button.active { background: var(--button); color: var(--button-fg); border-color: var(--button); }
-    .grid { display: grid; grid-template-rows: minmax(200px, 0.9fr) auto minmax(180px, 0.8fr); height: calc(100vh - 52px); }
-    .top { display: grid; grid-template-columns: 1fr 1fr; min-height: 0; border-bottom: 1px solid var(--border); }
+    .grid { display: grid; grid-template-rows: minmax(200px, 1fr) auto minmax(180px, 0.8fr); height: calc(100vh - 104px); }
+    .top { display: grid; grid-template-columns: 1fr 1fr; min-height: 0; border-bottom: 1px solid var(--border); overflow: hidden; }
     section { min-width: 0; min-height: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
     section:last-child { border-right: 0; }
     .title { padding: 6px 10px; font-weight: 650; color: var(--muted); border-bottom: 1px solid var(--border); }
@@ -1884,6 +1885,26 @@ function renderManualMergeHtml(
       }
       vscode.postMessage({ type: 'save', content: document.getElementById('result').value });
     });
+
+    // 滚动同步：左/右/结果三栏联动
+    const srcPane = document.getElementById('sourcePane');
+    const tgtPane = document.getElementById('targetPane');
+    const resultArea = document.getElementById('result');
+    let syncing = false;
+
+    function syncScroll(source, targets) {
+      if (syncing) return;
+      syncing = true;
+      const ratio = source.scrollTop / (source.scrollHeight - source.clientHeight || 1);
+      for (const t of targets) {
+        t.scrollTop = ratio * (t.scrollHeight - t.clientHeight || 1);
+      }
+      syncing = false;
+    }
+
+    srcPane.addEventListener('scroll', () => syncScroll(srcPane, [tgtPane, resultArea]));
+    tgtPane.addEventListener('scroll', () => syncScroll(tgtPane, [srcPane, resultArea]));
+    resultArea.addEventListener('scroll', () => syncScroll(resultArea, [srcPane, tgtPane]));
   </script>
 </body>
 </html>`;
