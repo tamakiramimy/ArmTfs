@@ -3,6 +3,8 @@
     "armTfs.branch.scope": "$/C02_PTL_P088_Comm",
     "armTfs.ui.language": "zh-CN",
     "armTfs.merge.sourcePath": "$/C02_AD_P002_行政门户及应用/MindrayApp.Administration-P20200914",
-    "armTfs.cli.command": "d:\\ProgramFiles\\armtfs-win-arm64\\arm-tfs.exe",
-    "armTfs.cli.commandArgs": []
+    "armTfs.cli.command": "dotnet",
+    "armTfs.cli.commandArgs": [
+        "/Users/tamakirami/arm-tfs/src/ArmTfs.Cli/bin/Release/net8.0/osx-arm64/arm-tfs.dll"
+    ]
 }

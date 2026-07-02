@@ -332,59 +332,23 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
     const serverPath = this.targets[0]?.serverPath;
     if (!serverPath) { return; }
 
-    const history = await this.client.history(serverPath, 100);
-    const changesetsToRollback = history.items
-      .filter((item: any) => item.changesetId > targetChangesetId)
-      .filter((item: any) => {
-        const comment = (item.comment || '').toLowerCase();
-        return !comment.startsWith('revert to cs') && !comment.startsWith('rollback changeset') && !comment.startsWith('rollback cs');
-      })
-      .sort((a: any, b: any) => b.changesetId - a.changesetId);
-
-    if (changesetsToRollback.length === 0) {
-      void vscode.window.showInformationMessage(`cs${targetChangesetId} 已经是最新版本，无需回退。`);
-      return;
-    }
-
-    const csList = changesetsToRollback.map((c: any) => `cs${c.changesetId}`).join(', ');
     const confirm = await vscode.window.showWarningMessage(
-      `⚠️ 危险操作！\n\n将回退到 cs${targetChangesetId}，以下 ${changesetsToRollback.length} 个变更集将被逐一回滚：\n${csList}\n\n此操作会创建反向changeset，不可自动撤销。确定继续？`,
+      `⚠️ 危险操作！\n\n将把 ${serverPath} 的文件内容恢复到 cs${targetChangesetId} 的状态。\n\n这会创建一个新的changeset，将所有文件恢复到该版本时的快照。\n\n确定继续？`,
       { modal: true },
       '确定回退',
     );
     if (confirm !== '确定回退') { return; }
 
-    let successCount = 0;
-    let failCount = 0;
-    const errors: string[] = [];
-
-    await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: `回退到 cs${targetChangesetId}` },
-      async (progress) => {
-        for (const [index, cs] of changesetsToRollback.entries()) {
-          progress.report({ message: `回滚 cs${cs.changesetId} (${index + 1}/${changesetsToRollback.length})` });
-          try {
-            await this.client.rollback(cs.changesetId, `Revert to cs${targetChangesetId}: rollback cs${cs.changesetId}`);
-            successCount++;
-          } catch (error) {
-            const msg = error instanceof Error ? error.message : String(error);
-            if (msg.includes('No rollback-able changes')) {
-              successCount++;
-            } else {
-              failCount++;
-              errors.push(`cs${cs.changesetId}: ${msg}`);
-            }
-          }
-        }
-      },
-    );
-
-    if (failCount === 0) {
-      void vscode.window.showInformationMessage(`回退成功！已回滚 ${successCount} 个变更集，当前版本为 cs${targetChangesetId}。`);
-    } else {
-      void vscode.window.showWarningMessage(`回退部分完成：成功 ${successCount}，失败 ${failCount}。\n失败项：${errors.join('; ')}`);
+    try {
+      const result = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `回退 ${serverPath} 到 cs${targetChangesetId}...` },
+        () => this.client.revertToVersion(serverPath, targetChangesetId, `Revert ${serverPath} to cs${targetChangesetId}`),
+      );
+      void vscode.window.showInformationMessage(`回退成功：${result}`);
+      await this.loadHistories();
+    } catch (error) {
+      void vscode.window.showErrorMessage(`回退失败：${error instanceof Error ? error.message : String(error)}`);
     }
-    await this.loadHistories();
   }
 
   private async checkoutSnapshot(changesetId: number): Promise<void> {

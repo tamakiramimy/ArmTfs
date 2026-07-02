@@ -18,9 +18,9 @@
     <Nullable>enable</Nullable>
     <AssemblyName>arm-tfs</AssemblyName>
     <RootNamespace>ArmTfs.Cli</RootNamespace>
-    <AssemblyVersion>0.1.4</AssemblyVersion>
-    <FileVersion>0.1.4</FileVersion>
-    <Version>0.1.4</Version>
+    <AssemblyVersion>0.1.6</AssemblyVersion>
+    <FileVersion>0.1.6</FileVersion>
+    <Version>0.1.6</Version>
     <Description>Cross-platform TFVC CLI for ARM64 macOS and Windows 11 ARM</Description>
     <!-- dotnet tool packaging -->
     <PackAsTool>true</PackAsTool>

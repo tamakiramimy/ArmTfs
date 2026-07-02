@@ -448,6 +448,13 @@ export class ArmTfsCliClient {
     return this.executeText(args, options);
   }
 
+  /** 将服务器路径原子回退到指定版本快照（对比目标版本与最新版本，生成单个 changeset）。 */
+  revertToVersion(serverPath: string, changesetId: number, comment?: string, options?: ArmTfsRunOptions): Promise<string> {
+    const args = ['revert-to-version', serverPath, String(changesetId)];
+    if (comment) args.push('--comment', comment);
+    return this.executeText(args, options);
+  }
+
   /** 还原已删除的服务器文件/文件夹。 */
   undeleteServerItem(serverPath: string, comment?: string, options?: ArmTfsRunOptions): Promise<string> {
     const args = ['undelete', serverPath];

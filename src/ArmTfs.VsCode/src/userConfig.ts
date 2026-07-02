@@ -38,6 +38,7 @@ const MIGRATED_SETTING_KEYS = [
   'merge.targetPath',
   'merge.candidateTop',
   'merge.candidateScan',
+  'merge.planConcurrency',
   'workspaceMappings',
   'serverExplorer.rootPath',
 ] as const;

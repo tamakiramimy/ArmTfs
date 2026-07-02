@@ -4,8 +4,8 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <AssemblyVersion>0.1.4</AssemblyVersion>
-    <Version>0.1.4</Version>
+    <AssemblyVersion>0.1.6</AssemblyVersion>
+    <Version>0.1.6</Version>
     <Description>Core library for arm-tfs: TFVC REST client and local workspace management</Description>
   </PropertyGroup>
 

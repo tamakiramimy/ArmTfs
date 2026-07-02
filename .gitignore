@@ -13,3 +13,9 @@ tests/*/obj/*
 .codebuddy/memory/2025-06-17.md
 .codebuddy/memory/MEMORY.md
 Temp-arm-tfs/
+src/ArmTfs.Cli/.DS_Store
+Temp-arm-tfs-vscode/temp/*
+src/ArmTfs.VsCode/.vscode/*
+src/ArmTfs.VsCode/release/*
+src/ArmTfs.VsCode/.vscodeignore
+src/ArmTfs.VsCode/arm-tfs-vscode*

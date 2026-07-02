@@ -3,6 +3,7 @@ tsconfig.json
 README.md
 .vscodeignore
 .vscode/**
+release/**
 *.vsix
 *.zip
 .DS_Store

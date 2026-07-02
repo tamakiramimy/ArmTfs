@@ -458,6 +458,102 @@ public sealed class TfvcClientService
     }
 
     /// <summary>
+    /// Revert a server path to the exact state at a specific changeset version.
+    /// Compares file trees at the target version and the current (latest) version,
+    /// then creates one atomic changeset that makes them match.
+    /// </summary>
+    public async Task<TfvcChangesetRef> RevertToVersionAsync(
+        string serverPath,
+        int targetChangesetId,
+        string? comment = null,
+        CancellationToken ct = default)
+    {
+        var normalizedPath = NormalizeServerPath(serverPath);
+        var client = _connection.GetTfvcClient();
+
+        var effectiveComment = string.IsNullOrWhiteSpace(comment)
+            ? $"Revert {normalizedPath} to version cs{targetChangesetId}"
+            : comment.Trim();
+
+        // Get file list at target version
+        var targetItems = await GetItemsAsync(normalizedPath, recursive: true, atChangeset: targetChangesetId, ct: ct).ConfigureAwait(false);
+
+        // Get file list at current (latest) version
+        var currentItems = await GetItemsAsync(normalizedPath, recursive: true, atChangeset: null, ct: ct).ConfigureAwait(false);
+
+        var targetFiles = targetItems
+            .Where(i => !i.IsFolder)
+            .ToDictionary(i => i.ServerPath, StringComparer.OrdinalIgnoreCase);
+
+        var currentFiles = currentItems
+            .Where(i => !i.IsFolder)
+            .ToDictionary(i => i.ServerPath, StringComparer.OrdinalIgnoreCase);
+
+        var changes = new List<TfvcChange>();
+
+        // Files in current but not in target -> Delete
+        foreach (var (path, item) in currentFiles)
+        {
+            if (!targetFiles.ContainsKey(path))
+            {
+                changes.Add(new TfvcChange
+                {
+                    Item = new TfvcItem { Path = path, ChangesetVersion = item.ChangesetId },
+                    ChangeType = VersionControlChangeType.Delete,
+                });
+            }
+        }
+
+        // Files in target but not in current -> Add (with content from target version)
+        foreach (var (path, item) in targetFiles)
+        {
+            if (!currentFiles.ContainsKey(path))
+            {
+                var content = await DownloadFileContentAsync(path, targetChangesetId, ct).ConfigureAwait(false);
+                changes.Add(BuildTfvcChange(path, VersionControlChangeType.Add, content, null));
+            }
+        }
+
+        // Files in both -> compare content hash or changeset version, Edit if different
+        foreach (var (path, targetItem) in targetFiles)
+        {
+            if (!currentFiles.TryGetValue(path, out var currentItem)) continue;
+
+            // Quick check: if the changeset version is the same, content is identical
+            if (targetItem.ChangesetId == currentItem.ChangesetId) continue;
+
+            // Hash comparison: if both have hashes and they match, skip
+            if (!string.IsNullOrEmpty(targetItem.HashValue)
+                && !string.IsNullOrEmpty(currentItem.HashValue)
+                && string.Equals(targetItem.HashValue, currentItem.HashValue, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            // Download and compare actual content
+            byte[] targetContent;
+            byte[] currentContent;
+            try
+            {
+                targetContent = await DownloadFileContentAsync(path, targetChangesetId, ct).ConfigureAwait(false);
+                currentContent = await DownloadFileContentAsync(path, null, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                continue; // Skip files we can't download
+            }
+
+            if (ContentEquals(targetContent, currentContent)) continue;
+
+            changes.Add(BuildTfvcChange(path, VersionControlChangeType.Edit, targetContent, currentItem.ChangesetId));
+        }
+
+        if (changes.Count == 0)
+            throw new InvalidOperationException($"No differences found between current version and cs{targetChangesetId}. Already at target state.");
+
+        var changeset = new TfvcChangeset { Comment = effectiveComment, Changes = changes };
+        return await client.CreateChangesetAsync(changeset, cancellationToken: ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// 创建 TFVC Label（给服务器路径打标签）。
     /// 通过 SOAP LabelItem 实现（REST 不支持创建 label）。
     /// </summary>

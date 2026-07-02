@@ -46,6 +46,7 @@ rootCommand.AddCommand(CheckinCommand.Build(config));
 rootCommand.AddCommand(BranchCommand.Build(config));
 rootCommand.AddCommand(MergeCommand.Build(config));
 rootCommand.AddCommand(RollbackCommand.Build(config));
+rootCommand.AddCommand(RevertToVersionCommand.Build(config));
 rootCommand.AddCommand(UndeleteCommand.Build(config));
 rootCommand.AddCommand(LockCommand.Build(config));
 rootCommand.AddCommand(ChangesetCommand.Build(config));
