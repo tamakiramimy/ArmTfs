@@ -604,36 +604,25 @@ public sealed class TfvcClientService
     }
 
     /// <summary>
-    /// 删除 TFVC Label（先通过 REST 获取 scope，再 SOAP UnlabelItem）。
+    /// 删除 TFVC Label（先通过 SOAP QueryLabels 获取 scope，再 SOAP UnlabelItem）。
     /// labelId 参数可为标签名或数字 ID。
     /// </summary>
     public async Task DeleteLabelAsync(string labelId, CancellationToken ct = default)
     {
-        // Resolve the label's actual scope via REST (UnlabelItem requires exact scope)
+        // Resolve the label's actual scope via SOAP QueryLabels (UnlabelItem requires exact scope)
         string? scope = null;
         string labelName = labelId;
 
         try
         {
-            var client = _connection.GetTfvcClient();
-            if (int.TryParse(labelId, out var numId))
+            var soap = new Soap.TfvcSoapClient(_connection);
+            var labels = await soap.QueryLabelsAsync(labelName: labelId, ct: ct).ConfigureAwait(false);
+            var found = labels.FirstOrDefault(l => string.Equals(l.Name, labelId, StringComparison.OrdinalIgnoreCase))
+                     ?? labels.FirstOrDefault();
+            if (found is not null)
             {
-                var label = await client.GetLabelAsync(labelId: labelId, requestData: new TfvcLabelRequestData { IncludeLinks = false }).ConfigureAwait(false);
-                scope = label.LabelScope;
-                labelName = label.Name ?? labelId;
-            }
-            else
-            {
-                var labels = await client.GetLabelsAsync(
-                    requestData: new Microsoft.TeamFoundation.SourceControl.WebApi.TfvcLabelRequestData { Name = labelId },
-                    top: 5,
-                    cancellationToken: ct).ConfigureAwait(false);
-                var found = labels.FirstOrDefault(l => string.Equals(l.Name, labelId, StringComparison.OrdinalIgnoreCase));
-                if (found is not null)
-                {
-                    scope = found.LabelScope;
-                    labelName = found.Name ?? labelId;
-                }
+                scope = found.Scope;
+                labelName = found.Name;
             }
         }
         catch
@@ -641,8 +630,8 @@ public sealed class TfvcClientService
             // Fall through with null scope — SOAP will fail with informative error
         }
 
-        var soap = new Soap.TfvcSoapClient(_connection);
-        await soap.DeleteLabelAsync(labelName, scope ?? "$/", ct).ConfigureAwait(false);
+        var soapClient = new Soap.TfvcSoapClient(_connection);
+        await soapClient.DeleteLabelAsync(labelName, scope ?? "$/", ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -844,19 +833,18 @@ public sealed class TfvcClientService
         int skip = 0,
         CancellationToken ct = default)
     {
-        var client = _connection.GetTfvcClient();
-        return await client.GetLabelsAsync(
-            requestData: new TfvcLabelRequestData
-            {
-                Owner = owner,
-                Name = name,
-                LabelScope = labelScope,
-                MaxItemCount = maxItemCount,
-                IncludeLinks = false,
-            },
-            top: top,
-            skip: skip,
-            cancellationToken: ct).ConfigureAwait(false);
+        var soap = new Soap.TfvcSoapClient(_connection);
+        var labels = await soap.QueryLabelsAsync(labelName: name, labelScope: labelScope, owner: owner, ct: ct).ConfigureAwait(false);
+
+        return labels.Skip(skip).Take(top).Select(l => new TfvcLabelRef
+        {
+            Id = l.LabelId,
+            Name = l.Name,
+            Description = l.Comment,
+            LabelScope = l.Scope,
+            ModifiedDate = l.Date?.DateTime ?? DateTime.MinValue,
+            Owner = l.Owner != null ? new IdentityRef { DisplayName = l.Owner, UniqueName = l.Owner } : null,
+        }).ToList();
     }
 
     /// <summary>获取单个 TFVC Label 详情。</summary>
@@ -865,15 +853,23 @@ public sealed class TfvcClientService
         int? maxItemCount = null,
         CancellationToken ct = default)
     {
-        var client = _connection.GetTfvcClient();
-        return await client.GetLabelAsync(
-            labelId: labelId,
-            requestData: new TfvcLabelRequestData
-            {
-                MaxItemCount = maxItemCount,
-                IncludeLinks = false,
-            },
-            cancellationToken: ct).ConfigureAwait(false);
+        var soap = new Soap.TfvcSoapClient(_connection);
+        var labels = await soap.QueryLabelsAsync(labelName: labelId, ct: ct).ConfigureAwait(false);
+        var found = labels.FirstOrDefault(l => string.Equals(l.Name, labelId, StringComparison.OrdinalIgnoreCase))
+                 ?? labels.FirstOrDefault(l => l.LabelId.ToString() == labelId);
+
+        if (found is null)
+            throw new InvalidOperationException($"Label '{labelId}' not found.");
+
+        return new TfvcLabel
+        {
+            Id = found.LabelId,
+            Name = found.Name,
+            Description = found.Comment,
+            LabelScope = found.Scope,
+            ModifiedDate = found.Date?.DateTime ?? DateTime.MinValue,
+            Owner = found.Owner != null ? new IdentityRef { DisplayName = found.Owner, UniqueName = found.Owner } : null,
+        };
     }
 
     // ─── Shelveset ─────────────────────────────────────────────────────────────
@@ -887,17 +883,21 @@ public sealed class TfvcClientService
         string? name = null,
         CancellationToken ct = default)
     {
-        var client = _connection.GetTfvcClient();
-        var results = await client.GetShelvesetsAsync(
-            requestData: new TfvcShelvesetRequestData
-            {
-                Owner = owner,
-                Name = name,
-                IncludeDetails = true,
-            },
-            cancellationToken: ct).ConfigureAwait(false);
+        var soap = new Soap.TfvcSoapClient(_connection);
+        var shelvesets = await soap.QueryShelvesetsAsync(shelvesetName: name, ownerName: owner, ct: ct).ConfigureAwait(false);
 
-        return results;
+        return shelvesets.Select(ss => new TfvcShelvesetRef
+        {
+            Name = ss.Name,
+            Owner = ss.Owner != null ? new IdentityRef
+            {
+                DisplayName = ss.OwnerDisplayName ?? ss.Owner,
+                UniqueName = ss.Owner,
+                Id = ss.Owner,
+            } : null,
+            CreatedDate = ss.Date?.DateTime ?? DateTime.MinValue,
+            Comment = ss.Comment,
+        }).ToList();
     }
 
     /// <summary>获取指定 Shelveset 中的文件变更列表。</summary>
@@ -909,11 +909,36 @@ public sealed class TfvcClientService
         string? owner = null,
         CancellationToken ct = default)
     {
-        var client = _connection.GetTfvcClient();
-        var id = string.IsNullOrEmpty(owner) ? shelvesetName : $"{shelvesetName};{owner}";
-        return await client.GetShelvesetChangesAsync(
-            shelvesetId: id,
-            cancellationToken: ct).ConfigureAwait(false);
+        // If owner is not provided, try to find the shelveset first to get the owner
+        var resolvedOwner = owner;
+        if (string.IsNullOrEmpty(resolvedOwner))
+        {
+            var soap = new Soap.TfvcSoapClient(_connection);
+            var shelvesets = await soap.QueryShelvesetsAsync(shelvesetName: shelvesetName, ct: ct).ConfigureAwait(false);
+            var found = shelvesets.FirstOrDefault(s => string.Equals(s.Name, shelvesetName, StringComparison.OrdinalIgnoreCase));
+            resolvedOwner = found?.Owner;
+        }
+
+        if (string.IsNullOrEmpty(resolvedOwner))
+            resolvedOwner = await _connection.GetAuthenticatedUserGuidAsync(ct).ConfigureAwait(false) ?? string.Empty;
+
+        var soapClient = new Soap.TfvcSoapClient(_connection);
+        var changes = await soapClient.QueryShelvesetChangesAsync(shelvesetName, resolvedOwner, ct).ConfigureAwait(false);
+
+        return changes.Select(c =>
+        {
+            var changeType = ParseSoapChangeType(c.ChangeType);
+            return new TfvcChange
+            {
+                Item = new TfvcItem
+                {
+                    Path = c.ServerPath,
+                    IsFolder = c.IsFolder,
+                    ChangesetVersion = c.ChangesetVersion,
+                },
+                ChangeType = changeType,
+            };
+        }).ToList();
     }
 
     // ─── Branch ───────────────────────────────────────────────────────────────
@@ -927,12 +952,21 @@ public sealed class TfvcClientService
         bool includeDeleted = false,
         CancellationToken ct = default)
     {
-        var client = _connection.GetTfvcClient();
-        return await client.GetBranchRefsAsync(
-            scopePath: scopePath,
-            includeDeleted: includeDeleted,
-            includeLinks: false,
-            cancellationToken: ct).ConfigureAwait(false);
+        var soap = new Soap.TfvcSoapClient(_connection);
+        var branches = await soap.QueryBranchObjectsAsync(scopePath, includeChildren: false, ct: ct).ConfigureAwait(false);
+
+        IEnumerable<Models.Soap.SoapBranchObject> filtered = branches;
+        if (!includeDeleted)
+            filtered = filtered.Where(b => !b.IsDeleted);
+
+        return filtered.Select(b => new TfvcBranchRef
+        {
+            Path = b.Path,
+            Description = b.Description,
+            Owner = b.Owner != null ? new IdentityRef { DisplayName = b.Owner, UniqueName = b.Owner } : null,
+            CreatedDate = b.DateCreated?.DateTime ?? DateTime.MinValue,
+            IsDeleted = b.IsDeleted,
+        }).ToList();
     }
 
     /// <summary>获取单个分支详情。</summary>
@@ -944,12 +978,26 @@ public sealed class TfvcClientService
         bool includeChildren = true,
         CancellationToken ct = default)
     {
-        var client = _connection.GetTfvcClient();
-        return await client.GetBranchAsync(
-            path: path,
-            includeParent: true,
-            includeChildren: includeChildren,
-            cancellationToken: ct).ConfigureAwait(false);
+        var soap = new Soap.TfvcSoapClient(_connection);
+        var branches = await soap.QueryBranchObjectsAsync(path, includeChildren: includeChildren, ct: ct).ConfigureAwait(false);
+        var found = branches.FirstOrDefault(b => string.Equals(b.Path, path, StringComparison.OrdinalIgnoreCase))
+                 ?? branches.FirstOrDefault();
+
+        if (found is null)
+            throw new InvalidOperationException($"Branch '{path}' not found.");
+
+        var result = new TfvcBranch
+        {
+            Path = found.Path,
+            Description = found.Description,
+            Owner = found.Owner != null ? new IdentityRef { DisplayName = found.Owner, UniqueName = found.Owner } : null,
+            CreatedDate = found.DateCreated?.DateTime ?? DateTime.MinValue,
+            IsDeleted = found.IsDeleted,
+            Parent = !string.IsNullOrEmpty(found.ParentPath) ? new TfvcShallowBranchRef { Path = found.ParentPath } : null,
+            Children = found.ChildPaths?.Select(cp => new TfvcBranch { Path = cp }).ToList(),
+        };
+
+        return result;
     }
 
     // ─── Merge Query ──────────────────────────────────────────────────────────
@@ -2564,8 +2612,10 @@ public sealed class TfvcClientService
     {
         try
         {
-            var item = await _connection.GetTfvcClient().GetItemAsync(serverPath, cancellationToken: ct).ConfigureAwait(false);
-            return item?.ChangesetVersion;
+            var soap = new Soap.TfvcSoapClient(_connection);
+            var items = await soap.QueryItemsAsync(serverPath, "None", null, ct).ConfigureAwait(false);
+            var item = items.FirstOrDefault(i => !i.IsFolder);
+            return item?.ChangesetId;
         }
         catch
         {

@@ -40,3 +40,45 @@ public sealed record SoapMergeSourceInfo(
     int? VersionFrom,
     int? VersionTo,
     bool IsRename);
+
+/// <summary>
+/// QueryLabels 返回的单个 TFVC Label 信息。
+/// </summary>
+public sealed record SoapLabel(
+    string Name,
+    int LabelId,
+    string? Scope,
+    string? Owner,
+    DateTimeOffset? Date,
+    string? Comment);
+
+/// <summary>
+/// QueryShelvesets 返回的单个 Shelveset 信息。
+/// </summary>
+public sealed record SoapShelveset(
+    string Name,
+    string? Owner,
+    string? OwnerDisplayName,
+    DateTimeOffset? Date,
+    string? Comment);
+
+/// <summary>
+/// QueryShelvesetChanges 返回的单个文件变更。
+/// </summary>
+public sealed record SoapShelvesetChange(
+    string ServerPath,
+    bool IsFolder,
+    int ChangesetVersion,
+    string ChangeType);
+
+/// <summary>
+/// QueryBranchObjects 返回的分支对象信息。
+/// </summary>
+public sealed record SoapBranchObject(
+    string Path,
+    string? Description,
+    DateTimeOffset? DateCreated,
+    string? ParentPath,
+    bool IsDeleted,
+    string? Owner,
+    IReadOnlyList<string>? ChildPaths);

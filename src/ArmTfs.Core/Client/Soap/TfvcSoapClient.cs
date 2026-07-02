@@ -727,6 +727,190 @@ public sealed class TfvcSoapClient
         }
     }
 
+    // ─── QueryLabels ───────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// 查询 TFVC 标签列表（SOAP QueryLabels）。
+    /// </summary>
+    public async Task<IReadOnlyList<SoapLabel>> QueryLabelsAsync(
+        string? labelName = null,
+        string? labelScope = null,
+        string? owner = null,
+        CancellationToken ct = default)
+    {
+        var body = $@"    <tns:QueryLabels>
+      <tns:workspaceName></tns:workspaceName>
+      <tns:workspaceOwner></tns:workspaceOwner>
+      <tns:labelName>{Esc(labelName ?? string.Empty)}</tns:labelName>
+      <tns:labelScope>{Esc(labelScope ?? string.Empty)}</tns:labelScope>
+      <tns:owner>{Esc(owner ?? string.Empty)}</tns:owner>
+      <tns:filterItem xsi:nil=""true"" />
+      <tns:sortBy>None</tns:sortBy>
+      <tns:includeItems>false</tns:includeItems>
+      <tns:generateDownloadUrls>false</tns:generateDownloadUrls>
+    </tns:QueryLabels>";
+
+        var doc = await InvokeAsync("QueryLabels", body, ct).ConfigureAwait(false);
+
+        var result = new List<SoapLabel>();
+        foreach (var label in doc.Descendants().Where(e => e.Name.LocalName == "VersionControlLabel"))
+        {
+            var name = AttrAny(label, "name") ?? string.Empty;
+            var lid = TryParseInt(AttrAny(label, "lid")) ?? 0;
+            var scope = AttrAny(label, "scope");
+            var labelOwner = AttrAny(label, "owner");
+            DateTimeOffset? date = DateTimeOffset.TryParse(AttrAny(label, "date"), out var d) ? d : null;
+            var comment = ChildText(label, "Comment");
+
+            result.Add(new SoapLabel(name, lid, scope, labelOwner, date, comment));
+        }
+
+        return result;
+    }
+
+    // ─── QueryShelvesets ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// 查询 Shelveset 列表（SOAP QueryShelvesets）。
+    /// </summary>
+    public async Task<IReadOnlyList<SoapShelveset>> QueryShelvesetsAsync(
+        string? shelvesetName = null,
+        string? ownerName = null,
+        CancellationToken ct = default)
+    {
+        var nameEl = string.IsNullOrEmpty(shelvesetName)
+            ? @"<tns:shelvesetName xsi:nil=""true"" />"
+            : $"<tns:shelvesetName>{Esc(shelvesetName)}</tns:shelvesetName>";
+        var ownerEl = string.IsNullOrEmpty(ownerName)
+            ? @"<tns:ownerName xsi:nil=""true"" />"
+            : $"<tns:ownerName>{Esc(ownerName)}</tns:ownerName>";
+
+        var body = $@"    <tns:QueryShelvesets>
+      {nameEl}
+      {ownerEl}
+    </tns:QueryShelvesets>";
+
+        var doc = await InvokeAsync("QueryShelvesets", body, ct).ConfigureAwait(false);
+
+        var result = new List<SoapShelveset>();
+        foreach (var ss in doc.Descendants().Where(e => e.Name.LocalName == "Shelveset"))
+        {
+            var name = AttrAny(ss, "name") ?? string.Empty;
+            var ssOwner = AttrAny(ss, "owner");
+            var ssOwnerDisp = AttrAny(ss, "ownerdisp");
+            DateTimeOffset? date = DateTimeOffset.TryParse(AttrAny(ss, "date"), out var d) ? d : null;
+            var comment = ChildText(ss, "Comment");
+
+            result.Add(new SoapShelveset(name, ssOwner, ssOwnerDisp, date, comment));
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 查询 Shelveset 中的文件变更列表（SOAP QueryShelvesetChanges）。
+    /// </summary>
+    public async Task<IReadOnlyList<SoapShelvesetChange>> QueryShelvesetChangesAsync(
+        string shelvesetName,
+        string ownerName,
+        CancellationToken ct = default)
+    {
+        var body = $@"    <tns:QueryShelvesetChanges>
+      <tns:shelvesetName>{Esc(shelvesetName)}</tns:shelvesetName>
+      <tns:ownerName>{Esc(ownerName)}</tns:ownerName>
+      <tns:includeDownloadUrls>false</tns:includeDownloadUrls>
+      <tns:pageSize>1000</tns:pageSize>
+    </tns:QueryShelvesetChanges>";
+
+        var doc = await InvokeAsync("QueryShelvesetChanges", body, ct).ConfigureAwait(false);
+
+        var result = new List<SoapShelvesetChange>();
+        foreach (var change in doc.Descendants().Where(e => e.Name.LocalName == "Change"))
+        {
+            var changeType = AttrAny(change, "type") ?? AttrAny(change, "chg") ?? string.Empty;
+            var itemEl = change.Elements().FirstOrDefault(e => e.Name.LocalName == "Item");
+            var serverPath = AttrAny(itemEl, "item") ?? string.Empty;
+            var itemType = AttrAny(itemEl, "type") ?? string.Empty;
+            var isFolder = string.Equals(itemType, "Folder", StringComparison.OrdinalIgnoreCase);
+            var cs = TryParseInt(AttrAny(itemEl, "cs")) ?? 0;
+
+            result.Add(new SoapShelvesetChange(serverPath, isFolder, cs, changeType));
+        }
+
+        return result;
+    }
+
+    // ─── QueryBranchObjects ──────────────────────────────────────────────────
+
+    /// <summary>
+    /// 查询 TFVC 分支对象信息（SOAP QueryBranchObjects）。
+    /// 返回指定路径的分支信息，包含父分支和子分支关系。
+    /// </summary>
+    public async Task<IReadOnlyList<SoapBranchObject>> QueryBranchObjectsAsync(
+        string? serverPath = null,
+        bool includeChildren = true,
+        CancellationToken ct = default)
+    {
+        var itemsXml = string.IsNullOrEmpty(serverPath)
+            ? @"<tns:items />"
+            : $@"<tns:items><tns:ItemIdentifier item=""{Esc(serverPath)}"" /></tns:items>";
+
+        var options = includeChildren ? "IncludeParent | IncludeChildren" : "IncludeParent";
+
+        var body = $@"    <tns:QueryBranchObjects>
+      {itemsXml}
+      <tns:options>{options}</tns:options>
+    </tns:QueryBranchObjects>";
+
+        var doc = await InvokeAsync("QueryBranchObjects", body, ct).ConfigureAwait(false);
+
+        var result = new List<SoapBranchObject>();
+        foreach (var bo in doc.Descendants().Where(e => e.Name.LocalName == "BranchObject"))
+        {
+            // BranchObject has a <Properties> child with <RootItem> child that has `item` attribute
+            var propsEl = bo.Elements().FirstOrDefault(e => e.Name.LocalName == "Properties");
+            var rootItemEl = propsEl?.Elements().FirstOrDefault(e => e.Name.LocalName == "RootItem");
+            var path = AttrAny(rootItemEl, "item") ?? AttrAny(bo, "item") ?? string.Empty;
+            var description = (propsEl is not null ? ChildText(propsEl, "Description") : null) ?? ChildText(bo, "Description");
+            DateTimeOffset? dateCreated = DateTimeOffset.TryParse(
+                AttrAny(propsEl, "DateCreated") ?? AttrAny(bo, "DateCreated") ?? (propsEl is not null ? ChildText(propsEl, "DateCreated") : null),
+                out var dc) ? dc : null;
+            var isDeleted = string.Equals(
+                AttrAny(rootItemEl, "del") ?? AttrAny(bo, "IsDeleted"),
+                "true", StringComparison.OrdinalIgnoreCase);
+            var owner = AttrAny(propsEl, "Owner") ?? (propsEl is not null ? ChildText(propsEl, "Owner") : null);
+
+            // Parent branch
+            var parentEl = propsEl?.Elements().FirstOrDefault(e => e.Name.LocalName == "ParentBranch");
+            var parentPath = AttrAny(parentEl, "item");
+
+            // Children
+            var childPaths = new List<string>();
+            var childBranches = bo.Elements().Where(e => e.Name.LocalName == "ChildBranch" || e.Name.LocalName == "ChildItem");
+            foreach (var child in childBranches)
+            {
+                var childPath = AttrAny(child, "item");
+                if (!string.IsNullOrEmpty(childPath))
+                    childPaths.Add(childPath);
+            }
+            // Also check for ChildBranches container
+            var childBranchesContainer = bo.Elements().FirstOrDefault(e => e.Name.LocalName == "ChildBranches");
+            if (childBranchesContainer is not null)
+            {
+                foreach (var child in childBranchesContainer.Elements())
+                {
+                    var childPath = AttrAny(child, "item");
+                    if (!string.IsNullOrEmpty(childPath))
+                        childPaths.Add(childPath);
+                }
+            }
+
+            result.Add(new SoapBranchObject(path, description, dateCreated, parentPath, isDeleted, owner, childPaths.Count > 0 ? childPaths : null));
+        }
+
+        return result;
+    }
+
     // ─── PendChanges (General) + Upload + CheckInWithContent ─────────────────
 
     /// <summary>
