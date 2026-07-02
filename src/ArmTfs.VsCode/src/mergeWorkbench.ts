@@ -486,11 +486,10 @@ export class ArmTfsMergeWorkbench {
         readServerText(this.client, change.sourceServerPath, change.sourceChangesetId),
         change.targetExists ? readServerText(this.client, change.targetServerPath) : Promise.resolve(''),
       ]);
-      const content = await openManualMergePanel(
-        `${path.posix.basename(change.sourceServerPath)} 手动合并`,
+      const content = await openNativeMergeWithToolbar(
         source,
         target,
-        this.manualMergeContents.get(conflictId) || '',
+        this.manualMergeContents.get(conflictId),
         change.sourceServerPath,
         change.targetServerPath,
       );
@@ -1264,6 +1263,124 @@ async function readServerText(client: ArmTfsCliClient, serverPath: string, versi
     throw new Error(`无法手动合并二进制文件：${serverPath}`);
   }
   return Buffer.from(response.item.contentBase64, 'base64').toString('utf8');
+}
+
+async function openNativeMergeWithToolbar(
+  sourceContent: string,
+  targetContent: string,
+  initialResult: string | undefined,
+  sourceServerPath: string,
+  targetServerPath: string,
+): Promise<string | undefined> {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'arm-tfs-conflict-'));
+  const baseName = sanitizeLocalFileName(path.posix.basename(targetServerPath || sourceServerPath) || 'merge.txt');
+  const basePath = path.join(directory, `base-${baseName}`);
+  const sourcePath = path.join(directory, `source-${baseName}`);
+  const targetPath = path.join(directory, `target-${baseName}`);
+  const resultPath = path.join(directory, `result-${baseName}`);
+
+  await Promise.all([
+    fs.writeFile(basePath, targetContent, 'utf8'),
+    fs.writeFile(sourcePath, sourceContent, 'utf8'),
+    fs.writeFile(targetPath, targetContent, 'utf8'),
+    fs.writeFile(resultPath, initialResult ?? targetContent, 'utf8'),
+  ]);
+
+  const baseUri = vscode.Uri.file(basePath);
+  const sourceUri = vscode.Uri.file(sourcePath);
+  const targetUri = vscode.Uri.file(targetPath);
+  const resultUri = vscode.Uri.file(resultPath);
+
+  try {
+    await vscode.commands.executeCommand('_open.mergeEditor', {
+      base: baseUri,
+      input1: {
+        uri: sourceUri,
+        title: '源分支',
+        description: path.posix.basename(sourceServerPath),
+        detail: sourceServerPath,
+      },
+      input2: {
+        uri: targetUri,
+        title: '目标分支',
+        description: path.posix.basename(targetServerPath),
+        detail: targetServerPath,
+      },
+      output: resultUri,
+    });
+  } catch (error) {
+    throw new Error(`无法打开 VS Code Merge Editor：${getErrorMessage(error)}`);
+  }
+
+  // Status bar items for merge toolbar
+  const prevBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 1000);
+  prevBtn.text = '$(arrow-up) 上一个冲突';
+  prevBtn.command = 'merge-conflict.previous';
+  prevBtn.tooltip = '跳转到上一个冲突';
+  prevBtn.show();
+
+  const nextBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 999);
+  nextBtn.text = '$(arrow-down) 下一个冲突';
+  nextBtn.command = 'merge-conflict.next';
+  nextBtn.tooltip = '跳转到下一个冲突';
+  nextBtn.show();
+
+  const countItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 998);
+  countItem.text = '$(git-merge) 合并冲突解决中...';
+  countItem.tooltip = '正在解决合并冲突';
+  countItem.show();
+
+  const completeBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 1000);
+  completeBtn.text = '$(check) 完成合并';
+  completeBtn.command = 'armTfs.mergeConflict.complete';
+  completeBtn.tooltip = '使用当前合并结果';
+  completeBtn.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+  completeBtn.show();
+
+  const undoBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 999);
+  undoBtn.text = '$(discard) 撤销合并';
+  undoBtn.command = 'armTfs.mergeConflict.undo';
+  undoBtn.tooltip = '放弃当前合并，恢复原始内容';
+  undoBtn.show();
+
+  const doc = await vscode.workspace.openTextDocument(resultUri);
+
+  return new Promise<string | undefined>((resolve) => {
+    const disposables: vscode.Disposable[] = [];
+
+    const cleanup = () => {
+      prevBtn.dispose();
+      nextBtn.dispose();
+      countItem.dispose();
+      completeBtn.dispose();
+      undoBtn.dispose();
+      vscode.Disposable.from(...disposables).dispose();
+    };
+
+    // Register commands
+    disposables.push(
+      vscode.commands.registerCommand('armTfs.mergeConflict.complete', async () => {
+        await doc.save();
+        const content = await fs.readFile(resultPath, 'utf8');
+        cleanup();
+        resolve(content);
+      }),
+      vscode.commands.registerCommand('armTfs.mergeConflict.undo', () => {
+        cleanup();
+        resolve(undefined);
+      }),
+    );
+
+    // Also handle if user closes the editor tab
+    disposables.push(
+      vscode.workspace.onDidCloseTextDocument((closed) => {
+        if (closed.uri.fsPath === resultUri.fsPath) {
+          cleanup();
+          resolve(undefined);
+        }
+      }),
+    );
+  });
 }
 
 async function openNativeConflictEditor(
