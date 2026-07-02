@@ -504,11 +504,10 @@ export class ArmTfsMergeWorkbench {
         readServerText(this.client, change.sourceServerPath, change.sourceChangesetId),
         change.targetExists ? readServerText(this.client, change.targetServerPath) : Promise.resolve(''),
       ]);
-      const content = await openManualMergePanel(
-        `${path.posix.basename(change.sourceServerPath)} 手动合并`,
+      const content = await openNativeMergeWithToolbar(
         source,
         target,
-        this.manualMergeContents.get(conflictId) || '',
+        this.manualMergeContents.get(conflictId),
         change.sourceServerPath,
         change.targetServerPath,
       );
@@ -560,6 +559,7 @@ function renderWorkbenchHtml(
   const nonce = getNonce();
   const selected = state.candidates.find((candidate) => candidate.changesetId === state.selectedChangesetId) ?? state.candidates[0];
   const conflictFiles = aggregateConflicts(state.candidates);
+  const aggregatedConflictPaths = new Set(conflictFiles.map(f => f.targetServerPath.replace(/\\/g, '/').replace(/\/+$/u, '').toLowerCase()));
   const checkedCount = state.candidates.filter((candidate) => candidate.checked).length;
   const hasUnresolvedBlocking = conflictFiles.some((f) => !conflictResolutions.has(f.targetServerPath));
   const fileCount = aggregateFileCount(state.candidates);
@@ -581,7 +581,7 @@ function renderWorkbenchHtml(
         <section class="pane changesets">
           <div class="pane-title">Changesets</div>
           <div class="list">
-            ${state.candidates.map((candidate) => renderCandidate(candidate, selected?.changesetId)).join('')}
+            ${state.candidates.map((candidate) => renderCandidate(candidate, selected?.changesetId, aggregatedConflictPaths)).join('')}
           </div>
         </section>
         <section class="pane files" id="filesPane">
@@ -953,8 +953,10 @@ ${script}
 </html>`;
 }
 
-function renderCandidate(candidate: MergeWorkbenchCandidate, selectedChangesetId?: number): string {
-  const conflictCount = findConflicts(candidate).length;
+function renderCandidate(candidate: MergeWorkbenchCandidate, selectedChangesetId?: number, validConflictPaths?: Set<string>): string {
+  const conflictCount = validConflictPaths
+    ? candidate.changes.filter(ch => ch.status.toLowerCase() === 'conflict' && validConflictPaths.has(ch.targetServerPath.replace(/\\/g, '/').replace(/\/+$/u, '').toLowerCase())).length
+    : findConflicts(candidate).length;
   const comment = candidate.comment?.trim() || '(no comment)';
   return `
     <article class="candidate ${candidate.changesetId === selectedChangesetId ? 'active' : ''}">
