@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.1.7 - 2026-07-02
+
+### VS Code extension
+
+- **Merge UI improvements for conflict navigation**:
+  - Added "Previous Conflict" and "Next Conflict" buttons with text labels to the top of the conflict panel
+  - Added bottom status bar showing "Remaining X conflicts" with duplicate navigation buttons
+  - Conflict navigation now auto-scrolls to the target conflict and highlights it for 1 second
+  - Navigation supports circular scrolling (wraps from last to first conflict)
+- **Merge completion actions**:
+  - Added "Complete Merge" button that executes the merge when all conflicts are resolved
+  - Added "Undo Merge" button that clears all conflict resolutions with user confirmation
+  - Both buttons are in the conflict panel footer for easy access
+- Removed the old custom manual merge webview fallback so manual conflict resolution now only uses VS Code's native Merge Editor path.
+- If the native Merge Editor command cannot be opened, the extension now reports a clear error instead of falling back to the lower-quality custom panel.
+
+### Packaging
+
+- Built release packages for macOS arm64 (`arm-tfs-0.1.7-osx-arm64.zip`, ~75MB)
+- Built release packages for Windows arm64 (`arm-tfs-0.1.7-win-arm64.zip`, ~112MB)
+- Updated VS Code extension package to version 0.1.7 (`arm-tfs-vscode-0.1.7.vsix`, ~769KB)
+
+## 0.1.6 - 2026-07-02
+
+### VS Code extension
+
+- Fixed Merge Workbench range conflicts being copied onto every changeset; range conflicts are now tracked once globally and shown once in the conflict list.
+- Changed manual conflict resolution to open VS Code's native Merge Editor with source branch on the left, target branch on the right, and the editable merged result as output.
+- Kept global range conflict resolutions in each selected changeset's resolution file so resolved range conflicts still execute correctly without duplicating the UI badges.
+- Excluded local `release/` build folders from VSIX packaging so old CLI release binaries are not embedded in the extension package.
+
+### Validation and packaging
+
+- Revalidated `MindrayApp.TeamsPortal-P_V20260515` to `MindrayApp.TeamsPortal` with SOAP range dry-run for `cs212325~cs213671`; it completed in about 1.56 seconds and surfaced the two expected `.csproj` conflicts without creating a changeset.
+- Bumped `ArmTfs.Cli`, `ArmTfs.Core`, and the VS Code extension package version to `0.1.6`.
+- Built `osx-arm64`, `win-arm64`, and VSIX release artifacts for `0.1.6`.
+
+## 0.1.5 - 2026-07-02
+
+### VS Code extension
+
+- Added `armTfs.merge.planConcurrency` to load Merge Workbench per-changeset dry-run plans with bounded parallelism.
+- Changed continuous, conflict-free multi-changeset execution to use one SOAP range merge instead of one SOAP merge per changeset.
+- Kept conflicted and non-contiguous selections on the existing safer per-changeset execution path.
+
+### Validation and packaging
+
+- Validated SOAP range preview against `MindrayApp.TeamsPortal-P_V20260515` to `MindrayApp.TeamsPortal`; the full range preview completed in about 1.55 seconds and surfaced two `.csproj` conflicts without creating pending changes.
+- Bumped `ArmTfs.Cli`, `ArmTfs.Core`, and the VS Code extension package version to `0.1.5`.
+
 ## 0.1.4 - 2026-06-30
 
 ### VS Code extension

@@ -3,11 +3,15 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { ArmTfsCliClient } from './armTfsCliClient';
-import type { MergeCandidateResponse, MergeExecuteResponse } from './contracts';
+import type { MergeBasePayload, MergeCandidateResponse, MergeExecuteResponse } from './contracts';
 import { t } from './i18n';
+import { getConfigValue } from './userConfig';
 import { openServerVersionDiff, openServerVersionDiffFromEmpty } from './versionedFiles';
 
 type MergePlanChange = MergeExecuteResponse['result']['changes'][number];
+
+const DEFAULT_PLAN_CONCURRENCY = 4;
+const MAX_PLAN_CONCURRENCY = 16;
 
 interface MergeWorkbenchCandidate {
   changesetId: number;
@@ -39,6 +43,8 @@ interface MergeWorkbenchState {
   sourcePath: string;
   targetPath: string;
   candidates: MergeWorkbenchCandidate[];
+  rangeConflicts: MergePlanChange[];
+  mergeBase?: MergeBasePayload;
   selectedChangesetId?: number;
 }
 
@@ -83,6 +89,7 @@ export class ArmTfsMergeWorkbench {
     sourcePath: '$/',
     targetPath: '$/',
     candidates: [],
+    rangeConflicts: [],
   };
 
   private readonly disposables: vscode.Disposable[] = [];
@@ -111,21 +118,33 @@ export class ArmTfsMergeWorkbench {
   ): Promise<void> {
     this.panel.webview.html = renderLoadingHtml(this.panel.webview);
     try {
+      let mergeBase: MergeBasePayload | undefined;
       const candidates = await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
           title: `arm-tfs merge plan ${path.posix.basename(sourcePath)} -> ${path.posix.basename(targetPath)}`,
         },
         async (progress) => {
-          const result: MergeWorkbenchCandidate[] = [];
-          for (const [index, item] of candidateResponse.items.entries()) {
+          const total = candidateResponse.items.length;
+          const concurrency = getMergePlanConcurrency();
+          let completed = 0;
+          progress.report({
+            message: `loading ${total} changeset plan(s), ${Math.min(concurrency, Math.max(total, 1))} parallel`,
+          });
+
+          return mapWithConcurrency(candidateResponse.items, concurrency, async (item) => {
             progress.report({
-              message: `cs${item.changesetId} (${index + 1}/${candidateResponse.items.length})`,
+              message: `cs${item.changesetId} loading`,
             });
             const plan = await this.client.mergeExecuteJson(sourcePath, targetPath, item.changesetId, {
               dryRun: true,
             });
-            result.push({
+            mergeBase ??= plan.result.mergeBase;
+            completed += 1;
+            progress.report({
+              message: `cs${item.changesetId} (${completed}/${total})`,
+            });
+            return {
               changesetId: item.changesetId,
               createdAt: item.createdAt,
               author: item.author?.displayName,
@@ -133,9 +152,8 @@ export class ArmTfsMergeWorkbench {
               checked: true,
               changes: plan.result.changes,
               warnings: plan.result.warnings,
-            });
-          }
-          return result;
+            };
+          });
         },
       );
 
@@ -143,6 +161,8 @@ export class ArmTfsMergeWorkbench {
         sourcePath,
         targetPath,
         candidates,
+        rangeConflicts: [],
+        mergeBase,
         selectedChangesetId: candidates[0]?.changesetId,
       };
 
@@ -158,8 +178,7 @@ export class ArmTfsMergeWorkbench {
           const rangePlan = await this.client.mergeExecuteRangeJson(sourcePath, targetPath, from, to, {
             dryRun: true,
           });
-          this.applyRangeConflictsToCandidates(
-            candidates,
+          this.mergeRangeConflicts(
             rangePlan.result.changes.filter((change) => change.status.toLowerCase() === 'conflict'),
           );
         } catch (previewError) {
@@ -238,6 +257,11 @@ export class ArmTfsMergeWorkbench {
       case 'executeSelected':
         await this.executeSelected(message.selectedChangesetIds ?? []);
         break;
+      case 'undoMerge':
+        this.conflictResolutions.clear();
+        this.manualMergeContents.clear();
+        this.render();
+        break;
     }
   }
 
@@ -286,7 +310,8 @@ export class ArmTfsMergeWorkbench {
       return;
     }
 
-    const unresolvedConflict = aggregateConflicts(selected).find(
+    const selectedConflicts = aggregateConflicts(selected, this.state.rangeConflicts);
+    const unresolvedConflict = selectedConflicts.find(
       (f) => !this.conflictResolutions.has(f.targetServerPath),
     );
     if (unresolvedConflict) {
@@ -294,7 +319,9 @@ export class ArmTfsMergeWorkbench {
       return;
     }
 
-    const resolutionItemsByChangeset = this.buildResolutionItems(selected);
+    const resolutionItemsByChangeset = selectedConflicts.length > 0
+      ? this.buildResolutionItems(selected)
+      : new Map<number, MergeExecutionResolutionFileItem[]>();
 
     const defaultComment = `Merge ${selected.map((item) => `cs${item.changesetId}`).join(', ')} from ${path.posix.basename(this.state.sourcePath)} to ${path.posix.basename(this.state.targetPath)}`;
     const comment = await vscode.window.showInputBox({
@@ -303,6 +330,62 @@ export class ArmTfsMergeWorkbench {
       ignoreFocusOut: true,
     });
     if (comment === undefined) {
+      return;
+    }
+
+    const range = selectedConflicts.length === 0
+      ? getContiguousSelectedRange(selected, this.state.candidates)
+      : undefined;
+    if (range) {
+      try {
+        const response = await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: `arm-tfs merge range cs${range.from}~cs${range.to}`,
+          },
+          async (progress) => {
+            progress.report({ message: 'server range merge' });
+            return this.client.mergeExecuteRangeJson(
+              this.state.sourcePath,
+              this.state.targetPath,
+              range.from,
+              range.to,
+              { comment: comment.trim() || undefined },
+            );
+          },
+        );
+
+        this.output.appendLine('> arm-tfs merge execute range');
+        this.output.appendLine(summarizeMergeResponse(response));
+        this.output.appendLine('');
+
+        const conflictChanges = response.result.changes.filter((c) => c.status.toLowerCase() === 'conflict');
+        if (conflictChanges.length > 0) {
+          this.mergeRangeConflicts(conflictChanges);
+          this.render();
+          void vscode.window.showWarningMessage(
+            `cs${range.from}~cs${range.to} 合并中止：服务器检测到冲突，已列入冲突列表。请解决后重试。`,
+          );
+        } else if (response.result.createdChangesetId !== null && response.result.createdChangesetId !== undefined) {
+          await this.refreshAfterExecute();
+          void vscode.window.showInformationMessage(
+            t('merge.execute.success', {
+              count: selected.length,
+              created: `cs${response.result.createdChangesetId}`,
+            }),
+          );
+          this.panel.dispose();
+        } else {
+          await this.refreshAfterExecute();
+          void vscode.window.showWarningMessage(
+            t('merge.execute.noChange', {
+              changesets: selected.map((id) => `cs${id.changesetId}`).join(', '),
+            }),
+          );
+        }
+      } catch (error) {
+        this.showError('arm-tfs merge execute range', error);
+      }
       return;
     }
 
@@ -411,31 +494,40 @@ export class ArmTfsMergeWorkbench {
     }
   }
 
-  /** 把 range SOAP dry-run 中发现的全部冲突补进候选计划。 */
-  private applyRangeConflictsToCandidates(
-    candidates: MergeWorkbenchCandidate[],
-    conflictChanges: MergePlanChange[],
-  ): void {
+  /** Keep SOAP range conflicts global so they are shown once, not copied onto every changeset. */
+  private mergeRangeConflicts(conflictChanges: MergePlanChange[]): void {
+    if (conflictChanges.length === 0) {
+      return;
+    }
+
+    const byTarget = new Map(
+      this.state.rangeConflicts.map((change) => [normalizeServerPathKey(change.targetServerPath), change]),
+    );
     for (const conflict of conflictChanges) {
-      for (const candidate of candidates) {
-        const existing = candidate.changes.find((change) =>
-          change.targetServerPath.toLowerCase() === conflict.targetServerPath.toLowerCase());
-        if (existing) {
-          existing.status = 'conflict';
-          existing.sourceServerPath = conflict.sourceServerPath || existing.sourceServerPath;
-          existing.note = conflict.note || 'Both source and target modified this file (server 3-way merge conflict). Resolve (source/target/manual).';
-        } else {
-          // Some conflicts are returned by the server without appearing in a single changeset dry-run.
-          // Attach them to every candidate so the selected execution passes the user's resolution file
-          // before whichever changeset first encounters that conflict.
-          candidate.changes.push({
-            ...conflict,
-            sourceChangesetId: candidate.changesetId,
-            status: 'conflict',
-            targetExists: true,
-            note: conflict.note || 'Server range merge conflict. Resolve (source/target/manual) before executing.',
-          });
+      byTarget.set(normalizeServerPathKey(conflict.targetServerPath), {
+        ...conflict,
+        status: 'conflict',
+        targetExists: conflict.targetExists,
+        note: conflict.note || 'Server range merge conflict. Resolve (source/target/manual) before executing.',
+      });
+    }
+    this.state.rangeConflicts = [...byTarget.values()];
+    this.markExistingCandidateChangesAsRangeConflicts(conflictChanges);
+  }
+
+  private markExistingCandidateChangesAsRangeConflicts(conflictChanges: MergePlanChange[]): void {
+    const conflictByTarget = new Map(
+      conflictChanges.map((change) => [normalizeServerPathKey(change.targetServerPath), change]),
+    );
+    for (const candidate of this.state.candidates) {
+      for (const change of candidate.changes) {
+        const conflict = conflictByTarget.get(normalizeServerPathKey(change.targetServerPath));
+        if (!conflict) {
+          continue;
         }
+        change.status = 'conflict';
+        change.sourceServerPath = conflict.sourceServerPath || change.sourceServerPath;
+        change.note = conflict.note || 'Both source and target modified this file (server 3-way merge conflict). Resolve (source/target/manual).';
       }
     }
   }
@@ -445,39 +537,47 @@ export class ArmTfsMergeWorkbench {
   ): Map<number, MergeExecutionResolutionFileItem[]> {
     const itemsByChangeset = new Map<number, MergeExecutionResolutionFileItem[]>();
     for (const candidate of selected) {
-      const items: MergeExecutionResolutionFileItem[] = [];
+      const items = new Map<string, MergeExecutionResolutionFileItem>();
       for (const change of candidate.changes) {
         if (change.status.toLowerCase() !== 'conflict') continue;
-        const choice = this.conflictResolutions.get(change.targetServerPath);
-        if (!choice) continue;
-
-        const item: MergeExecutionResolutionFileItem = {
-          sourceServerPath: change.sourceServerPath,
-          targetServerPath: change.targetServerPath,
-          choice,
-        };
-        if (choice === 'manual') {
-          const content = this.manualMergeContents.get(change.targetServerPath);
-          if (content === undefined)
-            throw new Error(`手动合并结果不存在：${change.sourceServerPath}`);
-          item.contentBase64 = Buffer.from(content, 'utf8').toString('base64');
-        }
-        items.push(item);
+        const item = this.buildResolutionItem(change);
+        if (item) items.set(normalizeServerPathKey(item.targetServerPath), item);
       }
-      itemsByChangeset.set(candidate.changesetId, items);
+      for (const change of this.state.rangeConflicts) {
+        const item = this.buildResolutionItem(change);
+        if (item) items.set(normalizeServerPathKey(item.targetServerPath), item);
+      }
+      itemsByChangeset.set(candidate.changesetId, [...items.values()]);
     }
 
     return itemsByChangeset;
   }
 
+  private buildResolutionItem(change: MergePlanChange): MergeExecutionResolutionFileItem | undefined {
+    const choice = this.conflictResolutions.get(change.targetServerPath);
+    if (!choice) {
+      return undefined;
+    }
+
+    const item: MergeExecutionResolutionFileItem = {
+      sourceServerPath: change.sourceServerPath,
+      targetServerPath: change.targetServerPath,
+      choice,
+    };
+    if (choice === 'manual') {
+      const content = this.manualMergeContents.get(change.targetServerPath);
+      if (content === undefined) {
+        throw new Error(`手动合并结果不存在：${change.sourceServerPath}`);
+      }
+      item.contentBase64 = Buffer.from(content, 'utf8').toString('base64');
+    }
+    return item;
+  }
+
   private async openManualMergeForConflict(conflictId: string): Promise<void> {
     // conflictId is the conflict file's target server path.
-    const candidate = this.state.candidates.find((item) =>
-      item.changes.some((ch) => ch.status.toLowerCase() === 'conflict' && ch.targetServerPath === conflictId));
-    const change = candidate?.changes.find(
-      (ch) => ch.status.toLowerCase() === 'conflict' && ch.targetServerPath === conflictId,
-    );
-    if (!candidate || !change) {
+    const change = this.findConflictChange(conflictId);
+    if (!change) {
       return;
     }
 
@@ -486,8 +586,9 @@ export class ArmTfsMergeWorkbench {
         readServerText(this.client, change.sourceServerPath, change.sourceChangesetId),
         change.targetExists ? readServerText(this.client, change.targetServerPath) : Promise.resolve(''),
       ]);
-      const content = await openNativeConflictEditor(
-        `${path.posix.basename(change.sourceServerPath)} 手动合并`,
+      const base = await this.readMergeBaseText(change, target);
+      const content = await openVsCodeMergeEditor(
+        base,
         source,
         target,
         this.manualMergeContents.get(conflictId),
@@ -501,6 +602,39 @@ export class ArmTfsMergeWorkbench {
       }
     } catch (error) {
       this.showError('arm-tfs manual merge', error);
+    }
+  }
+
+  private findConflictChange(conflictId: string): MergePlanChange | undefined {
+    const key = normalizeServerPathKey(conflictId);
+    for (const candidate of this.state.candidates) {
+      const change = candidate.changes.find((ch) =>
+        ch.status.toLowerCase() === 'conflict' && normalizeServerPathKey(ch.targetServerPath) === key);
+      if (change) {
+        return change;
+      }
+    }
+
+    return this.state.rangeConflicts.find((change) => normalizeServerPathKey(change.targetServerPath) === key);
+  }
+
+  private async readMergeBaseText(change: MergePlanChange, fallbackContent: string): Promise<string> {
+    const mergeBase = this.state.mergeBase;
+    const baseRoot = mergeBase?.commonAncestorPath;
+    const baseChangesetId = mergeBase?.targetBranchPointChangesetId ?? mergeBase?.sourceBranchPointChangesetId;
+    if (!baseRoot || !baseChangesetId) {
+      return fallbackContent;
+    }
+
+    const relativePath = relativeFilePath(change.targetServerPath, this.state.targetPath);
+    const basePath = joinServerPath(baseRoot, relativePath);
+    try {
+      return await readServerText(this.client, basePath, baseChangesetId);
+    } catch (error) {
+      this.output.appendLine(
+        `merge base content fallback: ${basePath}@${baseChangesetId}: ${getErrorMessage(error)}`,
+      );
+      return fallbackContent;
     }
   }
 
@@ -541,7 +675,7 @@ function renderWorkbenchHtml(
 ): string {
   const nonce = getNonce();
   const selected = state.candidates.find((candidate) => candidate.changesetId === state.selectedChangesetId) ?? state.candidates[0];
-  const conflictFiles = aggregateConflicts(state.candidates);
+  const conflictFiles = aggregateConflicts(state.candidates, state.rangeConflicts);
   const checkedCount = state.candidates.filter((candidate) => candidate.checked).length;
   const hasUnresolvedBlocking = conflictFiles.some((f) => !conflictResolutions.has(f.targetServerPath));
   const fileCount = aggregateFileCount(state.candidates);
@@ -582,12 +716,35 @@ function renderWorkbenchHtml(
           <div class="pane-title">
             <span>冲突列表 <span class="count">${conflictFiles.length} 个冲突文件</span></span>
             <span class="pane-actions">
+              <button id="prevConflict" title="上一个冲突" ${conflictFiles.length === 0 ? 'disabled' : ''}>
+                <i class="codicon codicon-chevron-up"></i> 上一个冲突
+              </button>
+              <button id="nextConflict" title="下一个冲突" ${conflictFiles.length === 0 ? 'disabled' : ''}>
+                下一个冲突 <i class="codicon codicon-chevron-down"></i>
+              </button>
               <button data-resolution="source" title="所有冲突采用源分支">批量采用源</button>
               <button data-resolution="target" title="所有冲突采用目标分支">批量采用目标</button>
             </span>
           </div>
           <div class="list">
-            ${renderConflictTree(state.candidates, state.targetPath, conflictResolutions, manualMergeContents)}
+            ${renderConflictTree(state.candidates, state.targetPath, state.rangeConflicts, conflictResolutions, manualMergeContents)}
+          </div>
+          <div class="conflict-footer">
+            <div class="conflict-status">
+              <span>剩余 <strong>${conflictFiles.filter(f => !conflictResolutions.has(f.targetServerPath)).length}</strong> 个冲突</span>
+              <span class="footer-navigation">
+                <button id="prevConflictFooter" title="上一个冲突" ${conflictFiles.length === 0 ? 'disabled' : ''}>
+                  <i class="codicon codicon-chevron-up"></i> 上一个冲突
+                </button>
+                <button id="nextConflictFooter" title="下一个冲突" ${conflictFiles.length === 0 ? 'disabled' : ''}>
+                  下一个冲突 <i class="codicon codicon-chevron-down"></i>
+                </button>
+              </span>
+            </div>
+            <div class="merge-actions">
+              <button id="undoMerge" title="撤销所有合并操作">撤销合并</button>
+              <button id="completeMerge" class="primary" title="完成合并并签入" ${hasUnresolvedBlocking ? 'disabled' : ''}>完成合并</button>
+            </div>
           </div>
         </section>
       </section>
@@ -660,6 +817,51 @@ function renderWorkbenchHtml(
       const selectedChangesetIds = Array.from(document.querySelectorAll('[data-candidate-check]:checked')).map((input) => Number(input.dataset.candidateCheck));
       vscode.postMessage({ type: 'executeSelected', selectedChangesetIds });
     });
+
+    // Conflict navigation
+    function scrollToConflict(direction) {
+      const conflicts = Array.from(document.querySelectorAll('.conflict-leaf'));
+      if (conflicts.length === 0) return;
+
+      const visible = conflicts.find((el) => {
+        const rect = el.getBoundingClientRect();
+        return rect.top >= 0 && rect.bottom <= window.innerHeight;
+      });
+
+      let targetIndex = 0;
+      if (visible) {
+        const currentIndex = conflicts.indexOf(visible);
+        targetIndex = direction === 'next'
+          ? (currentIndex + 1) % conflicts.length
+          : (currentIndex - 1 + conflicts.length) % conflicts.length;
+      }
+
+      conflicts[targetIndex].scrollIntoView({ behavior: 'smooth', block: 'center' });
+      conflicts[targetIndex].style.backgroundColor = 'var(--vscode-list-focusBackground, rgba(255, 255, 0, 0.2))';
+      setTimeout(() => { conflicts[targetIndex].style.backgroundColor = ''; }, 1000);
+    }
+
+    document.getElementById('prevConflict')?.addEventListener('click', () => scrollToConflict('prev'));
+    document.getElementById('nextConflict')?.addEventListener('click', () => scrollToConflict('next'));
+    document.getElementById('prevConflictFooter')?.addEventListener('click', () => scrollToConflict('prev'));
+    document.getElementById('nextConflictFooter')?.addEventListener('click', () => scrollToConflict('next'));
+
+    // Complete merge
+    document.getElementById('completeMerge')?.addEventListener('click', () => {
+      const selectedChangesetIds = Array.from(document.querySelectorAll('[data-candidate-check]:checked')).map((input) => Number(input.dataset.candidateCheck));
+      if (selectedChangesetIds.length === 0) {
+        return;
+      }
+      vscode.postMessage({ type: 'executeSelected', selectedChangesetIds });
+    });
+
+    // Undo merge
+    document.getElementById('undoMerge')?.addEventListener('click', () => {
+      if (confirm('确定要撤销所有合并操作吗？这将清除所有冲突解决方案。')) {
+        vscode.postMessage({ type: 'undoMerge' });
+      }
+    });
+
     refreshExecuteState();
   `;
 
@@ -705,6 +907,8 @@ function renderShell(webview: vscode.Webview, nonce: string, body: string, scrip
       --row: var(--vscode-list-hoverBackground);
     }
     .codicon { font-family: 'codicon'; font-size: 16px; line-height: 1; vertical-align: middle; }
+    .codicon-chevron-up::before { content: '\\eab4'; }
+    .codicon-chevron-down::before { content: '\\eab7'; }
     .ci-folder::before { font-family: 'codicon'; content: '\\ea83'; color: var(--vscode-symbolIcon-folderForeground, #c5c5c5); margin-right: 4px; }
     .ci-file::before { font-family: 'codicon'; content: '\\ea7b'; color: var(--vscode-symbolIcon-fileForeground, #c5c5c5); margin-right: 4px; }
     .ci-chevron-down::before { font-family: 'codicon'; content: '\\eab4'; }
@@ -779,6 +983,30 @@ function renderShell(webview: vscode.Webview, nonce: string, body: string, scrip
       flex-direction: column;
     }
     .pane:last-child { border-right: 0; }
+    .conflict-footer {
+      border-top: 1px solid var(--border);
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .conflict-status {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .footer-navigation {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .merge-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+    }
     .pane-title {
       display: flex;
       justify-content: space-between;
@@ -978,6 +1206,16 @@ function relativeFilePath(serverPath: string, rootPath: string): string {
     : serverPath;
 }
 
+function normalizeServerPathKey(serverPath: string): string {
+  return serverPath.replace(/\\/g, '/').replace(/\/+$/u, '').toLowerCase();
+}
+
+function joinServerPath(rootPath: string, relativePath: string): string {
+  const root = rootPath.replace(/\/+$/u, '');
+  const relative = relativePath.replace(/^\/+/u, '');
+  return relative ? `${root}/${relative}` : root;
+}
+
 function aggregateFileCount(candidates: MergeWorkbenchCandidate[]): number {
   const paths = new Set<string>();
   for (const c of candidates) {
@@ -1059,22 +1297,41 @@ interface AggregatedConflict {
 }
 
 /** 聚合所有勾选 changeset 的冲突文件，按目标路径去重（一个文件只出现一次）。 */
-function aggregateConflicts(candidates: MergeWorkbenchCandidate[]): AggregatedConflict[] {
+function aggregateConflicts(
+  candidates: MergeWorkbenchCandidate[],
+  rangeConflicts: readonly MergePlanChange[] = [],
+): AggregatedConflict[] {
   const byPath = new Map<string, AggregatedConflict>();
   for (const cand of candidates) {
     if (!cand.checked) continue;
     for (const ch of cand.changes) {
       if (ch.status.toLowerCase() !== 'conflict') continue;
-      const existing = byPath.get(ch.targetServerPath);
+      const targetKey = normalizeServerPathKey(ch.targetServerPath);
+      const existing = byPath.get(targetKey);
       if (existing) {
         if (!existing.changesets.includes(cand.changesetId)) existing.changesets.push(cand.changesetId);
       } else {
-        byPath.set(ch.targetServerPath, {
+        byPath.set(targetKey, {
           targetServerPath: ch.targetServerPath,
           sourceServerPath: ch.sourceServerPath,
           changesets: [cand.changesetId],
         });
       }
+    }
+  }
+
+  const checked = candidates.filter((candidate) => candidate.checked);
+  if (checked.length > 0) {
+    for (const conflict of rangeConflicts) {
+      const targetKey = normalizeServerPathKey(conflict.targetServerPath);
+      if (byPath.has(targetKey)) {
+        continue;
+      }
+      byPath.set(targetKey, {
+        targetServerPath: conflict.targetServerPath,
+        sourceServerPath: conflict.sourceServerPath,
+        changesets: [conflict.sourceChangesetId],
+      });
     }
   }
   return [...byPath.values()];
@@ -1085,10 +1342,11 @@ type ConflictResolution = 'source' | 'target' | 'manual';
 function renderConflictTree(
   candidates: MergeWorkbenchCandidate[],
   targetPath: string,
+  rangeConflicts: readonly MergePlanChange[],
   conflictResolutions: ReadonlyMap<string, ConflictResolution>,
   manualMergeContents: ReadonlyMap<string, string>,
 ): string {
-  const conflicts = aggregateConflicts(candidates);
+  const conflicts = aggregateConflicts(candidates, rangeConflicts);
   if (conflicts.length === 0) return '<div class="empty">当前勾选项没有冲突。</div>';
   const root: FileTreeNode = { name: '', children: new Map(), files: [] };
   for (const c of conflicts) {
@@ -1251,6 +1509,74 @@ function findConflicts(candidate: MergeWorkbenchCandidate): MergeConflictView[] 
     }));
 }
 
+function getMergePlanConcurrency(): number {
+  const configured = Number(getConfigValue<number>('merge.planConcurrency', DEFAULT_PLAN_CONCURRENCY));
+  if (!Number.isFinite(configured)) {
+    return DEFAULT_PLAN_CONCURRENCY;
+  }
+
+  return Math.min(MAX_PLAN_CONCURRENCY, Math.max(1, Math.floor(configured)));
+}
+
+function getContiguousSelectedRange(
+  selected: readonly MergeWorkbenchCandidate[],
+  allCandidates: readonly MergeWorkbenchCandidate[],
+): { from: number; to: number } | undefined {
+  if (selected.length < 2) {
+    return undefined;
+  }
+
+  const selectedIds = new Set(selected.map((candidate) => candidate.changesetId));
+  const selectedIndexes = allCandidates
+    .map((candidate, index) => selectedIds.has(candidate.changesetId) ? index : -1)
+    .filter((index) => index >= 0);
+  if (selectedIndexes.length !== selected.length) {
+    return undefined;
+  }
+
+  const firstIndex = Math.min(...selectedIndexes);
+  const lastIndex = Math.max(...selectedIndexes);
+  for (let index = firstIndex; index <= lastIndex; index += 1) {
+    if (!selectedIds.has(allCandidates[index].changesetId)) {
+      return undefined;
+    }
+  }
+
+  const changesetIds = selected.map((candidate) => candidate.changesetId);
+  return {
+    from: Math.min(...changesetIds),
+    to: Math.max(...changesetIds),
+  };
+}
+
+async function mapWithConcurrency<T, TResult>(
+  items: readonly T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<TResult>,
+): Promise<TResult[]> {
+  if (items.length === 0) {
+    return [];
+  }
+
+  const workerCount = Math.min(items.length, Math.max(1, Math.floor(concurrency)));
+  const results = new Array<TResult>(items.length);
+  let nextIndex = 0;
+
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    for (;;) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) {
+        return;
+      }
+
+      results[index] = await mapper(items[index], index);
+    }
+  }));
+
+  return results;
+}
+
 async function writeResolutionFile(items: MergeExecutionResolutionFileItem[]): Promise<string> {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'arm-tfs-merge-'));
   const filePath = path.join(directory, 'resolutions.json');
@@ -1266,8 +1592,8 @@ async function readServerText(client: ArmTfsCliClient, serverPath: string, versi
   return Buffer.from(response.item.contentBase64, 'base64').toString('utf8');
 }
 
-async function openNativeConflictEditor(
-  title: string,
+async function openVsCodeMergeEditor(
+  baseContent: string,
   sourceContent: string,
   targetContent: string,
   initialResult: string | undefined,
@@ -1276,41 +1602,56 @@ async function openNativeConflictEditor(
 ): Promise<string | undefined> {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'arm-tfs-conflict-'));
   const baseName = sanitizeLocalFileName(path.posix.basename(targetServerPath || sourceServerPath) || 'merge.txt');
+  const basePath = path.join(directory, `base-${baseName}`);
   const sourcePath = path.join(directory, `source-${baseName}`);
   const targetPath = path.join(directory, `target-${baseName}`);
   const resultPath = path.join(directory, `result-${baseName}`);
 
   await Promise.all([
+    fs.writeFile(basePath, baseContent, 'utf8'),
     fs.writeFile(sourcePath, sourceContent, 'utf8'),
     fs.writeFile(targetPath, targetContent, 'utf8'),
-    fs.writeFile(
-      resultPath,
-      initialResult ?? buildConflictMarkerContent(sourceContent, targetContent, sourceServerPath, targetServerPath),
-      'utf8',
-    ),
+    fs.writeFile(resultPath, initialResult ?? targetContent, 'utf8'),
   ]);
 
+  const baseUri = vscode.Uri.file(basePath);
   const sourceUri = vscode.Uri.file(sourcePath);
   const targetUri = vscode.Uri.file(targetPath);
   const resultUri = vscode.Uri.file(resultPath);
 
-  await vscode.commands.executeCommand(
-    'vscode.diff',
-    sourceUri,
-    targetUri,
-    `${title}: 源分支 -> 目标分支`,
-    { preview: false, viewColumn: vscode.ViewColumn.Beside },
-  );
+  try {
+    await vscode.commands.executeCommand('_open.mergeEditor', {
+      base: baseUri,
+      input1: {
+        uri: sourceUri,
+        title: '源分支',
+        description: path.posix.basename(sourceServerPath),
+        detail: sourceServerPath,
+      },
+      input2: {
+        uri: targetUri,
+        title: '目标分支',
+        description: path.posix.basename(targetServerPath),
+        detail: targetServerPath,
+      },
+      output: resultUri,
+    });
+    try {
+      await vscode.commands.executeCommand('merge.mixedLayout');
+    } catch {
+      // Older VS Code builds may not expose the layout command; the merge editor still opened.
+    }
+  } catch (error) {
+    throw new Error(
+      `无法打开 VS Code 原生 Merge Editor：${getErrorMessage(error)}。已停止使用旧的自研三栏合并面板，请升级 VS Code 或检查内置 Merge Editor 是否可用。`,
+    );
+  }
 
   const doc = await vscode.workspace.openTextDocument(resultUri);
-  await vscode.window.showTextDocument(doc, {
-    preview: false,
-    viewColumn: vscode.ViewColumn.Active,
-  });
 
   for (;;) {
     const action = await vscode.window.showInformationMessage(
-      '已打开 VS Code 原生冲突文件。使用编辑器中的 Accept Current / Incoming / Both 或直接编辑，保存后点击使用当前内容。',
+      '已打开 VS Code Merge Editor。左侧为源分支，右侧为目标分支，下方为合并结果；逐块采用源/目标并保存后点击使用当前结果。',
       '使用当前内容',
       '取消',
     );
@@ -1344,27 +1685,6 @@ async function openNativeConflictEditor(
   }
 }
 
-function buildConflictMarkerContent(
-  sourceContent: string,
-  targetContent: string,
-  sourceServerPath: string,
-  targetServerPath: string,
-): string {
-  const eol = sourceContent.includes('\r\n') || targetContent.includes('\r\n') ? '\r\n' : '\n';
-  return [
-    `<<<<<<< 源分支 ${sourceServerPath}`,
-    trimTrailingLineBreak(sourceContent),
-    '=======',
-    trimTrailingLineBreak(targetContent),
-    `>>>>>>> 目标分支 ${targetServerPath}`,
-    '',
-  ].join(eol);
-}
-
-function trimTrailingLineBreak(value: string): string {
-  return value.replace(/(?:\r\n|\r|\n)+$/u, '');
-}
-
 function hasConflictMarkers(value: string): boolean {
   return /(^|\n)<<<<<<< .+(\r?\n)/u.test(value)
     || /(^|\n)=======(\r?\n)/u.test(value)
@@ -1374,279 +1694,6 @@ function hasConflictMarkers(value: string): boolean {
 function sanitizeLocalFileName(value: string): string {
   const sanitized = value.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').trim();
   return sanitized || 'merge.txt';
-}
-
-function openManualMergePanel(
-  title: string,
-  sourceContent: string,
-  targetContent: string,
-  initialResult: string,
-  sourceBranchPath: string,
-  targetBranchPath: string,
-): Promise<string | undefined> {
-  const panel = vscode.window.createWebviewPanel(
-    'armTfsManualMerge',
-    title,
-    vscode.ViewColumn.Active,
-    {
-      enableScripts: true,
-      retainContextWhenHidden: true,
-    },
-  );
-  const nonce = getNonce();
-  panel.webview.html = renderManualMergeHtml(panel.webview, nonce, sourceContent, targetContent, initialResult, sourceBranchPath, targetBranchPath);
-
-  return new Promise((resolve) => {
-    const disposable = panel.webview.onDidReceiveMessage((message: { type: string; content?: string }) => {
-      if (message.type === 'save') {
-        disposable.dispose();
-        resolve(message.content ?? '');
-        panel.dispose();
-      }
-      if (message.type === 'cancel') {
-        disposable.dispose();
-        resolve(undefined);
-        panel.dispose();
-      }
-    });
-    panel.onDidDispose(() => {
-      disposable.dispose();
-      resolve(undefined);
-    });
-  });
-}
-
-function renderManualMergeHtml(
-  webview: vscode.Webview,
-  nonce: string,
-  sourceContent: string,
-  targetContent: string,
-  initialResult: string,
-  sourceBranchPath: string,
-  targetBranchPath: string,
-): string {
-  const csp = [
-    `default-src 'none'`,
-    `style-src ${webview.cspSource} 'unsafe-inline'`,
-    `script-src 'nonce-${nonce}'`,
-  ].join('; ');
-
-  // Embed content safely into <script>: JSON-encode then break any </script> sequence.
-  const sourceJson = JSON.stringify(sourceContent).replace(/</g, '\\u003c');
-  const targetJson = JSON.stringify(targetContent).replace(/</g, '\\u003c');
-  const initialJson = JSON.stringify(initialResult).replace(/</g, '\\u003c');
-  const sourceBranch = escapeHtml(sourceBranchPath);
-  const targetBranch = escapeHtml(targetBranchPath);
-
-  return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="${csp}">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    :root {
-      --bg: var(--vscode-editor-background);
-      --fg: var(--vscode-editor-foreground);
-      --muted: var(--vscode-descriptionForeground);
-      --border: var(--vscode-panel-border);
-      --button: var(--vscode-button-background);
-      --button-fg: var(--vscode-button-foreground);
-      --add-bg: var(--vscode-diffEditor-insertedTextBackground, rgba(0,180,0,0.15));
-      --del-bg: var(--vscode-diffEditor-removedTextBackground, rgba(255,0,0,0.15));
-      --add-line: var(--vscode-diffEditorGutter-insertedLineBackground, rgba(0,180,0,0.25));
-      --del-line: var(--vscode-diffEditorGutter-removedLineBackground, rgba(255,0,0,0.25));
-      --conflict: var(--vscode-editorWarning-foreground, #cca700);
-    }
-    * { box-sizing: border-box; }
-    body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); }
-    header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
-    h1 { margin: 0; font-size: 16px; }
-    .header-actions { display: flex; gap: 8px; align-items: center; }
-    button { border: 1px solid var(--border); background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); min-height: 28px; padding: 4px 10px; cursor: pointer; font: inherit; border-radius: 2px; }
-    button.primary { background: var(--button); color: var(--button-fg); border-color: var(--button); }
-    button.active { background: var(--button); color: var(--button-fg); border-color: var(--button); }
-    .grid { display: grid; grid-template-rows: minmax(200px, 0.9fr) auto minmax(180px, 0.8fr); height: calc(100vh - 52px); }
-    .top { display: grid; grid-template-columns: 1fr 1fr; min-height: 0; border-bottom: 1px solid var(--border); }
-    section { min-width: 0; min-height: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
-    section:last-child { border-right: 0; }
-    .title { padding: 6px 10px; font-weight: 650; color: var(--muted); border-bottom: 1px solid var(--border); }
-    pre, textarea { margin: 0; flex: 1; min-height: 0; padding: 8px; overflow: auto; white-space: pre; border: 0; outline: 0; color: var(--fg); background: var(--bg); font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); resize: none; }
-    .line { white-space: pre; }
-    .line.del { background: var(--del-bg); border-left: 3px solid var(--del-line); margin-left: -3px; padding-left: 8px; }
-    .line.add { background: var(--add-bg); border-left: 3px solid var(--add-line); margin-left: -3px; padding-left: 8px; }
-    #hunks { overflow: auto; border-bottom: 1px solid var(--border); max-height: 38vh; }
-    .hunk { border-bottom: 1px dashed var(--border); padding: 8px 10px; }
-    .hunk-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 6px; }
-    .hunk-title { color: var(--conflict); font-weight: 650; font-size: 12px; }
-    .hunk-actions { display: flex; gap: 6px; }
-    .hunk-body { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-    .hunk-side { font-family: var(--vscode-editor-font-family); font-size: 12px; white-space: pre; padding: 4px 6px; border-radius: 3px; }
-    .hunk-side.src { background: var(--del-bg); }
-    .hunk-side.tgt { background: var(--add-bg); }
-    .hunk-side .lbl { display:block; font-size: 10px; color: var(--muted); margin-bottom: 2px; }
-    .hunk.resolved .hunk-title { color: var(--muted); }
-    @media (max-width: 900px) { .top { grid-template-columns: 1fr; } .hunk-body { grid-template-columns: 1fr; } }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>手动合并（左：源分支 · 右：目标分支）</h1>
-    <div class="header-actions">
-      <button id="acceptAllSource" title="所有冲突块采用源分支">全部采用源</button>
-      <button id="acceptAllTarget" title="所有冲突块采用目标分支">全部采用目标</button>
-      <button id="cancel">取消</button>
-      <button id="save" class="primary">使用合并结果</button>
-    </div>
-  </header>
-  <main class="grid">
-    <div class="top">
-      <section>
-        <div class="title">源分支文件 · ${sourceBranch}</div>
-        <pre id="sourcePane"></pre>
-      </section>
-      <section>
-        <div class="title">目标分支文件 · ${targetBranch}</div>
-        <pre id="targetPane"></pre>
-      </section>
-    </div>
-    <section id="hunksSection">
-      <div class="title">冲突区块（逐块选择采用哪一侧；下方结果会自动更新）</div>
-      <div id="hunks"></div>
-    </section>
-    <section>
-      <div class="title">合并结果（可手动编辑）</div>
-      <textarea id="result"></textarea>
-    </section>
-  </main>
-  <script nonce="${nonce}">
-    const vscode = acquireVsCodeApi();
-    const sourceText = ${sourceJson};
-    const targetText = ${targetJson};
-    const initialResult = ${initialJson};
-    const sourceLines = sourceText.split('\\n');
-    const targetLines = targetText.split('\\n');
-
-    // LCS diff → ops
-    const n = sourceLines.length, m = targetLines.length;
-    const dp = Array.from({length: n + 1}, () => new Array(m + 1).fill(0));
-    for (let i = n - 1; i >= 0; i--) {
-      for (let j = m - 1; j >= 0; j--) {
-        dp[i][j] = sourceLines[i] === targetLines[j] ? dp[i+1][j+1] + 1 : Math.max(dp[i+1][j], dp[i][j+1]);
-      }
-    }
-    const ops = [];
-    let i = 0, j = 0;
-    while (i < n && j < m) {
-      if (sourceLines[i] === targetLines[j]) { ops.push({t:'eq', s:sourceLines[i]}); i++; j++; }
-      else if (dp[i+1][j] >= dp[i][j+1]) { ops.push({t:'del', s:sourceLines[i]}); i++; }
-      else { ops.push({t:'ins', s:targetLines[j]}); j++; }
-    }
-    while (i < n) { ops.push({t:'del', s:sourceLines[i]}); i++; }
-    while (j < m) { ops.push({t:'ins', s:targetLines[j]}); j++; }
-
-    // group into hunks: runs of del/ins
-    const hunks = [];
-    let k = 0;
-    while (k < ops.length) {
-      if (ops[k].t === 'eq') { k++; continue; }
-      const h = { src: [], tgt: [], choice: null };
-      while (k < ops.length && ops[k].t !== 'eq') {
-        if (ops[k].t === 'del') h.src.push(ops[k].s);
-        else h.tgt.push(ops[k].s);
-        k++;
-      }
-      hunks.push(h);
-    }
-
-    function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-
-    // render side-by-side panes with highlighting
-    const srcHtml = [], tgtHtml = [];
-    for (const op of ops) {
-      if (op.t === 'eq') { srcHtml.push('<span class="line">'+esc(op.s)+'</span>'); tgtHtml.push('<span class="line">'+esc(op.s)+'</span>'); }
-      else if (op.t === 'del') { srcHtml.push('<span class="line del">'+esc(op.s)+'</span>'); }
-      else { tgtHtml.push('<span class="line add">'+esc(op.s)+'</span>'); }
-    }
-    document.getElementById('sourcePane').innerHTML = srcHtml.join('\\n');
-    document.getElementById('targetPane').innerHTML = tgtHtml.join('\\n');
-
-    // build result from ops + hunk choices (unresolved hunks become conflict markers)
-    function buildResult() {
-      const result = [];
-      let p = 0;
-      let h = 0;
-      while (p < ops.length) {
-        if (ops[p].t === 'eq') { result.push(ops[p].s); p++; continue; }
-        const cur = hunks[h]; h++;
-        const c = cur.choice;
-        if (c === 'source') result.push(...cur.src);
-        else if (c === 'target') result.push(...cur.tgt);
-        else if (c === 'both') { result.push(...cur.src); result.push(...cur.tgt); }
-        else {
-          result.push('<<<<<<< 源分支');
-          result.push(...cur.src);
-          result.push('=======');
-          result.push(...cur.tgt);
-          result.push('>>>>>>> 目标分支');
-        }
-        while (p < ops.length && ops[p].t !== 'eq') p++;
-      }
-      return result.join('\\n');
-    }
-
-    function renderHunks() {
-      const box = document.getElementById('hunks');
-      if (hunks.length === 0) { box.innerHTML = '<div style="padding:12px;color:var(--muted)">两侧内容相同，没有冲突区块。</div>'; return; }
-      box.innerHTML = hunks.map((h, idx) => {
-        const choice = h.choice;
-        const srcPre = h.src.length ? esc(h.src.join('\\n')) : '(无)';
-        const tgtPre = h.tgt.length ? esc(h.tgt.join('\\n')) : '(无)';
-        return '<div class="hunk ' + (choice ? 'resolved' : '') + '" data-idx="'+idx+'">'
-          + '<div class="hunk-head"><span class="hunk-title">冲突 #' + (idx+1) + (choice ? ' · 已采用 '+({source:'源',target:'目标',both:'两者'}[choice]) : '') + '</span>'
-          + '<span class="hunk-actions">'
-          + '<button data-hunk="'+idx+'" data-choice="source" class="'+(choice==='source'?'active':'')+'">采用源</button>'
-          + '<button data-hunk="'+idx+'" data-choice="target" class="'+(choice==='target'?'active':'')+'">采用目标</button>'
-          + '<button data-hunk="'+idx+'" data-choice="both" class="'+(choice==='both'?'active':'')+'">两者都采用</button>'
-          + '</span></div>'
-          + '<div class="hunk-body"><div class="hunk-side src"><span class="lbl">源分支</span>'+srcPre+'</div><div class="hunk-side tgt"><span class="lbl">目标分支</span>'+tgtPre+'</div></div>'
-          + '</div>';
-      }).join('');
-      box.querySelectorAll('button[data-hunk]').forEach((b) => {
-        b.addEventListener('click', () => {
-          const idx = Number(b.dataset.hunk);
-          hunks[idx].choice = b.dataset.choice;
-          renderHunks();
-          document.getElementById('result').value = buildResult();
-        });
-      });
-    }
-
-    // initialize: if re-opening with saved content, use it; else build with conflict markers
-    if (initialResult && initialResult.length) {
-      document.getElementById('result').value = initialResult;
-    } else {
-      document.getElementById('result').value = buildResult();
-    }
-    renderHunks();
-
-    document.getElementById('acceptAllSource').addEventListener('click', () => {
-      hunks.forEach((h) => { h.choice = 'source'; });
-      renderHunks();
-      document.getElementById('result').value = buildResult();
-    });
-    document.getElementById('acceptAllTarget').addEventListener('click', () => {
-      hunks.forEach((h) => { h.choice = 'target'; });
-      renderHunks();
-      document.getElementById('result').value = buildResult();
-    });
-    document.getElementById('cancel').addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
-    document.getElementById('save').addEventListener('click', () => {
-      vscode.postMessage({ type: 'save', content: document.getElementById('result').value });
-    });
-  </script>
-</body>
-</html>`;
 }
 
 function getNonce(): string {
