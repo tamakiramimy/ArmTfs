@@ -3,6 +3,7 @@ using ArmTfs.Core.Models;
 using ArmTfs.Core.Workspace;
 using Microsoft.TeamFoundation.SourceControl.WebApi;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace ArmTfs.Core.Client;
 
@@ -461,6 +462,7 @@ public sealed class TfvcClientService
     /// Revert a server path to the exact state at a specific changeset version.
     /// Compares file trees at the target version and the current (latest) version,
     /// then creates one atomic changeset that makes them match.
+    /// Uses proper diff (Delete/Add/Edit) and retries excluding files with pending changes.
     /// </summary>
     public async Task<TfvcChangesetRef> RevertToVersionAsync(
         string serverPath,
@@ -469,99 +471,107 @@ public sealed class TfvcClientService
         CancellationToken ct = default)
     {
         var normalizedPath = NormalizeServerPath(serverPath);
+        var client = _connection.GetTfvcClient();
 
         var effectiveComment = string.IsNullOrWhiteSpace(comment)
             ? $"Revert {normalizedPath} to version cs{targetChangesetId}"
             : comment.Trim();
 
-        // Get ALL files at target version (the snapshot we want to restore to)
+        // Get ALL files at target version
         var targetItems = await GetItemsAsync(normalizedPath, recursive: true, atChangeset: targetChangesetId, ct: ct).ConfigureAwait(false);
-
-        // Get ALL files at current (latest) version
+        // Get ALL files at current version
         var currentItems = await GetItemsAsync(normalizedPath, recursive: true, atChangeset: null, ct: ct).ConfigureAwait(false);
 
         var targetFiles = targetItems
             .Where(i => !i.IsFolder)
             .ToDictionary(i => i.ServerPath, StringComparer.OrdinalIgnoreCase);
-
         var currentFiles = currentItems
             .Where(i => !i.IsFolder)
             .ToDictionary(i => i.ServerPath, StringComparer.OrdinalIgnoreCase);
 
+        // Build change list: make current state match target state
         var changes = new List<TfvcChange>();
 
-        // Delete ALL current files
+        // Files in current but NOT in target -> Delete
         foreach (var (path, item) in currentFiles)
         {
-            changes.Add(new TfvcChange
+            if (!targetFiles.ContainsKey(path))
             {
-                Item = new TfvcItem { Path = path, ChangesetVersion = item.ChangesetId },
-                ChangeType = VersionControlChangeType.Delete,
-            });
+                changes.Add(new TfvcChange
+                {
+                    Item = new TfvcItem { Path = path, ChangesetVersion = item.ChangesetId },
+                    ChangeType = VersionControlChangeType.Delete,
+                });
+            }
         }
 
-        // Add ALL files from target version
+        // Files in target but NOT in current -> Add
         foreach (var (path, item) in targetFiles)
         {
-            var content = await DownloadFileContentAsync(path, targetChangesetId, ct).ConfigureAwait(false);
-            changes.Add(BuildTfvcChange(path, VersionControlChangeType.Add, content, null));
+            if (!currentFiles.ContainsKey(path))
+            {
+                var content = await DownloadFileContentAsync(path, targetChangesetId, ct).ConfigureAwait(false);
+                changes.Add(BuildTfvcChange(path, VersionControlChangeType.Add, content, null));
+            }
+        }
+
+        // Files in BOTH -> Edit (overwrite with target content if different)
+        foreach (var (path, targetItem) in targetFiles)
+        {
+            if (!currentFiles.TryGetValue(path, out var currentItem)) continue;
+            if (targetItem.ChangesetId == currentItem.ChangesetId) continue; // Same version, skip
+
+            byte[] targetContent;
+            byte[] currentContent;
+            try
+            {
+                targetContent = await DownloadFileContentAsync(path, targetChangesetId, ct).ConfigureAwait(false);
+                currentContent = await DownloadFileContentAsync(path, null, ct).ConfigureAwait(false);
+            }
+            catch { continue; }
+
+            if (ContentEquals(targetContent, currentContent)) continue;
+            changes.Add(BuildTfvcChange(path, VersionControlChangeType.Edit, targetContent, currentItem.ChangesetId));
         }
 
         if (changes.Count == 0)
-            throw new InvalidOperationException($"No files found at cs{targetChangesetId} for path {normalizedPath}.");
+            throw new InvalidOperationException($"Already at target state (cs{targetChangesetId}).");
 
-        // Use REST CreateChangeset - but if it fails due to pending changes,
-        // retry by excluding the problematic files and noting them in the comment.
-        var client = _connection.GetTfvcClient();
-        try
+        // Try to submit. If pending changes block it, retry excluding problematic files.
+        var skippedFiles = new List<string>();
+        for (int attempt = 0; attempt < 5; attempt++)
         {
-            var changeset = new TfvcChangeset { Comment = effectiveComment, Changes = changes };
-            return await client.CreateChangesetAsync(changeset, cancellationToken: ct).ConfigureAwait(false);
+            try
+            {
+                var submitComment = skippedFiles.Count > 0
+                    ? $"{effectiveComment} [skipped {skippedFiles.Count} file(s) with pending changes]"
+                    : effectiveComment;
+                var changeset = new TfvcChangeset { Comment = submitComment, Changes = changes };
+                return await client.CreateChangesetAsync(changeset, cancellationToken: ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex.Message.Contains("挂起的更改") || ex.Message.Contains("pending change"))
+            {
+                // Extract the blocking file path from error message
+                // Pattern: "项 $/path/to/file 已有挂起的更改"
+                var match = Regex.Match(
+                    ex.Message, @"项\s+(.*?)\s+已有挂起的更改");
+                if (!match.Success) throw;
+
+                var blockedPath = match.Groups[1].Value.Trim();
+                skippedFiles.Add(blockedPath);
+
+                // Remove ALL changes related to this path
+                changes.RemoveAll(c =>
+                    string.Equals(c.Item?.Path, blockedPath, StringComparison.OrdinalIgnoreCase));
+
+                if (changes.Count == 0)
+                    throw new InvalidOperationException(
+                        $"All changes blocked by pending changes. Blocked files: {string.Join(", ", skippedFiles)}");
+            }
         }
-        catch (Exception ex) when (ex.Message.Contains("挂起的更改") || ex.Message.Contains("pending change"))
-        {
-            // Retry without the conflicting files - find which files are blocked
-            // by removing files one at a time is too slow. Instead, use Edit instead of Delete+Add
-            // for files that exist in both versions.
-            var retryChanges = new List<TfvcChange>();
 
-            // For files only in current (not in target) -> Delete
-            foreach (var (path, item) in currentFiles)
-            {
-                if (!targetFiles.ContainsKey(path))
-                {
-                    retryChanges.Add(new TfvcChange
-                    {
-                        Item = new TfvcItem { Path = path, ChangesetVersion = item.ChangesetId },
-                        ChangeType = VersionControlChangeType.Delete,
-                    });
-                }
-            }
-
-            // For files only in target (not in current) -> Add
-            foreach (var (path, item) in targetFiles)
-            {
-                if (!currentFiles.ContainsKey(path))
-                {
-                    var content = await DownloadFileContentAsync(path, targetChangesetId, ct).ConfigureAwait(false);
-                    retryChanges.Add(BuildTfvcChange(path, VersionControlChangeType.Add, content, null));
-                }
-            }
-
-            // For files in both -> Edit (overwrite with target version content)
-            foreach (var (path, targetItem) in targetFiles)
-            {
-                if (!currentFiles.TryGetValue(path, out var currentItem)) continue;
-                var content = await DownloadFileContentAsync(path, targetChangesetId, ct).ConfigureAwait(false);
-                retryChanges.Add(BuildTfvcChange(path, VersionControlChangeType.Edit, content, currentItem.ChangesetId));
-            }
-
-            if (retryChanges.Count == 0)
-                throw;
-
-            var retryChangeset = new TfvcChangeset { Comment = effectiveComment + " [retry: edit-mode]", Changes = retryChanges };
-            return await client.CreateChangesetAsync(retryChangeset, cancellationToken: ct).ConfigureAwait(false);
-        }
+        throw new InvalidOperationException(
+            $"Too many files with pending changes. Skipped: {string.Join(", ", skippedFiles)}");
     }
 
     /// <summary>
