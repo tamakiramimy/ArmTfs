@@ -2061,6 +2061,7 @@ public sealed class TfvcClientService
 
             var resolvedConflictChanges = new List<MergeExecutionChange>();
             var hasUnresolvedConflicts = false;
+            var manualContentFiles = new List<(string TargetPath, byte[] Content)>();
 
             if (pendResult.Conflicts.Count > 0)
             {
@@ -2083,12 +2084,6 @@ public sealed class TfvcClientService
 
                         if (choice == "manual")
                         {
-                            if (string.IsNullOrEmpty(resolution.ContentBase64))
-                            {
-                                unresolvedConflicts.Add(conflict);
-                                continue;
-                            }
-
                             var manualConflictId = await ResolveSoapConflictIdAsync(
                                 soap, createdWs.Name, createdWs.Owner, conflict, normalizedTarget, ct).ConfigureAwait(false);
                             if (manualConflictId <= 0)
@@ -2097,19 +2092,14 @@ public sealed class TfvcClientService
                                 continue;
                             }
 
-                            // Write manual content to workspace-mapped path so SOAP Resolve accepts it
-                            var targetLocalRoot = System.IO.Path.Combine(mergeTempRoot, "target");
-                            var relativePath = conflict.TargetServerItem.StartsWith(normalizedTarget, StringComparison.OrdinalIgnoreCase)
-                                ? conflict.TargetServerItem.Substring(normalizedTarget.Length).TrimStart('/')
-                                : System.IO.Path.GetFileName(conflict.TargetServerItem);
-                            var localFilePath = System.IO.Path.Combine(targetLocalRoot, relativePath.Replace('/', System.IO.Path.DirectorySeparatorChar));
-
-                            var manualContent = Convert.FromBase64String(resolution.ContentBase64);
-                            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(localFilePath)!);
-                            await File.WriteAllBytesAsync(localFilePath, manualContent, ct).ConfigureAwait(false);
-
+                            // Use AcceptTheirs first (makes CheckIn succeed), then apply manual content after
                             await soap.ResolveConflictAsync(
-                                createdWs.Name, createdWs.Owner, manualConflictId, "AcceptMerge", newPath: localFilePath, ct: ct).ConfigureAwait(false);
+                                createdWs.Name, createdWs.Owner, manualConflictId, "AcceptTheirs", ct: ct).ConfigureAwait(false);
+
+                            if (!string.IsNullOrEmpty(resolution.ContentBase64))
+                            {
+                                manualContentFiles.Add((conflict.TargetServerItem, Convert.FromBase64String(resolution.ContentBase64)));
+                            }
                             continue;
                         }
 
