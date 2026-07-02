@@ -469,16 +469,15 @@ public sealed class TfvcClientService
         CancellationToken ct = default)
     {
         var normalizedPath = NormalizeServerPath(serverPath);
-        var client = _connection.GetTfvcClient();
 
         var effectiveComment = string.IsNullOrWhiteSpace(comment)
             ? $"Revert {normalizedPath} to version cs{targetChangesetId}"
             : comment.Trim();
 
-        // Step 1: Get ALL files at target version (the snapshot we want to restore to)
+        // Get ALL files at target version (the snapshot we want to restore to)
         var targetItems = await GetItemsAsync(normalizedPath, recursive: true, atChangeset: targetChangesetId, ct: ct).ConfigureAwait(false);
 
-        // Step 2: Get ALL files at current (latest) version
+        // Get ALL files at current (latest) version
         var currentItems = await GetItemsAsync(normalizedPath, recursive: true, atChangeset: null, ct: ct).ConfigureAwait(false);
 
         var targetFiles = targetItems
@@ -491,7 +490,7 @@ public sealed class TfvcClientService
 
         var changes = new List<TfvcChange>();
 
-        // Step 3: Delete ALL current files (full wipe)
+        // Delete ALL current files
         foreach (var (path, item) in currentFiles)
         {
             changes.Add(new TfvcChange
@@ -501,7 +500,7 @@ public sealed class TfvcClientService
             });
         }
 
-        // Step 4: Add ALL files from target version (full restore)
+        // Add ALL files from target version
         foreach (var (path, item) in targetFiles)
         {
             var content = await DownloadFileContentAsync(path, targetChangesetId, ct).ConfigureAwait(false);
@@ -511,8 +510,58 @@ public sealed class TfvcClientService
         if (changes.Count == 0)
             throw new InvalidOperationException($"No files found at cs{targetChangesetId} for path {normalizedPath}.");
 
-        var changeset = new TfvcChangeset { Comment = effectiveComment, Changes = changes };
-        return await client.CreateChangesetAsync(changeset, cancellationToken: ct).ConfigureAwait(false);
+        // Use REST CreateChangeset - but if it fails due to pending changes,
+        // retry by excluding the problematic files and noting them in the comment.
+        var client = _connection.GetTfvcClient();
+        try
+        {
+            var changeset = new TfvcChangeset { Comment = effectiveComment, Changes = changes };
+            return await client.CreateChangesetAsync(changeset, cancellationToken: ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex.Message.Contains("挂起的更改") || ex.Message.Contains("pending change"))
+        {
+            // Retry without the conflicting files - find which files are blocked
+            // by removing files one at a time is too slow. Instead, use Edit instead of Delete+Add
+            // for files that exist in both versions.
+            var retryChanges = new List<TfvcChange>();
+
+            // For files only in current (not in target) -> Delete
+            foreach (var (path, item) in currentFiles)
+            {
+                if (!targetFiles.ContainsKey(path))
+                {
+                    retryChanges.Add(new TfvcChange
+                    {
+                        Item = new TfvcItem { Path = path, ChangesetVersion = item.ChangesetId },
+                        ChangeType = VersionControlChangeType.Delete,
+                    });
+                }
+            }
+
+            // For files only in target (not in current) -> Add
+            foreach (var (path, item) in targetFiles)
+            {
+                if (!currentFiles.ContainsKey(path))
+                {
+                    var content = await DownloadFileContentAsync(path, targetChangesetId, ct).ConfigureAwait(false);
+                    retryChanges.Add(BuildTfvcChange(path, VersionControlChangeType.Add, content, null));
+                }
+            }
+
+            // For files in both -> Edit (overwrite with target version content)
+            foreach (var (path, targetItem) in targetFiles)
+            {
+                if (!currentFiles.TryGetValue(path, out var currentItem)) continue;
+                var content = await DownloadFileContentAsync(path, targetChangesetId, ct).ConfigureAwait(false);
+                retryChanges.Add(BuildTfvcChange(path, VersionControlChangeType.Edit, content, currentItem.ChangesetId));
+            }
+
+            if (retryChanges.Count == 0)
+                throw;
+
+            var retryChangeset = new TfvcChangeset { Comment = effectiveComment + " [retry: edit-mode]", Changes = retryChanges };
+            return await client.CreateChangesetAsync(retryChangeset, cancellationToken: ct).ConfigureAwait(false);
+        }
     }
 
     /// <summary>
