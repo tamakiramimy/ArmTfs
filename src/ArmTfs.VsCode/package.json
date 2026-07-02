@@ -803,6 +803,11 @@
           "group": "context@1"
         },
         {
+          "command": "armTfs.rollback",
+          "when": "view == armTfs.historyGraph && viewItem == armTfsSidebarChangeset",
+          "group": "context@2"
+        },
+        {
           "command": "armTfs.sidebar.useMergeTarget",
           "when": "view == armTfs.merge && viewItem == armTfsMergeTargetOption",
           "group": "context@1"

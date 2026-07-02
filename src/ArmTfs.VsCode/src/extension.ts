@@ -601,11 +601,18 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   // ─── 回滚指定 changeset ────────────────────────────────────────────────
   register('armTfs.rollback', async (input) => {
     const csRaw = readStringOption(input, 'changesetId')
+      ?? ((input as any)?.item?.changesetId != null ? String((input as any).item.changesetId) : undefined)
       ?? await promptPath(t('extension.prompt.rollbackChangesetId'), '');
     if (!csRaw) { return; }
     const cs = Number.parseInt(csRaw.replace(/^C/i, ''), 10);
     if (Number.isNaN(cs)) { return; }
-    const comment = await promptPath(t('extension.prompt.rollbackComment'), '') ?? '';
+    const confirm = await vscode.window.showWarningMessage(
+      `确定要回滚 cs${cs} 吗？将创建一个反向changeset来撤销该变更。`,
+      { modal: true },
+      '确定回滚',
+    );
+    if (confirm !== '确定回滚') { return; }
+    const comment = await promptPath(t('extension.prompt.rollbackComment'), `Rollback cs${cs}`) ?? '';
     return runAndShowText(t('extension.operation.rollback'), output, () =>
       client.rollback(cs, comment.trim() || undefined));
   });
