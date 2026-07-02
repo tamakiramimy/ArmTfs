@@ -321,6 +321,63 @@ export class ArmTfsMergeWorkbench {
       return;
     }
 
+    // Prefer range merge when multiple contiguous changesets are selected (faster, atomic)
+    if (selected.length >= 2) {
+      const ids = selected.map((c) => c.changesetId);
+      const from = Math.min(...ids);
+      const to = Math.max(...ids);
+      try {
+        const response = await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: `arm-tfs merge range cs${from}~cs${to}`,
+          },
+          async (progress) => {
+            progress.report({ message: 'server range merge' });
+            return this.client.mergeExecuteRangeJson(
+              this.state.sourcePath,
+              this.state.targetPath,
+              from,
+              to,
+              { comment: comment.trim() || undefined },
+            );
+          },
+        );
+
+        this.output.appendLine('> arm-tfs merge execute range');
+        this.output.appendLine(summarizeMergeResponse(response));
+        this.output.appendLine('');
+
+        const conflictChanges = response.result.changes.filter((c) => c.status.toLowerCase() === 'conflict');
+        if (conflictChanges.length > 0) {
+          this.mergeRangeConflicts(conflictChanges);
+          this.render();
+          void vscode.window.showWarningMessage(
+            `cs${from}~cs${to} 合并中止：服务器检测到冲突，已列入冲突列表。请解决后重试。`,
+          );
+        } else if (response.result.createdChangesetId !== null && response.result.createdChangesetId !== undefined) {
+          await this.refreshAfterExecute();
+          void vscode.window.showInformationMessage(
+            t('merge.execute.success', {
+              count: selected.length,
+              created: `cs${response.result.createdChangesetId}`,
+            }),
+          );
+          this.panel.dispose();
+        } else {
+          await this.refreshAfterExecute();
+          void vscode.window.showWarningMessage(
+            t('merge.execute.noChange', {
+              changesets: selected.map((id) => `cs${id.changesetId}`).join(', '),
+            }),
+          );
+        }
+      } catch (error) {
+        this.showError('arm-tfs merge execute range', error);
+      }
+      return;
+    }
+
     const outputs: string[] = [];
     const createdIds: number[] = [];
     const noChangeIds: number[] = [];
@@ -1284,6 +1341,9 @@ async function readServerText(client: ArmTfsCliClient, serverPath: string, versi
 }
 
 let mergeToolbarDisposables: vscode.Disposable[] = [];
+let mergeCompleteHandler: (() => void) | undefined;
+let mergeUndoHandler: (() => void) | undefined;
+let mergeCommandsRegistered = false;
 
 async function openNativeMergeWithToolbar(
   sourceContent: string,
@@ -1334,33 +1394,39 @@ async function openNativeMergeWithToolbar(
 
   const doc = await vscode.workspace.openTextDocument(resultUri);
 
-  // Dispose any previous merge toolbar (commands + status bar items) before re-registering
+  // Dispose any previous toolbar UI
   for (const d of mergeToolbarDisposables) d.dispose();
   mergeToolbarDisposables = [];
 
-  return new Promise<string | undefined>((resolve) => {
-    const disposables: vscode.Disposable[] = [];
+  // Register commands only once (reuse across multiple opens)
+  if (!mergeCommandsRegistered) {
+    mergeCommandsRegistered = true;
+    vscode.commands.registerCommand('armTfs.mergeConflict.complete', () => {
+      mergeCompleteHandler?.();
+    });
+    vscode.commands.registerCommand('armTfs.mergeConflict.undo', () => {
+      mergeUndoHandler?.();
+    });
+  }
 
+  return new Promise<string | undefined>((resolve) => {
     const cleanup = () => {
-      for (const d of disposables) d.dispose();
-      disposables.length = 0;
+      mergeCompleteHandler = undefined;
+      mergeUndoHandler = undefined;
       for (const d of mergeToolbarDisposables) d.dispose();
       mergeToolbarDisposables = [];
     };
 
-    // Register commands FIRST
-    const cmdComplete = vscode.commands.registerCommand('armTfs.mergeConflict.complete', async () => {
+    mergeCompleteHandler = async () => {
       await doc.save();
       const content = await fs.readFile(resultPath, 'utf8');
       cleanup();
       resolve(content);
-    });
-    const cmdUndo = vscode.commands.registerCommand('armTfs.mergeConflict.undo', () => {
+    };
+    mergeUndoHandler = () => {
       cleanup();
       resolve(undefined);
-    });
-    disposables.push(cmdComplete, cmdUndo);
-    mergeToolbarDisposables.push(cmdComplete, cmdUndo);
+    };
 
     // Then create status bar items that reference the commands
     const prevBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 1000);
@@ -1396,14 +1462,13 @@ async function openNativeMergeWithToolbar(
     mergeToolbarDisposables.push(prevBtn, nextBtn, countItem, completeBtn, undoBtn);
 
     // Handle editor close
-    disposables.push(
-      vscode.workspace.onDidCloseTextDocument((closed) => {
-        if (closed.uri.fsPath === resultUri.fsPath) {
-          cleanup();
-          resolve(undefined);
-        }
-      }),
-    );
+    const closeWatcher = vscode.workspace.onDidCloseTextDocument((closed) => {
+      if (closed.uri.fsPath === resultUri.fsPath) {
+        cleanup();
+        resolve(undefined);
+      }
+    });
+    mergeToolbarDisposables.push(closeWatcher);
   });
 }
 
