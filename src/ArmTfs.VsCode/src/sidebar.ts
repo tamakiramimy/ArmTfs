@@ -240,6 +240,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       vscode.commands.registerCommand('armTfs.sidebar.openLocalPath', async (node?: BranchNode | ServerExplorerNode) => this.openLocalPath(node)),
       vscode.commands.registerCommand('armTfs.sidebar.pullBranch', async (node?: BranchNode | ServerExplorerNode) => this.pullBranch(node)),
       vscode.commands.registerCommand('armTfs.sidebar.cleanGet', async (node?: BranchNode | ServerExplorerNode) => this.cleanGet(node)),
+      vscode.commands.registerCommand('armTfs.sidebar.forceMerge', async (node?: BranchNode | ServerExplorerNode) => this.forceMergeFromBranch(node)),
       vscode.commands.registerCommand('armTfs.sidebar.checkoutBranch', async (node?: BranchNode | ServerExplorerNode) => this.checkoutBranch(node)),
       vscode.commands.registerCommand('armTfs.sidebar.showBranchHistory', async (node?: BranchNode | ServerExplorerNode) => this.showBranchHistory(node)),
       vscode.commands.registerCommand('armTfs.sidebar.mergeFromBranch', async (node?: BranchNode | ServerExplorerNode) => this.mergeFromBranch(node)),
@@ -1002,6 +1003,53 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     }
   }
 
+  private async forceMergeFromBranch(node?: BranchNode | ServerExplorerNode): Promise<void> {
+    const sourcePath = getNodeServerPath(node);
+    if (!sourcePath) {
+      void vscode.window.showWarningMessage(t('sidebar.warning.selectSourceBranch'));
+      return;
+    }
+
+    const targetBranches = await this.getMergeTargetBranchPaths(sourcePath);
+    if (!targetBranches.length) {
+      void vscode.window.showWarningMessage(t('sidebar.merge.noTargets'));
+      return;
+    }
+
+    const target = await vscode.window.showQuickPick(
+      targetBranches.map((targetPath) => ({
+        label: path.posix.basename(targetPath),
+        description: targetPath,
+        targetPath,
+      })),
+      { placeHolder: t('sidebar.merge.pickTarget') },
+    );
+    if (!target) { return; }
+
+    const top = getConfigValue<number>('merge.candidateTop', 20);
+    const scan = getConfigValue<number>('merge.candidateScan', 80);
+    try {
+      const response = await this.client.mergeCandidates(sourcePath, target.targetPath, top, scan, true);
+      if (!response.items.length) {
+        void vscode.window.showInformationMessage('源分支没有任何变更集。');
+        return;
+      }
+      await ArmTfsMergeWorkbench.open(
+        this.client,
+        this.output,
+        sourcePath,
+        target.targetPath,
+        response,
+        async () => {
+          await this.refreshScm();
+          await this.refreshAll();
+        },
+      );
+    } catch (error) {
+      this.showError('arm-tfs force merge', error);
+    }
+  }
+
   private async checkoutBranch(node?: BranchNode | ServerExplorerNode): Promise<void> {
     const mapped = this.resolveMappedBranchPath(node, 'checkout');
     if (!mapped) {
@@ -1086,28 +1134,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     try {
       const response = await this.client.mergeCandidates(sourcePath, target.targetPath, top, scan);
       if (!response.items.length) {
-        const forceAction = await vscode.window.showWarningMessage(
-          '没有合并候选。可能是因为这些变更集已有合并记录（例如之前合并后回滚了）。\n\n是否忽略合并历史，强制显示所有源分支变更集？',
-          '强制查询',
-          '取消',
-        );
-        if (forceAction !== '强制查询') { return; }
-        const forceResponse = await this.client.mergeCandidates(sourcePath, target.targetPath, top, scan, true);
-        if (!forceResponse.items.length) {
-          void vscode.window.showInformationMessage('源分支没有任何变更集。');
-          return;
-        }
-        await ArmTfsMergeWorkbench.open(
-          this.client,
-          this.output,
-          sourcePath,
-          target.targetPath,
-          forceResponse,
-          async () => {
-            await this.refreshScm();
-            await this.refreshAll();
-          },
-        );
+        void vscode.window.showInformationMessage(t('sidebar.noMergeCandidates'));
         return;
       }
       await ArmTfsMergeWorkbench.open(

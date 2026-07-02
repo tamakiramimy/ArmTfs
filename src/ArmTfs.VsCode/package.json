@@ -407,6 +407,12 @@
         "icon": "$(sync)"
       },
       {
+        "command": "armTfs.sidebar.forceMerge",
+        "title": "%command.sidebarForceMerge%",
+        "category": "arm-tfs",
+        "icon": "$(git-merge)"
+      },
+      {
         "command": "armTfs.sidebar.checkoutBranch",
         "title": "%command.sidebarCheckoutBranch%",
         "category": "arm-tfs",
@@ -847,6 +853,11 @@
           "command": "armTfs.sidebar.mergeFromBranch",
           "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
           "group": "2_branch@1"
+        },
+        {
+          "command": "armTfs.sidebar.forceMerge",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "2_branch@2"
         },
         {
           "command": "armTfs.sidebar.addBranch",

@@ -455,7 +455,7 @@ export class ArmTfsMergeWorkbench {
     try {
       const [source, target] = await Promise.all([
         readServerText(this.client, change.sourceServerPath, change.sourceChangesetId),
-        change.targetExists ? readServerText(this.client, change.targetServerPath) : Promise.resolve(''),
+        change.targetExists !== false ? readServerText(this.client, change.targetServerPath).catch(() => '') : Promise.resolve(''),
       ]);
       const content = await openNativeMergeWithToolbar(
         source,
