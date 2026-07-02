@@ -2,6 +2,7 @@ using ArmTfs.Core.Client.Soap;
 using ArmTfs.Core.Models;
 using ArmTfs.Core.Workspace;
 using Microsoft.TeamFoundation.SourceControl.WebApi;
+using Microsoft.VisualStudio.Services.WebApi;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -43,33 +44,18 @@ public sealed class TfvcClientService
         CancellationToken ct = default,
         bool oneLevelOnly = false)
     {
-        var client = _connection.GetTfvcClient();
-        VersionControlRecursionType recursion;
-        if (oneLevelOnly)
-            recursion = VersionControlRecursionType.OneLevel;
-        else if (recursive)
-            recursion = VersionControlRecursionType.Full;
-        else
-            recursion = VersionControlRecursionType.None;
-
-        TfvcVersionDescriptor? version = atChangeset.HasValue
-            ? new TfvcVersionDescriptor { VersionType = TfvcVersionType.Changeset, Version = atChangeset.Value.ToString() }
-            : null;
-
-        var items = await client.GetItemsAsync(
-            scopePath: serverPath,
-            recursionLevel: recursion,
-            versionDescriptor: version,
-            cancellationToken: ct).ConfigureAwait(false);
+        var soap = new Soap.TfvcSoapClient(_connection);
+        var recursion = oneLevelOnly ? "OneLevel" : (recursive ? "Full" : "None");
+        var items = await soap.QueryItemsAsync(serverPath, recursion, atChangeset, ct).ConfigureAwait(false);
 
         return items.Select(i => new TfsServerItem
         {
-            ServerPath = i.Path,
+            ServerPath = i.ServerPath,
             IsFolder = i.IsFolder,
-            ChangesetId = i.ChangesetVersion,
-            ContentLength = i.Size,
+            ChangesetId = i.ChangesetId,
+            ContentLength = i.ContentLength,
             HashValue = i.HashValue,
-            CheckinDate = i.ChangeDate,
+            CheckinDate = i.CheckinDate,
         }).ToList();
     }
 
@@ -84,19 +70,8 @@ public sealed class TfvcClientService
         int? atChangeset = null,
         CancellationToken ct = default)
     {
-        var client = _connection.GetTfvcClient();
-
-        TfvcVersionDescriptor? version = atChangeset.HasValue
-            ? new TfvcVersionDescriptor { VersionType = TfvcVersionType.Changeset, Version = atChangeset.Value.ToString() }
-            : null;
-
-        var stream = await client.GetItemContentAsync(
-            path: serverPath,
-            versionDescriptor: version,
-            cancellationToken: ct).ConfigureAwait(false);
-
-        await using (stream.ConfigureAwait(false))
-            await stream.CopyToAsync(destination, ct).ConfigureAwait(false);
+        var soap = new Soap.TfvcSoapClient(_connection);
+        await soap.DownloadFileToStreamAsync(serverPath, destination, atChangeset, ct).ConfigureAwait(false);
     }
 
     // ─── Changeset 查询 ────────────────────────────────────────────────────────
@@ -116,23 +91,38 @@ public sealed class TfvcClientService
         DateTime? toDate = null,
         CancellationToken ct = default)
     {
-        var client = _connection.GetTfvcClient();
-        var results = await client.GetChangesetsAsync(
-            project: null,
-            maxCommentLength: 4000,
-            skip: skip,
-            top: top,
-            orderby: orderby,
-            searchCriteria: new TfvcChangesetSearchCriteria
-            {
-                ItemPath = serverPath,
-                Author = author,
-                FromDate = fromDate?.ToString("O"),
-                ToDate = toDate?.ToString("O"),
-            },
-            cancellationToken: ct).ConfigureAwait(false);
+        var soap = new Soap.TfvcSoapClient(_connection);
+        var queryPath = serverPath ?? "$/";
+        var history = await soap.QueryHistoryAsync(queryPath, top + skip, false, ct).ConfigureAwait(false);
 
-        return results;
+        IEnumerable<Models.Soap.SoapChangeset> filtered = history;
+
+        // Apply author filter (SOAP QueryHistory doesn't support author filtering directly)
+        if (!string.IsNullOrEmpty(author))
+            filtered = filtered.Where(h =>
+                (h.Author != null && h.Author.Contains(author, StringComparison.OrdinalIgnoreCase)) ||
+                (h.AuthorUniqueName != null && h.AuthorUniqueName.Contains(author, StringComparison.OrdinalIgnoreCase)));
+
+        // Apply date filters
+        if (fromDate.HasValue)
+            filtered = filtered.Where(h => h.CreatedDate.HasValue && h.CreatedDate.Value >= fromDate.Value);
+        if (toDate.HasValue)
+            filtered = filtered.Where(h => h.CreatedDate.HasValue && h.CreatedDate.Value <= toDate.Value);
+
+        // Apply ordering (SOAP returns desc by default)
+        if (orderby.Contains("asc", StringComparison.OrdinalIgnoreCase))
+            filtered = filtered.OrderBy(h => h.ChangesetId);
+
+        // Apply skip/take
+        var results = filtered.Skip(skip).Take(top).ToList();
+
+        return results.Select(h => new TfvcChangesetRef
+        {
+            ChangesetId = h.ChangesetId,
+            Author = h.Author != null ? new IdentityRef { DisplayName = h.Author, UniqueName = h.AuthorUniqueName ?? h.Author } : null,
+            CreatedDate = h.CreatedDate?.DateTime ?? DateTime.MinValue,
+            Comment = h.Comment,
+        }).ToList();
     }
 
     /// <summary>
@@ -145,49 +135,81 @@ public sealed class TfvcClientService
         return history.Count(cs => cs.ChangesetId > localMaxChangesetId);
     }
 
-    /// <summary>获取单个 Changeset 的详细信息，包括文件列表、工作项和审核信息。</summary>
+    /// <summary>获取单个 Changeset 的详细信息，包括文件列表和合并来源。</summary>
     /// <param name="changesetId">Changeset 编号</param>
     /// <param name="ct">取消令牌</param>
     public async Task<TfvcChangeset> GetChangesetAsync(int changesetId, CancellationToken ct = default)
     {
-        var client = _connection.GetTfvcClient();
-        var changeset = await client.GetChangesetAsync(
-            id: changesetId,
-            maxChangeCount: 100,
-            includeDetails: true,
-            includeWorkItems: true,
-            includeSourceRename: true,
-            cancellationToken: ct).ConfigureAwait(false);
+        var soap = new Soap.TfvcSoapClient(_connection);
 
-        if (changeset.HasMoreChanges || changeset.Changes is null)
+        // 1. Get changeset metadata (author, date, comment)
+        var metadata = await soap.QueryChangesetMetadataAsync(changesetId, ct).ConfigureAwait(false);
+
+        // 2. Get all file changes with merge sources
+        var soapChanges = await soap.QueryChangesForChangesetAsync(changesetId, ct).ConfigureAwait(false);
+
+        // 3. Build TfvcChangeset from SOAP results
+        var changeset = new TfvcChangeset
         {
-            const int pageSize = 100;
-            var changes = new List<TfvcChange>();
-            var skip = 0;
+            ChangesetId = metadata.ChangesetId,
+            Author = metadata.Author != null
+                ? new IdentityRef { DisplayName = metadata.Author, UniqueName = metadata.AuthorUniqueName ?? metadata.Author }
+                : null,
+            CreatedDate = metadata.CreatedDate?.DateTime ?? DateTime.MinValue,
+            Comment = metadata.Comment,
+            HasMoreChanges = false,
+        };
 
-            while (true)
+        var changes = new List<TfvcChange>();
+        foreach (var sc in soapChanges)
+        {
+            var changeType = ParseSoapChangeType(sc.ChangeType);
+            var tfvcChange = new TfvcChange
             {
-                var page = await client.GetChangesetChangesAsync(
-                    id: changesetId,
-                    skip: skip,
-                    top: pageSize,
-                    cancellationToken: ct).ConfigureAwait(false);
+                Item = new TfvcItem
+                {
+                    Path = sc.ServerPath,
+                    IsFolder = sc.IsFolder,
+                    ChangesetVersion = sc.ItemChangesetVersion,
+                },
+                ChangeType = changeType,
+            };
 
-                if (page.Count == 0)
-                    break;
-
-                changes.AddRange(page);
-                if (page.Count < pageSize)
-                    break;
-
-                skip += page.Count;
+            if (sc.MergeSources.Count > 0)
+            {
+                tfvcChange.MergeSources = sc.MergeSources.Select(ms => new TfvcMergeSource
+                {
+                    ServerItem = ms.ServerItem,
+                    VersionFrom = ms.VersionFrom ?? 0,
+                    VersionTo = ms.VersionTo ?? 0,
+                    IsRename = ms.IsRename,
+                }).ToList();
             }
 
-            changeset.Changes = changes;
-            changeset.HasMoreChanges = false;
+            changes.Add(tfvcChange);
         }
 
+        changeset.Changes = changes;
         return changeset;
+    }
+
+    /// <summary>
+    /// 解析 SOAP 返回的 ChangeType 字符串（空格分隔的 flags）为 VersionControlChangeType 枚举。
+    /// 例如 "Edit Merge" → VersionControlChangeType.Edit | VersionControlChangeType.Merge
+    /// </summary>
+    private static VersionControlChangeType ParseSoapChangeType(string? typeStr)
+    {
+        if (string.IsNullOrWhiteSpace(typeStr))
+            return VersionControlChangeType.None;
+
+        var result = VersionControlChangeType.None;
+        foreach (var part in typeStr.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (Enum.TryParse<VersionControlChangeType>(part, true, out var parsed))
+                result |= parsed;
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -2563,9 +2585,8 @@ public sealed class TfvcClientService
 
     private async Task<byte[]> DownloadFileContentAsync(string serverPath, int? changesetId, CancellationToken ct)
     {
-        await using var stream = new MemoryStream();
-        await DownloadFileAsync(serverPath, stream, changesetId, ct).ConfigureAwait(false);
-        return stream.ToArray();
+        var soap = new Soap.TfvcSoapClient(_connection);
+        return await soap.DownloadFileContentAsync(serverPath, changesetId, ct).ConfigureAwait(false);
     }
 
     private static string NormalizeServerPath(string serverPath) => serverPath.TrimEnd('/');

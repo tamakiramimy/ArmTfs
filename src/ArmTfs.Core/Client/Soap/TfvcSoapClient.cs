@@ -775,6 +775,262 @@ public sealed class TfvcSoapClient
             .FirstOrDefault(a => string.Equals(a.Name.LocalName, localName, StringComparison.OrdinalIgnoreCase))
             ?.Value;
     }
+
+    // ─── QueryItems / QueryHistory / DownloadFile ────────────────────────────
+
+    /// <summary>
+    /// 查询 TFVC 项列表（文件和文件夹）。等价于 <c>tf dir</c> / REST <c>GET /items</c>。
+    /// </summary>
+    /// <param name="serverPath">服务器路径，例如 <c>$/Project/Main</c></param>
+    /// <param name="recursion">递归级别：Full（全递归）、OneLevel（一层）、None（仅自身）</param>
+    /// <param name="atChangeset">查询指定 changeset 版本；null 则查询最新版本</param>
+    public async Task<IReadOnlyList<SoapItem>> QueryItemsAsync(
+        string serverPath,
+        string recursion = "Full",
+        int? atChangeset = null,
+        CancellationToken ct = default)
+    {
+        var versionEl = atChangeset.HasValue
+            ? $@"<tns:version xsi:type=""tns:ChangesetVersionSpec"" cs=""{atChangeset.Value}"" />"
+            : @"<tns:version xsi:type=""tns:LatestVersionSpec"" />";
+
+        var body = $@"    <tns:QueryItems>
+      <tns:workspaceName></tns:workspaceName>
+      <tns:workspaceOwner></tns:workspaceOwner>
+      <tns:items>
+        <tns:ItemSpec recurse=""{Esc(recursion)}"">
+          <tns:item>{Esc(serverPath)}</tns:item>
+        </tns:ItemSpec>
+      </tns:items>
+      {versionEl}
+      <tns:deletedState>NonDeleted</tns:deletedState>
+      <tns:itemType>Any</tns:itemType>
+      <tns:generateDownloadUrls>true</tns:generateDownloadUrls>
+      <tns:options>0</tns:options>
+    </tns:QueryItems>";
+
+        var doc = await InvokeAsync("QueryItems", body, ct).ConfigureAwait(false);
+
+        var result = new List<SoapItem>();
+        foreach (var item in doc.Descendants().Where(e => e.Name.LocalName == "Item"))
+        {
+            var itemPath = AttrAny(item, "item") ?? string.Empty;
+            var type = AttrAny(item, "type") ?? string.Empty;
+            var cs = TryParseInt(AttrAny(item, "cs")) ?? 0;
+            _ = long.TryParse(AttrAny(item, "len"), out var len);
+            var hash = AttrAny(item, "hash");
+            var durl = AttrAny(item, "durl");
+            DateTimeOffset? date = DateTimeOffset.TryParse(AttrAny(item, "date"), out var d) ? d : null;
+
+            result.Add(new SoapItem(itemPath, string.Equals(type, "Folder", StringComparison.OrdinalIgnoreCase), cs, len, hash, durl, date));
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 查询 TFVC 变更历史。等价于 <c>tf history</c> / REST <c>GET /changesets</c>。
+    /// </summary>
+    /// <param name="serverPath">服务器路径</param>
+    /// <param name="maxCount">最大返回条数</param>
+    /// <param name="includeFiles">是否包含每个 changeset 的文件变更列表</param>
+    public async Task<IReadOnlyList<SoapChangeset>> QueryHistoryAsync(
+        string serverPath,
+        int maxCount = 100,
+        bool includeFiles = false,
+        CancellationToken ct = default)
+    {
+        var body = $@"    <tns:QueryHistory>
+      <tns:workspaceName></tns:workspaceName>
+      <tns:workspaceOwner></tns:workspaceOwner>
+      <tns:itemSpec>
+        <tns:item>{Esc(serverPath)}</tns:item>
+        <tns:recurse>Full</tns:recurse>
+      </tns:itemSpec>
+      <tns:versionItem xsi:type=""tns:LatestVersionSpec"" />
+      <tns:versionFrom xsi:nil=""true"" />
+      <tns:versionTo xsi:nil=""true"" />
+      <tns:maxCount>{maxCount}</tns:maxCount>
+      <tns:includeFiles>{(includeFiles ? "true" : "false")}</tns:includeFiles>
+      <tns:generateDownloadUrls>false</tns:generateDownloadUrls>
+      <tns:slotMode>false</tns:slotMode>
+      <tns:sortAscending>false</tns:sortAscending>
+    </tns:QueryHistory>";
+
+        var doc = await InvokeAsync("QueryHistory", body, ct).ConfigureAwait(false);
+
+        var result = new List<SoapChangeset>();
+        foreach (var cs in doc.Descendants().Where(e => e.Name.LocalName == "Changeset"))
+        {
+            var csetId = TryParseInt(AttrAny(cs, "cset")) ?? 0;
+            var author = AttrAny(cs, "cmtr");
+            var authorUnique = AttrAny(cs, "cmtru");
+            DateTimeOffset? date = DateTimeOffset.TryParse(AttrAny(cs, "date"), out var d) ? d : null;
+            var comment = ChildText(cs, "Comment");
+
+            result.Add(new SoapChangeset(csetId, author, authorUnique, date, comment));
+        }
+
+        return result;
+    }
+
+    // ─── QueryChangeset / QueryChangesForChangeset ─────────────────────────────
+
+    /// <summary>
+    /// 通过 SOAP QueryChangeset 获取单个 changeset 的元数据（作者、日期、注释）。
+    /// 不包含文件变更列表（用 <see cref="QueryChangesForChangesetAsync"/> 获取）。
+    /// </summary>
+    public async Task<SoapChangeset> QueryChangesetMetadataAsync(
+        int changesetId,
+        CancellationToken ct = default)
+    {
+        var body = $@"    <tns:QueryChangeset>
+      <tns:changesetId>{changesetId}</tns:changesetId>
+      <tns:includeChanges>false</tns:includeChanges>
+      <tns:generateDownloadUrls>false</tns:generateDownloadUrls>
+      <tns:includeSourceRenames>false</tns:includeSourceRenames>
+    </tns:QueryChangeset>";
+
+        var doc = await InvokeAsync("QueryChangeset", body, ct).ConfigureAwait(false);
+
+        // Response: <QueryChangesetResult cset="N" cmtr="Author" cmtru="unique" date="...">
+        //             <Comment>text</Comment>
+        //           </QueryChangesetResult>
+        var result = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "QueryChangesetResult")
+                  ?? doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "Changeset");
+
+        if (result is null)
+            throw new SoapFaultException("QueryChangeset", System.Net.HttpStatusCode.OK,
+                "QueryChangeset response did not contain a result element", doc.ToString());
+
+        var cset = TryParseInt(AttrAny(result, "cset")) ?? changesetId;
+        var author = AttrAny(result, "cmtr");
+        var authorUnique = AttrAny(result, "cmtru");
+        DateTimeOffset? date = DateTimeOffset.TryParse(AttrAny(result, "date"), out var d) ? d : null;
+        var comment = ChildText(result, "Comment");
+
+        return new SoapChangeset(cset, author, authorUnique, date, comment);
+    }
+
+    /// <summary>
+    /// 通过 SOAP QueryChangesForChangeset 获取指定 changeset 的全部文件变更（含 MergeSources）。
+    /// 支持分页（pageSize=1000），自动获取所有页面。
+    /// </summary>
+    public async Task<IReadOnlyList<SoapChangesetChange>> QueryChangesForChangesetAsync(
+        int changesetId,
+        CancellationToken ct = default)
+    {
+        var allChanges = new List<SoapChangesetChange>();
+        string? lastItem = null;
+        const int pageSize = 1000;
+
+        while (true)
+        {
+            var lastItemEl = lastItem is null
+                ? @"<tns:lastItem xsi:nil=""true"" />"
+                : $"<tns:lastItem>{Esc(lastItem)}</tns:lastItem>";
+
+            var body = $@"    <tns:QueryChangesForChangeset>
+      <tns:changesetId>{changesetId}</tns:changesetId>
+      <tns:generateDownloadUrls>false</tns:generateDownloadUrls>
+      <tns:pageSize>{pageSize}</tns:pageSize>
+      {lastItemEl}
+    </tns:QueryChangesForChangeset>";
+
+            var doc = await InvokeAsync("QueryChangesForChangeset", body, ct).ConfigureAwait(false);
+
+            var changeElements = doc.Descendants()
+                .Where(e => e.Name.LocalName == "Change")
+                .ToList();
+
+            if (changeElements.Count == 0)
+                break;
+
+            foreach (var changeEl in changeElements)
+            {
+                var changeType = AttrAny(changeEl, "type") ?? AttrAny(changeEl, "chg") ?? string.Empty;
+
+                // Parse <Item> child
+                var itemEl = changeEl.Elements().FirstOrDefault(e => e.Name.LocalName == "Item");
+                var serverPath = AttrAny(itemEl, "item") ?? string.Empty;
+                var itemType = AttrAny(itemEl, "type") ?? string.Empty;
+                var isFolder = string.Equals(itemType, "Folder", StringComparison.OrdinalIgnoreCase);
+                var itemCs = TryParseInt(AttrAny(itemEl, "cs")) ?? changesetId;
+
+                // Parse <MergeSources> child
+                var mergeSources = new List<SoapMergeSourceInfo>();
+                var mergeSourcesEl = changeEl.Elements().FirstOrDefault(e => e.Name.LocalName == "MergeSources");
+                if (mergeSourcesEl is not null)
+                {
+                    foreach (var ms in mergeSourcesEl.Elements().Where(e => e.Name.LocalName == "MergeSource"))
+                    {
+                        var sid = AttrAny(ms, "sid") ?? AttrAny(ms, "s") ?? string.Empty;
+                        var vf = TryParseInt(AttrAny(ms, "vf"));
+                        var vt = TryParseInt(AttrAny(ms, "vt"));
+                        var isr = string.Equals(AttrAny(ms, "isr"), "true", StringComparison.OrdinalIgnoreCase);
+                        mergeSources.Add(new SoapMergeSourceInfo(sid, vf, vt, isr));
+                    }
+                }
+
+                allChanges.Add(new SoapChangesetChange(serverPath, isFolder, itemCs, changeType, mergeSources));
+            }
+
+            // Pagination: if we got a full page, continue from the last item
+            if (changeElements.Count < pageSize)
+                break;
+
+            var lastChange = allChanges[^1];
+            lastItem = lastChange.ServerPath;
+        }
+
+        return allChanges;
+    }
+
+    /// <summary>
+    /// 下载指定文件的内容（返回 byte[]）。内部调用 QueryItems 获取下载 URL，然后 HTTP GET 获取内容。
+    /// </summary>
+    /// <param name="serverPath">文件的服务器路径</param>
+    /// <param name="atChangeset">指定 changeset 版本；null 则下载最新</param>
+    public async Task<byte[]> DownloadFileContentAsync(
+        string serverPath,
+        int? atChangeset = null,
+        CancellationToken ct = default)
+    {
+        using var ms = new MemoryStream();
+        await DownloadFileToStreamAsync(serverPath, ms, atChangeset, ct).ConfigureAwait(false);
+        return ms.ToArray();
+    }
+
+    /// <summary>
+    /// 下载指定文件并写入目标流。内部调用 QueryItems 获取下载 URL，然后 HTTP GET 获取内容。
+    /// </summary>
+    /// <param name="serverPath">文件的服务器路径</param>
+    /// <param name="destination">目标流</param>
+    /// <param name="atChangeset">指定 changeset 版本；null 则下载最新</param>
+    public async Task DownloadFileToStreamAsync(
+        string serverPath,
+        Stream destination,
+        int? atChangeset = null,
+        CancellationToken ct = default)
+    {
+        // 使用 QueryItems 获取下载 URL
+        var items = await QueryItemsAsync(serverPath, "None", atChangeset, ct).ConfigureAwait(false);
+        var item = items.FirstOrDefault(i => !i.IsFolder);
+        if (item is null)
+            throw new FileNotFoundException($"File not found in TFVC: {serverPath}");
+        if (string.IsNullOrEmpty(item.DownloadUrl))
+            throw new InvalidOperationException($"No download URL returned for: {serverPath}");
+
+        // 下载 URL 是相对路径，需要拼接 collection base URL
+        var downloadUrl = item.DownloadUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+            ? item.DownloadUrl
+            : _connection.ServerUrl.TrimEnd('/') + "/" + item.DownloadUrl.TrimStart('/');
+
+        using var httpClient = _connection.CreateHttpClient();
+        using var response = await httpClient.GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        await response.Content.CopyToAsync(destination, ct).ConfigureAwait(false);
+    }
 }
 
 /// <summary>SOAP 调用失败时抛出（HTTP 非 2xx，或响应含 SOAP Fault）。</summary>
