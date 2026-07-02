@@ -473,6 +473,9 @@ public sealed class TfvcClientService
         var normalizedPath = NormalizeServerPath(serverPath);
         var client = _connection.GetTfvcClient();
 
+        // Clean up any stale SOAP workspaces that might be holding pending changes
+        await CleanupStaleSoapWorkspacesAsync(ct).ConfigureAwait(false);
+
         var effectiveComment = string.IsNullOrWhiteSpace(comment)
             ? $"Revert {normalizedPath} to version cs{targetChangesetId}"
             : comment.Trim();
@@ -2908,5 +2911,34 @@ public sealed class TfvcClientService
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// Delete any stale arm-tfs temporary SOAP workspaces that might be holding pending changes.
+    /// These are left over from interrupted merge/preview operations.
+    /// </summary>
+    private async Task CleanupStaleSoapWorkspacesAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            var soap = new Soap.TfvcSoapClient(_connection);
+            var owner = await _connection.GetAuthenticatedUserGuidAsync(ct).ConfigureAwait(false);
+            var workspaces = await soap.QueryWorkspacesAsync(owner, null, ct).ConfigureAwait(false);
+
+            foreach (var ws in workspaces)
+            {
+                if (ws.Name.StartsWith("arm-tfs-soap-", StringComparison.OrdinalIgnoreCase)
+                    || ws.Name.StartsWith("arm-tfs-preview-", StringComparison.OrdinalIgnoreCase)
+                    || ws.Name.StartsWith("arm-tfs-lock-", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        await soap.DeleteWorkspaceAsync(ws.Name, ws.Owner, ct).ConfigureAwait(false);
+                    }
+                    catch { /* best effort */ }
+                }
+            }
+        }
+        catch { /* best effort - don't fail the revert if cleanup fails */ }
     }
 }
