@@ -194,6 +194,11 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
             await this.rollbackChangeset(message.changesetId);
           }
           break;
+        case 'revertToChangeset':
+          if (message.changesetId !== undefined) {
+            await this.revertToChangeset(message.changesetId);
+          }
+          break;
       }
     } catch (error) {
       this.showError(message.type, error);
@@ -321,6 +326,56 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
     } catch (error) {
       void vscode.window.showErrorMessage(`回滚失败：${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  private async revertToChangeset(targetChangesetId: number): Promise<void> {
+    const serverPath = this.targets[0]?.serverPath;
+    if (!serverPath) { return; }
+
+    const history = await this.client.history(serverPath, 100);
+    const changesetsToRollback = history.items
+      .filter((item: any) => item.changesetId > targetChangesetId)
+      .sort((a: any, b: any) => b.changesetId - a.changesetId);
+
+    if (changesetsToRollback.length === 0) {
+      void vscode.window.showInformationMessage(`cs${targetChangesetId} 已经是最新版本，无需回退。`);
+      return;
+    }
+
+    const csList = changesetsToRollback.map((c: any) => `cs${c.changesetId}`).join(', ');
+    const confirm = await vscode.window.showWarningMessage(
+      `⚠️ 危险操作！\n\n将回退到 cs${targetChangesetId}，以下 ${changesetsToRollback.length} 个变更集将被逐一回滚：\n${csList}\n\n此操作会创建反向changeset，不可自动撤销。确定继续？`,
+      { modal: true },
+      '确定回退',
+    );
+    if (confirm !== '确定回退') { return; }
+
+    let successCount = 0;
+    let failCount = 0;
+    const errors: string[] = [];
+
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `回退到 cs${targetChangesetId}` },
+      async (progress) => {
+        for (const [index, cs] of changesetsToRollback.entries()) {
+          progress.report({ message: `回滚 cs${cs.changesetId} (${index + 1}/${changesetsToRollback.length})` });
+          try {
+            await this.client.rollback(cs.changesetId, `Revert to cs${targetChangesetId}: rollback cs${cs.changesetId}`);
+            successCount++;
+          } catch (error) {
+            failCount++;
+            errors.push(`cs${cs.changesetId}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      },
+    );
+
+    if (failCount === 0) {
+      void vscode.window.showInformationMessage(`回退成功！已回滚 ${successCount} 个变更集，当前版本为 cs${targetChangesetId}。`);
+    } else {
+      void vscode.window.showWarningMessage(`回退部分完成：成功 ${successCount}，失败 ${failCount}。\n失败项：${errors.join('; ')}`);
+    }
+    await this.loadHistories();
   }
 
   private async checkoutSnapshot(changesetId: number): Promise<void> {
@@ -472,6 +527,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       contextCompare: zh ? '比较选中的两个变更集' : 'Compare selected changesets',
       contextGet: zh ? '获取此版本到文件夹' : 'Get this version to folder',
       contextRollback: zh ? '回滚此变更集' : 'Rollback this changeset',
+      contextRevertTo: zh ? '回退到此版本（回滚之后的所有提交）' : 'Revert to this version (rollback all after)',
       contextDiff: zh ? '与上一版本比较' : 'Compare with previous',
       contextHistory: zh ? '查看文件历史' : 'View file history',
       contextViewCurrent: zh ? '查看当前版本' : 'View current version',
@@ -678,6 +734,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
             { label: labels.contextCompare, disabled: selected.length !== 2, run: () => vscode.postMessage({ type: 'compareChangesets', changesetIds: selected }) },
             { label: labels.contextGet, run: () => vscode.postMessage({ type: 'checkoutChangeset', changesetId }) },
             { label: labels.contextRollback, run: () => vscode.postMessage({ type: 'rollbackChangeset', changesetId }) },
+            { label: labels.contextRevertTo, run: () => vscode.postMessage({ type: 'revertToChangeset', changesetId }) },
           ]);
         });
       });
