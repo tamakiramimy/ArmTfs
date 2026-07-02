@@ -39,6 +39,7 @@ interface MergeWorkbenchState {
   sourcePath: string;
   targetPath: string;
   candidates: MergeWorkbenchCandidate[];
+  rangeConflicts: MergePlanChange[];
   selectedChangesetId?: number;
 }
 
@@ -83,6 +84,7 @@ export class ArmTfsMergeWorkbench {
     sourcePath: '$/',
     targetPath: '$/',
     candidates: [],
+    rangeConflicts: [],
   };
 
   private readonly disposables: vscode.Disposable[] = [];
@@ -143,6 +145,7 @@ export class ArmTfsMergeWorkbench {
         sourcePath,
         targetPath,
         candidates,
+        rangeConflicts: [],
         selectedChangesetId: candidates[0]?.changesetId,
       };
 
@@ -158,8 +161,7 @@ export class ArmTfsMergeWorkbench {
           const rangePlan = await this.client.mergeExecuteRangeJson(sourcePath, targetPath, from, to, {
             dryRun: true,
           });
-          this.applyRangeConflictsToCandidates(
-            candidates,
+          this.mergeRangeConflicts(
             rangePlan.result.changes.filter((change) => change.status.toLowerCase() === 'conflict'),
           );
         } catch (previewError) {
@@ -411,30 +413,33 @@ export class ArmTfsMergeWorkbench {
     }
   }
 
-  /** 把 range SOAP dry-run 中发现的全部冲突补进候选计划。 */
-  private applyRangeConflictsToCandidates(
-    candidates: MergeWorkbenchCandidate[],
-    conflictChanges: MergePlanChange[],
-  ): void {
+  /** 把 range SOAP dry-run 中发现的全部冲突存入 rangeConflicts，并标记已存在的候选变更。 */
+  private mergeRangeConflicts(conflictChanges: MergePlanChange[]): void {
+    if (conflictChanges.length === 0) return;
+    const byTarget = new Map(
+      this.state.rangeConflicts.map((c) => [c.targetServerPath.replace(/\\/g, '/').replace(/\/+$/u, '').toLowerCase(), c]),
+    );
     for (const conflict of conflictChanges) {
-      for (const candidate of candidates) {
-        const existing = candidate.changes.find((change) =>
-          change.targetServerPath.toLowerCase() === conflict.targetServerPath.toLowerCase());
-        if (existing) {
-          existing.status = 'conflict';
-          existing.sourceServerPath = conflict.sourceServerPath || existing.sourceServerPath;
-          existing.note = conflict.note || 'Both source and target modified this file (server 3-way merge conflict). Resolve (source/target/manual).';
-        } else {
-          // Some conflicts are returned by the server without appearing in a single changeset dry-run.
-          // Attach them to every candidate so the selected execution passes the user's resolution file
-          // before whichever changeset first encounters that conflict.
-          candidate.changes.push({
-            ...conflict,
-            sourceChangesetId: candidate.changesetId,
-            status: 'conflict',
-            targetExists: true,
-            note: conflict.note || 'Server range merge conflict. Resolve (source/target/manual) before executing.',
-          });
+      const key = conflict.targetServerPath.replace(/\\/g, '/').replace(/\/+$/u, '').toLowerCase();
+      byTarget.set(key, { ...conflict, status: 'conflict' });
+    }
+    this.state.rangeConflicts = [...byTarget.values()];
+    // Only mark existing candidate changes - don't add new ones
+    this.markExistingCandidateChangesAsRangeConflicts(conflictChanges);
+  }
+
+  private markExistingCandidateChangesAsRangeConflicts(conflictChanges: MergePlanChange[]): void {
+    const conflictByTarget = new Map(
+      conflictChanges.map((c) => [c.targetServerPath.replace(/\\/g, '/').replace(/\/+$/u, '').toLowerCase(), c]),
+    );
+    for (const candidate of this.state.candidates) {
+      for (const change of candidate.changes) {
+        const key = change.targetServerPath.replace(/\\/g, '/').replace(/\/+$/u, '').toLowerCase();
+        const conflict = conflictByTarget.get(key);
+        if (conflict) {
+          change.status = 'conflict';
+          change.sourceServerPath = conflict.sourceServerPath || change.sourceServerPath;
+          change.note = conflict.note || 'Both source and target modified this file.';
         }
       }
     }
@@ -1058,7 +1063,10 @@ interface AggregatedConflict {
 }
 
 /** 聚合所有勾选 changeset 的冲突文件，按目标路径去重（一个文件只出现一次）。 */
-function aggregateConflicts(candidates: MergeWorkbenchCandidate[]): AggregatedConflict[] {
+function aggregateConflicts(
+  candidates: MergeWorkbenchCandidate[],
+  rangeConflicts: readonly MergePlanChange[] = [],
+): AggregatedConflict[] {
   const byPath = new Map<string, AggregatedConflict>();
   for (const cand of candidates) {
     if (!cand.checked) continue;
@@ -1074,6 +1082,16 @@ function aggregateConflicts(candidates: MergeWorkbenchCandidate[]): AggregatedCo
           changesets: [cand.changesetId],
         });
       }
+    }
+  }
+  // Include range conflicts that aren't already tracked by candidate changes
+  for (const rc of rangeConflicts) {
+    if (!byPath.has(rc.targetServerPath)) {
+      byPath.set(rc.targetServerPath, {
+        targetServerPath: rc.targetServerPath,
+        sourceServerPath: rc.sourceServerPath,
+        changesets: [],
+      });
     }
   }
   return [...byPath.values()];
