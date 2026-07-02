@@ -368,7 +368,7 @@ export class ArmTfsCliClient {
     targetPath: string,
     fromChangesetId: number,
     toChangesetId: number,
-    options?: { comment?: string; dryRun?: boolean },
+    options?: { comment?: string; dryRun?: boolean; resolutionFile?: string },
     runOptions?: ArmTfsRunOptions,
   ): Promise<MergeExecuteResponse> {
     const args = [
@@ -390,6 +390,9 @@ export class ArmTfsCliClient {
     }
     if (options?.dryRun) {
       args.push('--dry-run');
+    }
+    if (options?.resolutionFile) {
+      args.push('--resolution-file', options.resolutionFile);
     }
 
     return this.executeJson<MergeExecuteResponse>(args, runOptions);

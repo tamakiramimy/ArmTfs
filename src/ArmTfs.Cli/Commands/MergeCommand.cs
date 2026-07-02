@@ -155,15 +155,15 @@ public static class MergeCommand
                 {
                     if (!string.Equals(mode, "soap", StringComparison.OrdinalIgnoreCase))
                         throw new InvalidOperationException("Range merge is SOAP-only. Omit --mode or use --mode soap.");
-                    if (resolutionFile is not null)
-                        throw new InvalidOperationException("Range merge does not accept --resolution-file yet. Use the range dry-run to list conflicts, then execute resolved single changesets from the workbench.");
 
+                    var resolutions = LoadMergeResolutions(resolutionFile);
                     result = await svc.MergeChangesetRangeViaSoapAsync(
                         resolvedSource, resolvedTarget,
                         fromChangeset!.Value, toChangeset!.Value,
                         comment,
                         dryRun,
-                        soapOwner: soapOwner).ConfigureAwait(false);
+                        soapOwner: soapOwner,
+                        resolutions: resolutions).ConfigureAwait(false);
                 }
                 else
                 {

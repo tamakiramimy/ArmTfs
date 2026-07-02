@@ -325,6 +325,14 @@ export class ArmTfsMergeWorkbench {
     const ids = selected.map((c) => c.changesetId);
     const from = Math.min(...ids);
     const to = Math.max(...ids);
+
+    // Build resolution file if there are resolved conflicts
+    const allResolutionItems = this.buildAllResolutionItems();
+    let resolutionFile: string | undefined;
+    if (allResolutionItems.length > 0) {
+      resolutionFile = await writeResolutionFile(allResolutionItems);
+    }
+
     try {
       const response = await vscode.window.withProgress(
         {
@@ -338,7 +346,7 @@ export class ArmTfsMergeWorkbench {
             this.state.targetPath,
             from,
             to,
-            { comment: comment.trim() || undefined },
+            { comment: comment.trim() || undefined, resolutionFile },
           );
         },
       );
@@ -439,6 +447,44 @@ export class ArmTfsMergeWorkbench {
     }
 
     return itemsByChangeset;
+  }
+
+  private buildAllResolutionItems(): MergeExecutionResolutionFileItem[] {
+    const items: MergeExecutionResolutionFileItem[] = [];
+    const seen = new Set<string>();
+
+    for (const [targetPath, choice] of this.conflictResolutions) {
+      const key = targetPath.replace(/\\/g, '/').toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const change = this.findConflictChangeByTarget(targetPath);
+      const item: MergeExecutionResolutionFileItem = {
+        sourceServerPath: change?.sourceServerPath ?? targetPath,
+        targetServerPath: targetPath,
+        choice,
+      };
+      if (choice === 'manual') {
+        const content = this.manualMergeContents.get(targetPath);
+        if (content !== undefined) {
+          item.contentBase64 = Buffer.from(content, 'utf8').toString('base64');
+        }
+      }
+      items.push(item);
+    }
+    return items;
+  }
+
+  private findConflictChangeByTarget(targetPath: string): MergePlanChange | undefined {
+    for (const candidate of this.state.candidates) {
+      const change = candidate.changes.find(
+        (ch) => ch.status.toLowerCase() === 'conflict' && ch.targetServerPath === targetPath,
+      );
+      if (change) return change;
+    }
+    return this.state.rangeConflicts.find(
+      (ch) => ch.targetServerPath === targetPath,
+    );
   }
 
   private async openManualMergeForConflict(conflictId: string): Promise<void> {
