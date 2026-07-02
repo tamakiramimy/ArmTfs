@@ -335,6 +335,10 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
     const history = await this.client.history(serverPath, 100);
     const changesetsToRollback = history.items
       .filter((item: any) => item.changesetId > targetChangesetId)
+      .filter((item: any) => {
+        const comment = (item.comment || '').toLowerCase();
+        return !comment.startsWith('revert to cs') && !comment.startsWith('rollback changeset') && !comment.startsWith('rollback cs');
+      })
       .sort((a: any, b: any) => b.changesetId - a.changesetId);
 
     if (changesetsToRollback.length === 0) {
