@@ -189,6 +189,11 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
             await this.checkoutSnapshot(message.changesetId);
           }
           break;
+        case 'rollbackChangeset':
+          if (message.changesetId !== undefined) {
+            await this.rollbackChangeset(message.changesetId);
+          }
+          break;
       }
     } catch (error) {
       this.showError(message.type, error);
@@ -289,6 +294,33 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       },
       `${path.posix.basename(toPath)}: cs${fromVersion} ↔ cs${toVersion}`,
     );
+  }
+
+  private async rollbackChangeset(changesetId: number): Promise<void> {
+    const confirm = await vscode.window.showWarningMessage(
+      `确定要回滚 cs${changesetId} 吗？\n\n此操作会创建一个反向changeset来撤销该变更集的所有文件修改。此操作不可逆。`,
+      { modal: true },
+      '确定回滚',
+    );
+    if (confirm !== '确定回滚') { return; }
+
+    const comment = await vscode.window.showInputBox({
+      prompt: '回滚注释',
+      value: `Rollback changeset ${changesetId}`,
+      ignoreFocusOut: true,
+    });
+    if (comment === undefined) { return; }
+
+    try {
+      const result = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `Rolling back cs${changesetId}...` },
+        () => this.client.rollback(changesetId, comment.trim() || undefined),
+      );
+      void vscode.window.showInformationMessage(`回滚成功：${result}`);
+      await this.loadHistories();
+    } catch (error) {
+      void vscode.window.showErrorMessage(`回滚失败：${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   private async checkoutSnapshot(changesetId: number): Promise<void> {
@@ -439,6 +471,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       contextDetails: zh ? '查看详细信息' : 'View Details',
       contextCompare: zh ? '比较选中的两个变更集' : 'Compare selected changesets',
       contextGet: zh ? '获取此版本到文件夹' : 'Get this version to folder',
+      contextRollback: zh ? '回滚此变更集' : 'Rollback this changeset',
       contextDiff: zh ? '与上一版本比较' : 'Compare with previous',
       contextHistory: zh ? '查看文件历史' : 'View file history',
       contextViewCurrent: zh ? '查看当前版本' : 'View current version',
@@ -644,6 +677,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
             { label: labels.contextDetails, run: () => activateChangeset(changesetId) },
             { label: labels.contextCompare, disabled: selected.length !== 2, run: () => vscode.postMessage({ type: 'compareChangesets', changesetIds: selected }) },
             { label: labels.contextGet, run: () => vscode.postMessage({ type: 'checkoutChangeset', changesetId }) },
+            { label: labels.contextRollback, run: () => vscode.postMessage({ type: 'rollbackChangeset', changesetId }) },
           ]);
         });
       });
