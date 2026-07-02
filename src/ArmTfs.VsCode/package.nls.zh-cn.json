@@ -69,6 +69,7 @@
   "command.sidebarCopyTfvcPath": "arm-tfs: 复制 TFVC 路径",
   "command.sidebarOpenLocalPath": "arm-tfs: 在 Finder/资源管理器中打开",
   "command.sidebarPullBranch": "arm-tfs: 拉取分支",
+  "command.sidebarCleanGet": "arm-tfs: 强制同步（Clean Get）",
   "command.sidebarCheckoutBranch": "arm-tfs: 检出分支",
   "command.sidebarShowBranchHistory": "arm-tfs: 显示分支历史",
   "command.sidebarMergeFromBranch": "arm-tfs: 从此分支合并",

@@ -239,6 +239,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       vscode.commands.registerCommand('armTfs.sidebar.copyTfvcPath', async (node?: BranchNode | MergeTargetOptionNode | string) => this.copyTfvcPath(node)),
       vscode.commands.registerCommand('armTfs.sidebar.openLocalPath', async (node?: BranchNode | ServerExplorerNode) => this.openLocalPath(node)),
       vscode.commands.registerCommand('armTfs.sidebar.pullBranch', async (node?: BranchNode | ServerExplorerNode) => this.pullBranch(node)),
+      vscode.commands.registerCommand('armTfs.sidebar.cleanGet', async (node?: BranchNode | ServerExplorerNode) => this.cleanGet(node)),
       vscode.commands.registerCommand('armTfs.sidebar.checkoutBranch', async (node?: BranchNode | ServerExplorerNode) => this.checkoutBranch(node)),
       vscode.commands.registerCommand('armTfs.sidebar.showBranchHistory', async (node?: BranchNode | ServerExplorerNode) => this.showBranchHistory(node)),
       vscode.commands.registerCommand('armTfs.sidebar.mergeFromBranch', async (node?: BranchNode | ServerExplorerNode) => this.mergeFromBranch(node)),
@@ -960,10 +961,6 @@ export class ArmTfsSidebarController implements vscode.Disposable {
           location: vscode.ProgressLocation.Notification,
           title: `arm-tfs pull ${mapped.serverPath}`,
         },
-        // checkoutServerPathToLocalFolder ensures .tf/workspace.json exists (via workspaceNew
-        // when nothing is there yet, or workspaceMap if a parent workspace exists). Without
-        // this, `arm-tfs get` would fetch files but never write the workspace metadata —
-        // re-opening the folder later would have no .tf/ to discover the mapping from.
         () => checkoutServerPathToLocalFolder(this.client, mapped.serverPath, mapped.localPath),
       );
 
@@ -972,6 +969,36 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       await this.refreshAll();
     } catch (error) {
       this.showError('arm-tfs pull branch', error);
+    }
+  }
+
+  private async cleanGet(node?: BranchNode | ServerExplorerNode): Promise<void> {
+    const mapped = this.resolveMappedBranchPath(node, 'clean-get');
+    if (!mapped) {
+      return;
+    }
+
+    const confirm = await vscode.window.showWarningMessage(
+      `⚠️ 强制同步将删除 ${mapped.localPath} 下的所有本地文件，然后从服务器重新下载。\n\n确保没有未提交的本地修改。确定继续？`,
+      { modal: true },
+      '确定同步',
+    );
+    if (confirm !== '确定同步') { return; }
+
+    try {
+      const result = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `arm-tfs clean get ${mapped.serverPath}`,
+        },
+        () => this.client.get(mapped.serverPath, { clean: true, force: true }),
+      );
+
+      reportCommandOutput(this.output, `arm-tfs clean get ${mapped.serverPath}`, result);
+      await this.refreshScm();
+      await this.refreshAll();
+    } catch (error) {
+      this.showError('arm-tfs clean get', error);
     }
   }
 
@@ -1247,7 +1274,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     }
   }
 
-  private resolveMappedBranchPath(node: BranchNode | ServerExplorerNode | undefined, action: 'pull' | 'checkout'): MappedBranchPath | undefined {
+  private resolveMappedBranchPath(node: BranchNode | ServerExplorerNode | undefined, action: 'pull' | 'checkout' | 'clean-get'): MappedBranchPath | undefined {
     const branchPath = getNodeServerPath(node);
     if (!branchPath) {
       void vscode.window.showWarningMessage(t('sidebar.warning.beforeAction', { action }));

@@ -401,6 +401,12 @@
         "icon": "$(cloud-download)"
       },
       {
+        "command": "armTfs.sidebar.cleanGet",
+        "title": "%command.sidebarCleanGet%",
+        "category": "arm-tfs",
+        "icon": "$(sync)"
+      },
+      {
         "command": "armTfs.sidebar.checkoutBranch",
         "title": "%command.sidebarCheckoutBranch%",
         "category": "arm-tfs",
@@ -828,9 +834,14 @@
           "group": "1_sync@1"
         },
         {
-          "command": "armTfs.checkoutServerPathToFolder",
+          "command": "armTfs.sidebar.cleanGet",
           "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
           "group": "1_sync@2"
+        },
+        {
+          "command": "armTfs.checkoutServerPathToFolder",
+          "when": "view == armTfs.branches && viewItem == armTfsSidebarBranch",
+          "group": "1_sync@3"
         },
         {
           "command": "armTfs.sidebar.mergeFromBranch",

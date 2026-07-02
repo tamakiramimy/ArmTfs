@@ -69,6 +69,7 @@
   "command.sidebarCopyTfvcPath": "arm-tfs: Copy TFVC Path",
   "command.sidebarOpenLocalPath": "arm-tfs: Open in Finder / File Explorer",
   "command.sidebarPullBranch": "arm-tfs: Pull Branch",
+  "command.sidebarCleanGet": "arm-tfs: Force Sync (Clean Get)",
   "command.sidebarCheckoutBranch": "arm-tfs: Checkout Branch",
   "command.sidebarShowBranchHistory": "arm-tfs: Show Branch History",
   "command.sidebarMergeFromBranch": "arm-tfs: Merge From Branch",
