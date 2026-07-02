@@ -1485,6 +1485,7 @@ function renderManualMergeHtml(
     .hunk-side.src { background: var(--del-bg); }
     .hunk-side.tgt { background: var(--add-bg); }
     .hunk-side .lbl { display:block; font-size: 10px; color: var(--muted); margin-bottom: 2px; }
+    .hunk-ctx { font-family: var(--vscode-editor-font-family); font-size: 12px; white-space: pre; padding: 4px 8px; color: var(--muted); background: var(--bg); border-radius: 2px; margin: 4px 0; border-left: 2px solid var(--border); }
     .hunk.resolved .hunk-title { color: var(--muted); }
     footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 14px; border-top: 1px solid var(--border); flex-wrap: wrap; }
     .footer-status { display: flex; align-items: center; gap: 16px; }
@@ -1565,17 +1566,19 @@ function renderManualMergeHtml(
     while (i < n) { ops.push({t:'del', s:sourceLines[i]}); i++; }
     while (j < m) { ops.push({t:'ins', s:targetLines[j]}); j++; }
 
-    // group into hunks: runs of del/ins
+    // group into hunks: runs of del/ins, with position tracking for context
     const hunks = [];
     let k = 0;
     while (k < ops.length) {
       if (ops[k].t === 'eq') { k++; continue; }
-      const h = { src: [], tgt: [], choice: null };
+      const startIdx = k;
+      const h = { src: [], tgt: [], choice: null, opsStart: startIdx, opsEnd: 0 };
       while (k < ops.length && ops[k].t !== 'eq') {
         if (ops[k].t === 'del') h.src.push(ops[k].s);
         else h.tgt.push(ops[k].s);
         k++;
       }
+      h.opsEnd = k;
       hunks.push(h);
     }
 
@@ -1618,18 +1621,32 @@ function renderManualMergeHtml(
     function renderHunks() {
       const box = document.getElementById('hunks');
       if (hunks.length === 0) { box.innerHTML = '<div style="padding:12px;color:var(--muted)">两侧内容相同，没有冲突区块。</div>'; return; }
+      const CONTEXT = 3;
       box.innerHTML = hunks.map((h, idx) => {
         const choice = h.choice;
+        // Gather context lines before and after the hunk
+        const ctxBefore = [];
+        for (let c = Math.max(0, h.opsStart - CONTEXT); c < h.opsStart; c++) {
+          if (ops[c].t === 'eq') ctxBefore.push(ops[c].s);
+        }
+        const ctxAfter = [];
+        for (let c = h.opsEnd; c < Math.min(ops.length, h.opsEnd + CONTEXT); c++) {
+          if (ops[c].t === 'eq') ctxAfter.push(ops[c].s);
+        }
+        const ctxBeforeHtml = ctxBefore.length ? '<div class="hunk-ctx">' + ctxBefore.map(l => esc(l)).join('\\n') + '</div>' : '';
+        const ctxAfterHtml = ctxAfter.length ? '<div class="hunk-ctx">' + ctxAfter.map(l => esc(l)).join('\\n') + '</div>' : '';
         const srcPre = h.src.length ? esc(h.src.join('\\n')) : '(无)';
         const tgtPre = h.tgt.length ? esc(h.tgt.join('\\n')) : '(无)';
         return '<div class="hunk ' + (choice ? 'resolved' : '') + '" data-idx="'+idx+'">'
-          + '<div class="hunk-head"><span class="hunk-title">冲突 #' + (idx+1) + (choice ? ' · 已采用 '+({source:'源',target:'目标',both:'两者'}[choice]) : '') + '</span>'
+          + '<div class="hunk-head"><span class="hunk-title">冲突 #' + (idx+1) + ' / ' + hunks.length + (choice ? ' · 已采用 '+({source:'源',target:'目标',both:'两者'}[choice]) : '') + '</span>'
           + '<span class="hunk-actions">'
           + '<button data-hunk="'+idx+'" data-choice="source" class="'+(choice==='source'?'active':'')+'">采用源</button>'
           + '<button data-hunk="'+idx+'" data-choice="target" class="'+(choice==='target'?'active':'')+'">采用目标</button>'
           + '<button data-hunk="'+idx+'" data-choice="both" class="'+(choice==='both'?'active':'')+'">两者都采用</button>'
           + '</span></div>'
+          + ctxBeforeHtml
           + '<div class="hunk-body"><div class="hunk-side src"><span class="lbl">源分支</span>'+srcPre+'</div><div class="hunk-side tgt"><span class="lbl">目标分支</span>'+tgtPre+'</div></div>'
+          + ctxAfterHtml
           + '</div>';
       }).join('');
       box.querySelectorAll('button[data-hunk]').forEach((b) => {
