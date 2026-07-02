@@ -1086,7 +1086,28 @@ export class ArmTfsSidebarController implements vscode.Disposable {
     try {
       const response = await this.client.mergeCandidates(sourcePath, target.targetPath, top, scan);
       if (!response.items.length) {
-        void vscode.window.showInformationMessage(t('sidebar.noMergeCandidates'));
+        const forceAction = await vscode.window.showWarningMessage(
+          '没有合并候选。可能是因为这些变更集已有合并记录（例如之前合并后回滚了）。\n\n是否忽略合并历史，强制显示所有源分支变更集？',
+          '强制查询',
+          '取消',
+        );
+        if (forceAction !== '强制查询') { return; }
+        const forceResponse = await this.client.mergeCandidates(sourcePath, target.targetPath, top, scan, true);
+        if (!forceResponse.items.length) {
+          void vscode.window.showInformationMessage('源分支没有任何变更集。');
+          return;
+        }
+        await ArmTfsMergeWorkbench.open(
+          this.client,
+          this.output,
+          sourcePath,
+          target.targetPath,
+          forceResponse,
+          async () => {
+            await this.refreshScm();
+            await this.refreshAll();
+          },
+        );
         return;
       }
       await ArmTfsMergeWorkbench.open(

@@ -282,8 +282,8 @@ export class ArmTfsCliClient {
     ], options);
   }
 
-  mergeCandidates(sourcePath: string, targetPath: string, top = 20, scan = 80, options?: ArmTfsRunOptions): Promise<MergeCandidateResponse> {
-    return this.executeJson<MergeCandidateResponse>([
+  mergeCandidates(sourcePath: string, targetPath: string, top = 20, scan = 80, force = false, options?: ArmTfsRunOptions): Promise<MergeCandidateResponse> {
+    const args = [
       'merge',
       'candidate',
       '--source',
@@ -296,7 +296,9 @@ export class ArmTfsCliClient {
       String(scan),
       '--format',
       'json',
-    ], options);
+    ];
+    if (force) args.push('--force');
+    return this.executeJson<MergeCandidateResponse>(args, options);
   }
 
   mergeExecute(

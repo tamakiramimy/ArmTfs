@@ -253,6 +253,7 @@ public static class MergeCommand
         var targetOpt = new Option<string>("--target") { Description = "Target branch or folder path ($/...)" };
         var topOpt = new Option<int>("--top", () => 20) { Description = "Maximum candidate changesets to return" };
         var scanOpt = new Option<int>("--scan", () => 80) { Description = "How many source/target history entries to scan while inferring candidates" };
+        var forceOpt = new Option<bool>("--force") { Description = "Ignore merge history (show all source changesets as candidates, useful after rollback)" };
         var formatOpt = new Option<string>("--format", () => "table") { Description = "Output format: table | json" };
 
         sourceOpt.IsRequired = true;
@@ -262,9 +263,10 @@ public static class MergeCommand
         cmd.AddOption(targetOpt);
         cmd.AddOption(topOpt);
         cmd.AddOption(scanOpt);
+        cmd.AddOption(forceOpt);
         cmd.AddOption(formatOpt);
 
-        cmd.SetHandler(async (source, target, top, scan, format) =>
+        cmd.SetHandler(async (source, target, top, scan, force, format) =>
         {
             var ws = WorkspaceManager.FindWorkspace(Directory.GetCurrentDirectory());
             using var conn = new TfsConnection(config);
@@ -275,7 +277,7 @@ public static class MergeCommand
                 var resolvedSource = ResolveServerPath(source);
                 var resolvedTarget = ResolveServerPath(target);
                 var locallyMerged = ws?.GetLocallyMergedChangesetIds(resolvedSource, resolvedTarget);
-                var result = await svc.GetMergeCandidatesAsync(resolvedSource, resolvedTarget, top, scan, locallyMerged).ConfigureAwait(false);
+                var result = await svc.GetMergeCandidatesAsync(resolvedSource, resolvedTarget, top, scan, force, locallyMerged).ConfigureAwait(false);
 
                 if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
                 {
@@ -344,7 +346,7 @@ public static class MergeCommand
                 Console.Error.WriteLine($"Error: {ex.Message}");
                 Environment.ExitCode = 1;
             }
-        }, sourceOpt, targetOpt, topOpt, scanOpt, formatOpt);
+        }, sourceOpt, targetOpt, topOpt, scanOpt, forceOpt, formatOpt);
 
         return cmd;
     }
