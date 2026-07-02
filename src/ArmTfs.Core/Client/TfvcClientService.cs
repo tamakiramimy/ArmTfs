@@ -2061,6 +2061,7 @@ public sealed class TfvcClientService
 
             var resolvedConflictChanges = new List<MergeExecutionChange>();
             var hasUnresolvedConflicts = false;
+            var manualContentFiles = new List<(string TargetPath, byte[] Content)>();
 
             if (pendResult.Conflicts.Count > 0)
             {
@@ -2083,8 +2084,27 @@ public sealed class TfvcClientService
 
                         if (choice == "manual")
                         {
-                            // Manual resolution cannot be applied via SOAP Resolve
-                            unresolvedConflicts.Add(conflict);
+                            if (string.IsNullOrEmpty(resolution.ContentBase64))
+                            {
+                                unresolvedConflicts.Add(conflict);
+                                continue;
+                            }
+
+                            var manualConflictId = await ResolveSoapConflictIdAsync(
+                                soap, createdWs.Name, createdWs.Owner, conflict, normalizedTarget, ct).ConfigureAwait(false);
+                            if (manualConflictId <= 0)
+                            {
+                                unresolvedConflicts.Add(conflict);
+                                continue;
+                            }
+
+                            // For manual: accept source first to clear the conflict, then we'll
+                            // upload the manual content as a separate edit after all conflicts are resolved.
+                            await soap.ResolveConflictAsync(
+                                createdWs.Name, createdWs.Owner, manualConflictId, "AcceptTheirs", ct: ct).ConfigureAwait(false);
+
+                            // Track this file for post-resolve content upload
+                            manualContentFiles.Add((conflict.TargetServerItem, Convert.FromBase64String(resolution.ContentBase64)));
                             continue;
                         }
 
@@ -2213,6 +2233,38 @@ public sealed class TfvcClientService
                 effectiveComment,
                 pendingChanges,
                 ct).ConfigureAwait(false);
+
+            // Apply manual merge content: create a follow-up Edit changeset with the custom content
+            if (manualContentFiles.Count > 0 && newChangesetId > 0)
+            {
+                try
+                {
+                    var manualChanges = new List<TfvcChange>();
+                    foreach (var manualFile in manualContentFiles)
+                    {
+                        var currentVer = await TryGetItemVersionAsync(manualFile.TargetPath, ct).ConfigureAwait(false);
+                        if (currentVer.HasValue)
+                        {
+                            manualChanges.Add(BuildTfvcChange(manualFile.TargetPath, VersionControlChangeType.Edit, manualFile.Content, currentVer.Value));
+                        }
+                    }
+                    if (manualChanges.Count > 0)
+                    {
+                        var restClient = _connection.GetTfvcClient();
+                        var manualChangeset = new TfvcChangeset
+                        {
+                            Comment = $"{effectiveComment} [manual merge content]",
+                            Changes = manualChanges,
+                        };
+                        var manualResult = await restClient.CreateChangesetAsync(manualChangeset, cancellationToken: ct).ConfigureAwait(false);
+                        newChangesetId = manualResult.ChangesetId;
+                    }
+                }
+                catch
+                {
+                    warnings.Add("Manual merge content could not be applied as a follow-up changeset. The merge used source content for manually-resolved files.");
+                }
+            }
 
             foreach (var mergedSourceChangeset in pendingChanges
                          .Select(c => c.VersionTo)
