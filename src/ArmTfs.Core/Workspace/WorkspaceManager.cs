@@ -405,7 +405,7 @@ public sealed class WorkspaceManager
             {
                 var json = File.ReadAllText(versionFile);
                 var candidate = JsonSerializer.Deserialize<TrackedFileVersion>(json, _jsonOptions);
-                if (candidate is null)
+                if (candidate is null || string.IsNullOrWhiteSpace(candidate.LocalPath))
                     continue;
 
                 _trackedByLocalPath.TryAdd(NormalizeLocalKey(candidate.LocalPath), candidate);
