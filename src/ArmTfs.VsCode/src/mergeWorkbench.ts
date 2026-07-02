@@ -5,9 +5,13 @@ import * as vscode from 'vscode';
 import type { ArmTfsCliClient } from './armTfsCliClient';
 import type { MergeCandidateResponse, MergeExecuteResponse } from './contracts';
 import { t } from './i18n';
+import { getConfigValue } from './userConfig';
 import { openServerVersionDiff, openServerVersionDiffFromEmpty } from './versionedFiles';
 
 type MergePlanChange = MergeExecuteResponse['result']['changes'][number];
+
+const DEFAULT_PLAN_CONCURRENCY = 4;
+const MAX_PLAN_CONCURRENCY = 16;
 
 interface MergeWorkbenchCandidate {
   changesetId: number;
@@ -119,15 +123,25 @@ export class ArmTfsMergeWorkbench {
           title: `arm-tfs merge plan ${path.posix.basename(sourcePath)} -> ${path.posix.basename(targetPath)}`,
         },
         async (progress) => {
-          const result: MergeWorkbenchCandidate[] = [];
-          for (const [index, item] of candidateResponse.items.entries()) {
+          const total = candidateResponse.items.length;
+          const concurrency = getMergePlanConcurrency();
+          let completed = 0;
+          progress.report({
+            message: `loading ${total} changeset plan(s), ${Math.min(concurrency, Math.max(total, 1))} parallel`,
+          });
+
+          return mapWithConcurrency(candidateResponse.items, concurrency, async (item) => {
             progress.report({
-              message: `cs${item.changesetId} (${index + 1}/${candidateResponse.items.length})`,
+              message: `cs${item.changesetId} loading`,
             });
             const plan = await this.client.mergeExecuteJson(sourcePath, targetPath, item.changesetId, {
               dryRun: true,
             });
-            result.push({
+            completed += 1;
+            progress.report({
+              message: `cs${item.changesetId} (${completed}/${total})`,
+            });
+            return {
               changesetId: item.changesetId,
               createdAt: item.createdAt,
               author: item.author?.displayName,
@@ -135,9 +149,8 @@ export class ArmTfsMergeWorkbench {
               checked: true,
               changes: plan.result.changes,
               warnings: plan.result.warnings,
-            });
-          }
-          return result;
+            };
+          });
         },
       );
 
@@ -1283,6 +1296,8 @@ async function readServerText(client: ArmTfsCliClient, serverPath: string, versi
   return Buffer.from(response.item.contentBase64, 'base64').toString('utf8');
 }
 
+let mergeToolbarDisposables: vscode.Disposable[] = [];
+
 async function openNativeMergeWithToolbar(
   sourceContent: string,
   targetContent: string,
@@ -1330,52 +1345,19 @@ async function openNativeMergeWithToolbar(
     throw new Error(`无法打开 VS Code Merge Editor：${getErrorMessage(error)}`);
   }
 
-  // Status bar items for merge toolbar
-  const prevBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 1000);
-  prevBtn.text = '$(arrow-up) 上一个冲突';
-  prevBtn.command = 'merge-conflict.previous';
-  prevBtn.tooltip = '跳转到上一个冲突';
-  prevBtn.show();
-
-  const nextBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 999);
-  nextBtn.text = '$(arrow-down) 下一个冲突';
-  nextBtn.command = 'merge-conflict.next';
-  nextBtn.tooltip = '跳转到下一个冲突';
-  nextBtn.show();
-
-  const countItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 998);
-  countItem.text = '$(git-merge) 合并冲突解决中...';
-  countItem.tooltip = '正在解决合并冲突';
-  countItem.show();
-
-  const completeBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 1000);
-  completeBtn.text = '$(check) 完成合并';
-  completeBtn.command = 'armTfs.mergeConflict.complete';
-  completeBtn.tooltip = '使用当前合并结果';
-  completeBtn.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
-  completeBtn.show();
-
-  const undoBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 999);
-  undoBtn.text = '$(discard) 撤销合并';
-  undoBtn.command = 'armTfs.mergeConflict.undo';
-  undoBtn.tooltip = '放弃当前合并，恢复原始内容';
-  undoBtn.show();
-
   const doc = await vscode.workspace.openTextDocument(resultUri);
 
   return new Promise<string | undefined>((resolve) => {
     const disposables: vscode.Disposable[] = [];
 
     const cleanup = () => {
-      prevBtn.dispose();
-      nextBtn.dispose();
-      countItem.dispose();
-      completeBtn.dispose();
-      undoBtn.dispose();
-      vscode.Disposable.from(...disposables).dispose();
+      for (const d of disposables) d.dispose();
+      disposables.length = 0;
+      for (const d of mergeToolbarDisposables) d.dispose();
+      mergeToolbarDisposables = [];
     };
 
-    // Register commands
+    // Register commands FIRST
     disposables.push(
       vscode.commands.registerCommand('armTfs.mergeConflict.complete', async () => {
         await doc.save();
@@ -1389,7 +1371,40 @@ async function openNativeMergeWithToolbar(
       }),
     );
 
-    // Also handle if user closes the editor tab
+    // Then create status bar items that reference the commands
+    const prevBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 1000);
+    prevBtn.text = '$(arrow-up) 上一个冲突';
+    prevBtn.command = 'merge-conflict.previous';
+    prevBtn.tooltip = '跳转到上一个冲突';
+    prevBtn.show();
+
+    const nextBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 999);
+    nextBtn.text = '$(arrow-down) 下一个冲突';
+    nextBtn.command = 'merge-conflict.next';
+    nextBtn.tooltip = '跳转到下一个冲突';
+    nextBtn.show();
+
+    const countItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 998);
+    countItem.text = '$(git-merge) 合并冲突解决中...';
+    countItem.tooltip = '正在解决合并冲突';
+    countItem.show();
+
+    const completeBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 1000);
+    completeBtn.text = '$(check) 完成合并';
+    completeBtn.command = 'armTfs.mergeConflict.complete';
+    completeBtn.tooltip = '使用当前合并结果';
+    completeBtn.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+    completeBtn.show();
+
+    const undoBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 999);
+    undoBtn.text = '$(discard) 撤销合并';
+    undoBtn.command = 'armTfs.mergeConflict.undo';
+    undoBtn.tooltip = '放弃当前合并，恢复原始内容';
+    undoBtn.show();
+
+    mergeToolbarDisposables.push(prevBtn, nextBtn, countItem, completeBtn, undoBtn);
+
+    // Handle editor close
     disposables.push(
       vscode.workspace.onDidCloseTextDocument((closed) => {
         if (closed.uri.fsPath === resultUri.fsPath) {
@@ -1872,6 +1887,38 @@ function renderManualMergeHtml(
   </script>
 </body>
 </html>`;
+}
+
+function getMergePlanConcurrency(): number {
+  const configured = Number(getConfigValue<number>('merge.planConcurrency', DEFAULT_PLAN_CONCURRENCY));
+  if (!Number.isFinite(configured)) {
+    return DEFAULT_PLAN_CONCURRENCY;
+  }
+  return Math.min(MAX_PLAN_CONCURRENCY, Math.max(1, Math.floor(configured)));
+}
+
+async function mapWithConcurrency<T, TResult>(
+  items: readonly T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<TResult>,
+): Promise<TResult[]> {
+  if (items.length === 0) {
+    return [];
+  }
+  const workerCount = Math.min(items.length, Math.max(1, Math.floor(concurrency)));
+  const results = new Array<TResult>(items.length);
+  let nextIndex = 0;
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    for (;;) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) {
+        return;
+      }
+      results[index] = await mapper(items[index], index);
+    }
+  }));
+  return results;
 }
 
 function getNonce(): string {
