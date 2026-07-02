@@ -1334,6 +1334,10 @@ async function openNativeMergeWithToolbar(
 
   const doc = await vscode.workspace.openTextDocument(resultUri);
 
+  // Dispose any previous merge toolbar (commands + status bar items) before re-registering
+  for (const d of mergeToolbarDisposables) d.dispose();
+  mergeToolbarDisposables = [];
+
   return new Promise<string | undefined>((resolve) => {
     const disposables: vscode.Disposable[] = [];
 
@@ -1345,18 +1349,18 @@ async function openNativeMergeWithToolbar(
     };
 
     // Register commands FIRST
-    disposables.push(
-      vscode.commands.registerCommand('armTfs.mergeConflict.complete', async () => {
-        await doc.save();
-        const content = await fs.readFile(resultPath, 'utf8');
-        cleanup();
-        resolve(content);
-      }),
-      vscode.commands.registerCommand('armTfs.mergeConflict.undo', () => {
-        cleanup();
-        resolve(undefined);
-      }),
-    );
+    const cmdComplete = vscode.commands.registerCommand('armTfs.mergeConflict.complete', async () => {
+      await doc.save();
+      const content = await fs.readFile(resultPath, 'utf8');
+      cleanup();
+      resolve(content);
+    });
+    const cmdUndo = vscode.commands.registerCommand('armTfs.mergeConflict.undo', () => {
+      cleanup();
+      resolve(undefined);
+    });
+    disposables.push(cmdComplete, cmdUndo);
+    mergeToolbarDisposables.push(cmdComplete, cmdUndo);
 
     // Then create status bar items that reference the commands
     const prevBtn = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 1000);
