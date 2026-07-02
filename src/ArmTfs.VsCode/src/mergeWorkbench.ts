@@ -321,146 +321,58 @@ export class ArmTfsMergeWorkbench {
       return;
     }
 
-    // Prefer range merge when multiple contiguous changesets are selected (faster, atomic)
-    if (selected.length >= 2) {
-      const ids = selected.map((c) => c.changesetId);
-      const from = Math.min(...ids);
-      const to = Math.max(...ids);
-      try {
-        const response = await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: `arm-tfs merge range cs${from}~cs${to}`,
-          },
-          async (progress) => {
-            progress.report({ message: 'server range merge' });
-            return this.client.mergeExecuteRangeJson(
-              this.state.sourcePath,
-              this.state.targetPath,
-              from,
-              to,
-              { comment: comment.trim() || undefined },
-            );
-          },
-        );
-
-        this.output.appendLine('> arm-tfs merge execute range');
-        this.output.appendLine(summarizeMergeResponse(response));
-        this.output.appendLine('');
-
-        const conflictChanges = response.result.changes.filter((c) => c.status.toLowerCase() === 'conflict');
-        if (conflictChanges.length > 0) {
-          this.mergeRangeConflicts(conflictChanges);
-          this.render();
-          void vscode.window.showWarningMessage(
-            `cs${from}~cs${to} 合并中止：服务器检测到冲突，已列入冲突列表。请解决后重试。`,
-          );
-        } else if (response.result.createdChangesetId !== null && response.result.createdChangesetId !== undefined) {
-          await this.refreshAfterExecute();
-          void vscode.window.showInformationMessage(
-            t('merge.execute.success', {
-              count: selected.length,
-              created: `cs${response.result.createdChangesetId}`,
-            }),
-          );
-          this.panel.dispose();
-        } else {
-          await this.refreshAfterExecute();
-          void vscode.window.showWarningMessage(
-            t('merge.execute.noChange', {
-              changesets: selected.map((id) => `cs${id.changesetId}`).join(', '),
-            }),
-          );
-        }
-      } catch (error) {
-        this.showError('arm-tfs merge execute range', error);
-      }
-      return;
-    }
-
-    const outputs: string[] = [];
-    const createdIds: number[] = [];
-    const noChangeIds: number[] = [];
-    const conflictAbortIds: number[] = [];
-    const resolutionFiles: string[] = [];
-    let abortedByConflict = false;
+    // Always use atomic range merge (one PendMerge + one CheckIn = one changeset)
+    const ids = selected.map((c) => c.changesetId);
+    const from = Math.min(...ids);
+    const to = Math.max(...ids);
     try {
-      await vscode.window.withProgress(
+      const response = await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: `arm-tfs merge ${selected.length} changeset(s)`,
+          title: `arm-tfs merge ${selected.length === 1 ? `cs${from}` : `range cs${from}~cs${to}`}`,
         },
         async (progress) => {
-          for (const [index, candidate] of selected.entries()) {
-            if (abortedByConflict) break;
-            progress.report({
-              message: `cs${candidate.changesetId} (${index + 1}/${selected.length})`,
-            });
-            const resolutionFile = await writeResolutionFile(resolutionItemsByChangeset.get(candidate.changesetId) ?? []);
-            resolutionFiles.push(resolutionFile);
-            const response = await this.client.mergeExecuteJson(
-              this.state.sourcePath,
-              this.state.targetPath,
-              candidate.changesetId,
-              {
-                comment: comment.trim() || undefined,
-                resolutionFile,
-              },
-            );
-            const createdId = response.result.createdChangesetId;
-            const conflictChanges = response.result.changes.filter((c) => c.status.toLowerCase() === 'conflict');
-            if (conflictChanges.length > 0) {
-              // The server's 3-way merge found conflicts the workbench preview did not surface
-              // (e.g. per-changeset conflicts differ from the range preview, or state changed
-              // after intermediate merges). Mark them on the candidate so the conflict list shows
-              // them and the user can resolve (批量采用源/目标 or per-file), then retry.
-              conflictAbortIds.push(candidate.changesetId);
-              this.applyConflictResultToCandidate(candidate, conflictChanges);
-              abortedByConflict = true;
-            } else if (createdId !== null && createdId !== undefined) {
-              createdIds.push(createdId);
-            } else {
-              noChangeIds.push(candidate.changesetId);
-            }
-            outputs.push(summarizeMergeResponse(response));
-          }
+          progress.report({ message: 'server merge (atomic)' });
+          return this.client.mergeExecuteRangeJson(
+            this.state.sourcePath,
+            this.state.targetPath,
+            from,
+            to,
+            { comment: comment.trim() || undefined },
+          );
         },
       );
 
-      this.output.appendLine('> arm-tfs merge execute');
-      this.output.appendLine(outputs.join('\n\n'));
+      this.output.appendLine('> arm-tfs merge execute range');
+      this.output.appendLine(summarizeMergeResponse(response));
       this.output.appendLine('');
 
-      await this.refreshAfterExecute();
-
-      if (abortedByConflict) {
+      const conflictChanges = response.result.changes.filter((c) => c.status.toLowerCase() === 'conflict');
+      if (conflictChanges.length > 0) {
+        this.mergeRangeConflicts(conflictChanges);
         this.render();
         void vscode.window.showWarningMessage(
-          `cs${conflictAbortIds.join(', cs')} 合并中止：服务器检测到冲突，已列入冲突列表。请解决（批量采用源/目标或逐个）后重试。`,
+          `合并中止：服务器检测到 ${conflictChanges.length} 个冲突，已列入冲突列表。请解决后重试。`,
         );
-      } else if (createdIds.length) {
+      } else if (response.result.createdChangesetId !== null && response.result.createdChangesetId !== undefined) {
+        await this.refreshAfterExecute();
         void vscode.window.showInformationMessage(
           t('merge.execute.success', {
-            count: createdIds.length,
-            created: createdIds.map((id) => `cs${id}`).join(', '),
+            count: selected.length,
+            created: `cs${response.result.createdChangesetId}`,
           }),
         );
-        if (noChangeIds.length) {
-          void vscode.window.showWarningMessage(
-            t('merge.execute.noChange', {
-              changesets: noChangeIds.map((id) => `cs${id}`).join(', '),
-            }),
-          );
-        }
-      }
-
-      if (createdIds.length && !abortedByConflict) {
         this.panel.dispose();
+      } else {
+        await this.refreshAfterExecute();
+        void vscode.window.showWarningMessage(
+          t('merge.execute.noChange', {
+            changesets: selected.map((id) => `cs${id.changesetId}`).join(', '),
+          }),
+        );
       }
     } catch (error) {
       this.showError('arm-tfs merge execute', error);
-    } finally {
-      await Promise.all(resolutionFiles.map((file) => fs.rm(path.dirname(file), { force: true, recursive: true })));
     }
   }
 
