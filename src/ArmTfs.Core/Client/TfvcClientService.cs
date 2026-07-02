@@ -475,10 +475,10 @@ public sealed class TfvcClientService
             ? $"Revert {normalizedPath} to version cs{targetChangesetId}"
             : comment.Trim();
 
-        // Get file list at target version
+        // Step 1: Get ALL files at target version (the snapshot we want to restore to)
         var targetItems = await GetItemsAsync(normalizedPath, recursive: true, atChangeset: targetChangesetId, ct: ct).ConfigureAwait(false);
 
-        // Get file list at current (latest) version
+        // Step 2: Get ALL files at current (latest) version
         var currentItems = await GetItemsAsync(normalizedPath, recursive: true, atChangeset: null, ct: ct).ConfigureAwait(false);
 
         var targetFiles = targetItems
@@ -491,63 +491,25 @@ public sealed class TfvcClientService
 
         var changes = new List<TfvcChange>();
 
-        // Files in current but not in target -> Delete
+        // Step 3: Delete ALL current files (full wipe)
         foreach (var (path, item) in currentFiles)
         {
-            if (!targetFiles.ContainsKey(path))
+            changes.Add(new TfvcChange
             {
-                changes.Add(new TfvcChange
-                {
-                    Item = new TfvcItem { Path = path, ChangesetVersion = item.ChangesetId },
-                    ChangeType = VersionControlChangeType.Delete,
-                });
-            }
+                Item = new TfvcItem { Path = path, ChangesetVersion = item.ChangesetId },
+                ChangeType = VersionControlChangeType.Delete,
+            });
         }
 
-        // Files in target but not in current -> Add (with content from target version)
+        // Step 4: Add ALL files from target version (full restore)
         foreach (var (path, item) in targetFiles)
         {
-            if (!currentFiles.ContainsKey(path))
-            {
-                var content = await DownloadFileContentAsync(path, targetChangesetId, ct).ConfigureAwait(false);
-                changes.Add(BuildTfvcChange(path, VersionControlChangeType.Add, content, null));
-            }
-        }
-
-        // Files in both -> compare content hash or changeset version, Edit if different
-        foreach (var (path, targetItem) in targetFiles)
-        {
-            if (!currentFiles.TryGetValue(path, out var currentItem)) continue;
-
-            // Quick check: if the changeset version is the same, content is identical
-            if (targetItem.ChangesetId == currentItem.ChangesetId) continue;
-
-            // Hash comparison: if both have hashes and they match, skip
-            if (!string.IsNullOrEmpty(targetItem.HashValue)
-                && !string.IsNullOrEmpty(currentItem.HashValue)
-                && string.Equals(targetItem.HashValue, currentItem.HashValue, StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            // Download and compare actual content
-            byte[] targetContent;
-            byte[] currentContent;
-            try
-            {
-                targetContent = await DownloadFileContentAsync(path, targetChangesetId, ct).ConfigureAwait(false);
-                currentContent = await DownloadFileContentAsync(path, null, ct).ConfigureAwait(false);
-            }
-            catch
-            {
-                continue; // Skip files we can't download
-            }
-
-            if (ContentEquals(targetContent, currentContent)) continue;
-
-            changes.Add(BuildTfvcChange(path, VersionControlChangeType.Edit, targetContent, currentItem.ChangesetId));
+            var content = await DownloadFileContentAsync(path, targetChangesetId, ct).ConfigureAwait(false);
+            changes.Add(BuildTfvcChange(path, VersionControlChangeType.Add, content, null));
         }
 
         if (changes.Count == 0)
-            throw new InvalidOperationException($"No differences found between current version and cs{targetChangesetId}. Already at target state.");
+            throw new InvalidOperationException($"No files found at cs{targetChangesetId} for path {normalizedPath}.");
 
         var changeset = new TfvcChangeset { Comment = effectiveComment, Changes = changes };
         return await client.CreateChangesetAsync(changeset, cancellationToken: ct).ConfigureAwait(false);
