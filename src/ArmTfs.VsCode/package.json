@@ -2,7 +2,7 @@
   "name": "arm-tfs-vscode",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.1.4",
+  "version": "0.1.8",
   "publisher": "local",
   "engines": {
     "vscode": "^1.90.0"
@@ -1110,6 +1110,13 @@
           "default": 80,
           "minimum": 1,
           "description": "How many history entries to scan when computing merge candidates."
+        },
+        "armTfs.merge.planConcurrency": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 16,
+          "description": "Maximum number of merge dry-run plans loaded in parallel when opening the Merge Workbench. Higher values can speed up large candidate lists but increase CLI/SOAP load."
         },
         "armTfs.workspaceMappings": {
           "type": "array",
