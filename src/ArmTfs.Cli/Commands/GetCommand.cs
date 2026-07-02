@@ -17,6 +17,7 @@ public static class GetCommand
         var pathArg = new Argument<string>("path", () => ".", "Local path or server path to sync");
         var versionOpt = new Option<string?>("--version", "-v") { Description = "Version spec: changeset (C123), label (Lname), date (Ddate), latest (T)" };
         var forceOpt = new Option<bool>(new[] { "--force", "-f" }) { Description = "Overwrite even if local file appears up-to-date" };
+        var cleanOpt = new Option<bool>("--clean") { Description = "Delete all local files before downloading (ensures 100% sync with server)" };
         var recursiveOpt = new Option<bool>(new[] { "--recursive", "-r" }, getDefaultValue: () => true) { Description = "Get all files recursively (default: true)" };
         var dryRunOpt = new Option<bool>("--dry-run") { Description = "Show what would be downloaded without writing files" };
         var localPathOpt = new Option<string?>("--local-path") { Description = "Local directory override when auto-creating a workspace from a server path" };
@@ -25,12 +26,13 @@ public static class GetCommand
         cmd.AddArgument(pathArg);
         cmd.AddOption(versionOpt);
         cmd.AddOption(forceOpt);
+        cmd.AddOption(cleanOpt);
         cmd.AddOption(recursiveOpt);
         cmd.AddOption(dryRunOpt);
         cmd.AddOption(localPathOpt);
         cmd.AddOption(parallelOpt);
 
-        cmd.SetHandler(async (path, versionSpec, force, recursive, dryRun, localPathOverride, parallel) =>
+        cmd.SetHandler(async (path, versionSpec, force, clean, recursive, dryRun, localPathOverride, parallel) =>
         {
             // Parse version spec → int? (changeset) for REST
             int? version = ParseVersionSpec(versionSpec);
@@ -104,6 +106,28 @@ public static class GetCommand
 
             Console.WriteLine($"Getting from: {serverPath}");
 
+            // --clean: 先删除本地所有文件（保留.tf目录），确保与服务器完全一致
+            if (clean)
+            {
+                var mapping = meta.Mappings.FirstOrDefault(m =>
+                    serverPath.StartsWith(m.ServerPath, StringComparison.OrdinalIgnoreCase));
+                var localRoot = mapping?.LocalPath;
+                if (localRoot is not null && Directory.Exists(localRoot))
+                {
+                    Console.WriteLine($"Cleaning local directory: {localRoot}");
+                    foreach (var dir in Directory.GetDirectories(localRoot))
+                    {
+                        if (Path.GetFileName(dir) == ".tf") continue;
+                        Directory.Delete(dir, recursive: true);
+                    }
+                    foreach (var file in Directory.GetFiles(localRoot))
+                    {
+                        File.Delete(file);
+                    }
+                    Console.WriteLine("Local files cleaned. Downloading fresh copy...");
+                }
+                force = true;
+            }
             var items = await svc.GetItemsAsync(serverPath, recursive, version).ConfigureAwait(false);
             var cloaked = meta.CloakedPaths;
             var files = items
@@ -210,7 +234,7 @@ public static class GetCommand
             Console.WriteLine($"Downloaded: {downloaded}  Skipped (up-to-date): {skipped}  Errors: {errors}");
 
             if (errors > 0) Environment.ExitCode = 1;
-        }, pathArg, versionOpt, forceOpt, recursiveOpt, dryRunOpt, localPathOpt, parallelOpt);
+        }, pathArg, versionOpt, forceOpt, cleanOpt, recursiveOpt, dryRunOpt, localPathOpt, parallelOpt);
 
         return cmd;
     }

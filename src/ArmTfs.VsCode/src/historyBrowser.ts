@@ -344,7 +344,12 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
         { location: vscode.ProgressLocation.Notification, title: `回退 ${serverPath} 到 cs${targetChangesetId}...` },
         () => this.client.revertToVersion(serverPath, targetChangesetId, `Revert ${serverPath} to cs${targetChangesetId}`),
       );
-      void vscode.window.showInformationMessage(`回退成功：${result}`);
+      // 服务器恢复后，同步本地文件（clean get）
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: '同步本地文件...' },
+        () => this.client.get(serverPath, { clean: true, force: true }),
+      );
+      void vscode.window.showInformationMessage(`回退成功：${result}\n本地文件已同步。`);
       await this.loadHistories();
     } catch (error) {
       void vscode.window.showErrorMessage(`回退失败：${error instanceof Error ? error.message : String(error)}`);

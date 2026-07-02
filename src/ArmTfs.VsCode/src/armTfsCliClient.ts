@@ -98,13 +98,16 @@ export class ArmTfsCliClient {
     return this.executeText(['workspace', 'map', '--server-path', serverPath, '--local-path', localPath], options);
   }
 
-  get(targetPath = '.', options?: { version?: number; force?: boolean; recursive?: boolean; dryRun?: boolean }, runOptions?: ArmTfsRunOptions): Promise<string> {
+  get(targetPath = '.', options?: { version?: number; force?: boolean; clean?: boolean; recursive?: boolean; dryRun?: boolean }, runOptions?: ArmTfsRunOptions): Promise<string> {
     const args = ['get', targetPath];
     if (options?.version !== undefined) {
       args.push('--version', String(options.version));
     }
     if (options?.force) {
       args.push('--force');
+    }
+    if (options?.clean) {
+      args.push('--clean');
     }
     if (options?.recursive === false) {
       args.push('--recursive', 'false');
