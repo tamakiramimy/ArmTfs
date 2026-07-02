@@ -310,18 +310,13 @@ public sealed class TfvcClientService
         // Download source content
         var content = await DownloadFileContentAsync(normalizedOld, null, ct).ConfigureAwait(false);
 
-        // Create a single changeset: Add new path + Delete old path
-        var client = _connection.GetTfvcClient();
-        var addChange = BuildTfvcChange(normalizedNew, VersionControlChangeType.Add, content, null);
-        var deleteChange = BuildTfvcChange(normalizedOld, VersionControlChangeType.Delete, null, oldVersion);
-
-        var changeset = new TfvcChangeset
+        // Create a single changeset via SOAP: Add new path + Delete old path
+        var soapChanges = new List<(string serverPath, string changeType, byte[]? content, int? baseVersion)>
         {
-            Comment = effectiveComment,
-            Changes = new List<TfvcChange> { addChange, deleteChange },
+            (normalizedNew, "Add", content, null),
+            (normalizedOld, "Delete", null, oldVersion),
         };
-        var result = await client.CreateChangesetAsync(changeset, cancellationToken: ct).ConfigureAwait(false);
-        return result.ChangesetId;
+        return await CreateChangesetViaSoapAsync(effectiveComment, soapChanges, ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -380,11 +375,13 @@ public sealed class TfvcClientService
             throw new InvalidOperationException($"Cannot download prior version of '{normalized}' at CS#{restoreFromVersion}: {ex.Message}", ex);
         }
 
-        // Re-add the file with its restored content
-        var client = _connection.GetTfvcClient();
-        var addChange = BuildTfvcChange(normalized, VersionControlChangeType.Add, content, null);
-        var changeset = new TfvcChangeset { Comment = effectiveComment, Changes = new List<TfvcChange> { addChange } };
-        return await client.CreateChangesetAsync(changeset, cancellationToken: ct).ConfigureAwait(false);
+        // Re-add the file with its restored content via SOAP
+        var soapChanges = new List<(string serverPath, string changeType, byte[]? content, int? baseVersion)>
+        {
+            (normalized, "Add", content, null),
+        };
+        var changesetId = await CreateChangesetViaSoapAsync(effectiveComment, soapChanges, ct).ConfigureAwait(false);
+        return new TfvcChangesetRef { ChangesetId = changesetId };
     }
 
     /// <summary>
@@ -411,8 +408,7 @@ public sealed class TfvcClientService
             ? $"Rollback changeset {changesetId}"
             : comment.Trim();
 
-        var client = _connection.GetTfvcClient();
-        var rollbackChanges = new List<TfvcChange>();
+        var soapChanges = new List<(string serverPath, string changeType, byte[]? content, int? baseVersion)>();
 
         foreach (var c in changes)
         {
@@ -424,31 +420,29 @@ public sealed class TfvcClientService
                 // The file was undeleted in this changeset — rolling back means deleting it again
                 var ver = await TryGetItemVersionAsync(path, ct).ConfigureAwait(false);
                 if (ver.HasValue)
-                    rollbackChanges.Add(new TfvcChange
-                    {
-                        Item = new TfvcItem { Path = path, ChangesetVersion = ver.Value },
-                        ChangeType = VersionControlChangeType.Delete,
-                    });
+                    soapChanges.Add((path, "Delete", null, ver));
             }
             else if (ct2.HasFlag(VersionControlChangeType.Add))
             {
                 // The file was added in this changeset — rolling back means deleting it
                 var ver = await TryGetItemVersionAsync(path, ct).ConfigureAwait(false);
                 if (ver.HasValue)
-                    rollbackChanges.Add(new TfvcChange
-                    {
-                        Item = new TfvcItem { Path = path, ChangesetVersion = ver.Value },
-                        ChangeType = VersionControlChangeType.Delete,
-                    });
+                    soapChanges.Add((path, "Delete", null, ver));
             }
             else if (ct2.HasFlag(VersionControlChangeType.Delete))
             {
-                // The file was deleted — rolling back means undeleting
-                rollbackChanges.Add(new TfvcChange
+                // The file was deleted — rolling back means re-adding it
+                var prevVersion = changesetId - 1;
+                byte[]? content = null;
+                try
                 {
-                    Item = new TfvcItem { Path = path },
-                    ChangeType = VersionControlChangeType.Undelete,
-                });
+                    content = await DownloadFileContentAsync(path, prevVersion, ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    continue;
+                }
+                soapChanges.Add((path, "Add", content, null));
             }
             else if (ct2.HasFlag(VersionControlChangeType.Edit) || ct2.HasFlag(VersionControlChangeType.Rename))
             {
@@ -468,16 +462,15 @@ public sealed class TfvcClientService
                 var currentVer = await TryGetItemVersionAsync(path, ct).ConfigureAwait(false);
                 if (currentVer is null) continue;
 
-                var tfvcChange = BuildTfvcChange(path, VersionControlChangeType.Edit, content, currentVer);
-                rollbackChanges.Add(tfvcChange);
+                soapChanges.Add((path, "Edit", content, currentVer));
             }
         }
 
-        if (rollbackChanges.Count == 0)
+        if (soapChanges.Count == 0)
             throw new InvalidOperationException($"No rollback-able changes found in changeset {changesetId}.");
 
-        var changeset = new TfvcChangeset { Comment = effectiveComment, Changes = rollbackChanges };
-        return await client.CreateChangesetAsync(changeset, cancellationToken: ct).ConfigureAwait(false);
+        var csetId = await CreateChangesetViaSoapAsync(effectiveComment, soapChanges, ct).ConfigureAwait(false);
+        return new TfvcChangesetRef { ChangesetId = csetId };
     }
 
     /// <summary>
@@ -493,7 +486,6 @@ public sealed class TfvcClientService
         CancellationToken ct = default)
     {
         var normalizedPath = NormalizeServerPath(serverPath);
-        var client = _connection.GetTfvcClient();
 
         // Clean up any stale SOAP workspaces that might be holding pending changes
         await CleanupStaleSoapWorkspacesAsync(ct).ConfigureAwait(false);
@@ -514,19 +506,15 @@ public sealed class TfvcClientService
             .Where(i => !i.IsFolder)
             .ToDictionary(i => i.ServerPath, StringComparer.OrdinalIgnoreCase);
 
-        // Build change list: make current state match target state
-        var changes = new List<TfvcChange>();
+        // Build change list: make current state match target state (using SOAP tuples)
+        var soapChanges = new List<(string serverPath, string changeType, byte[]? content, int? baseVersion)>();
 
         // Files in current but NOT in target -> Delete
         foreach (var (path, item) in currentFiles)
         {
             if (!targetFiles.ContainsKey(path))
             {
-                changes.Add(new TfvcChange
-                {
-                    Item = new TfvcItem { Path = path, ChangesetVersion = item.ChangesetId },
-                    ChangeType = VersionControlChangeType.Delete,
-                });
+                soapChanges.Add((path, "Delete", null, item.ChangesetId));
             }
         }
 
@@ -536,7 +524,7 @@ public sealed class TfvcClientService
             if (!currentFiles.ContainsKey(path))
             {
                 var content = await DownloadFileContentAsync(path, targetChangesetId, ct).ConfigureAwait(false);
-                changes.Add(BuildTfvcChange(path, VersionControlChangeType.Add, content, null));
+                soapChanges.Add((path, "Add", content, null));
             }
         }
 
@@ -556,10 +544,10 @@ public sealed class TfvcClientService
             catch { continue; }
 
             if (ContentEquals(targetContent, currentContent)) continue;
-            changes.Add(BuildTfvcChange(path, VersionControlChangeType.Edit, targetContent, currentItem.ChangesetId));
+            soapChanges.Add((path, "Edit", targetContent, currentItem.ChangesetId));
         }
 
-        if (changes.Count == 0)
+        if (soapChanges.Count == 0)
             throw new InvalidOperationException($"Already at target state (cs{targetChangesetId}).");
 
         // Try to submit. If pending changes block it, retry excluding problematic files.
@@ -571,8 +559,8 @@ public sealed class TfvcClientService
                 var submitComment = skippedFiles.Count > 0
                     ? $"{effectiveComment} [skipped {skippedFiles.Count} file(s) with pending changes]"
                     : effectiveComment;
-                var changeset = new TfvcChangeset { Comment = submitComment, Changes = changes };
-                return await client.CreateChangesetAsync(changeset, cancellationToken: ct).ConfigureAwait(false);
+                var csetId = await CreateChangesetViaSoapAsync(submitComment, soapChanges, ct).ConfigureAwait(false);
+                return new TfvcChangesetRef { ChangesetId = csetId };
             }
             catch (Exception ex) when (ex.Message.Contains("挂起的更改") || ex.Message.Contains("pending change"))
             {
@@ -586,10 +574,10 @@ public sealed class TfvcClientService
                 skippedFiles.Add(blockedPath);
 
                 // Remove ALL changes related to this path
-                changes.RemoveAll(c =>
-                    string.Equals(c.Item?.Path, blockedPath, StringComparison.OrdinalIgnoreCase));
+                soapChanges.RemoveAll(c =>
+                    string.Equals(c.serverPath, blockedPath, StringComparison.OrdinalIgnoreCase));
 
-                if (changes.Count == 0)
+                if (soapChanges.Count == 0)
                     throw new InvalidOperationException(
                         $"All changes blocked by pending changes. Blocked files: {string.Join(", ", skippedFiles)}");
             }
@@ -1240,6 +1228,7 @@ public sealed class TfvcClientService
         var warnings = new List<string>();
         var plannedChanges = new List<MergeExecutionChange>();
         var tfvcChanges = new List<TfvcChange>();
+        var soapMergeChanges = new List<(string serverPath, string changeType, byte[]? content, int? baseVersion)>();
         var expectedContentByTarget = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         var expectedDeletes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var resolutionBySource = BuildResolutionBySource(resolutions);
@@ -1395,6 +1384,11 @@ public sealed class TfvcClientService
                 targetChangeType,
                 content,
                 targetExists));
+            soapMergeChanges.Add((
+                targetServerPath,
+                targetChangeType.ToString(),
+                content,
+                targetExists));
 
             if (targetChangeType.HasFlag(VersionControlChangeType.Delete))
             {
@@ -1436,21 +1430,17 @@ public sealed class TfvcClientService
             };
         }
 
-        warnings.Add("Changes were applied as a direct check-in (take-source). TFVC merge history is not recorded because the REST changeset API does not support merge change types.");
+        warnings.Add("Changes were applied as a direct check-in (take-source) via SOAP. TFVC merge history is not recorded via this path.");
 
         // Embed a structured marker so the candidate filter can detect this merge cross-workspace.
         var commentWithMarker = effectiveComment.TrimEnd()
             + " "
             + MergeCommentMarker.Build(normalizedSource, sourceChangesetId, normalizedTarget);
 
-        var created = await _connection.GetTfvcClient().CreateChangesetAsync(new TfvcChangeset
-        {
-            Comment = commentWithMarker,
-            Changes = tfvcChanges,
-        }, cancellationToken: ct).ConfigureAwait(false);
+        var createdChangesetId = await CreateChangesetViaSoapAsync(commentWithMarker, soapMergeChanges, ct).ConfigureAwait(false);
 
         var verifyWarnings = await VerifyMergeChangesetAppliedAsync(
-            created.ChangesetId,
+            createdChangesetId,
             tfvcChanges.Select(change => change.Item?.Path).Where(path => !string.IsNullOrEmpty(path)).Cast<string>().ToArray(),
             expectedContentByTarget,
             expectedDeletes,
@@ -1464,9 +1454,9 @@ public sealed class TfvcClientService
             SourceChangesetId = sourceChangesetId,
             SourcePath = normalizedSource,
             TargetPath = normalizedTarget,
-            TargetChangesetId = created.ChangesetId,
+            TargetChangesetId = createdChangesetId,
             MergedAtUtc = DateTime.UtcNow,
-            Method = "rest-takesource",
+            Method = "soap-takesource",
         });
 
         return new MergeExecutionResult
@@ -1478,7 +1468,7 @@ public sealed class TfvcClientService
             SourceToChangesetId = sourceChangesetId,
             Comment = commentWithMarker,
             DryRun = false,
-            CreatedChangesetId = created.ChangesetId,
+            CreatedChangesetId = createdChangesetId,
             BaseInfo = mergeBase,
             Changes = plannedChanges.Select(change => new MergeExecutionChange
             {
@@ -2948,34 +2938,27 @@ public sealed class TfvcClientService
         IEnumerable<(string serverPath, Models.ChangeType changeType, byte[]? content, int? baseChangesetId)> changes,
         CancellationToken ct = default)
     {
-        var client = _connection.GetTfvcClient();
+        var soapChanges = changes.Select(c => (
+            c.serverPath,
+            changeType: MapChangeTypeToSoapString(c.changeType),
+            c.content,
+            c.baseChangesetId
+        )).ToList();
 
-        var tfvcChanges = new List<TfvcChange>();
-        foreach (var (serverPath, changeType, content, baseChangesetId) in changes)
-        {
-            var tfvcChangeType = MapChangeType(changeType);
-            tfvcChanges.Add(BuildTfvcChange(serverPath, tfvcChangeType, content, baseChangesetId));
-        }
-
-        var changeset = new TfvcChangeset
-        {
-            Comment = comment,
-            Changes = tfvcChanges,
-        };
-
-        return await client.CreateChangesetAsync(changeset, cancellationToken: ct).ConfigureAwait(false);
+        var csetId = await CreateChangesetViaSoapAsync(comment, soapChanges, ct).ConfigureAwait(false);
+        return new TfvcChangesetRef { ChangesetId = csetId };
     }
 
-    /// <summary>将本地 <see cref="Models.ChangeType"/> 转换为 REST API 的 <see cref="VersionControlChangeType"/>。</summary>
-    private static VersionControlChangeType MapChangeType(Models.ChangeType changeType) =>
+    /// <summary>将本地 <see cref="Models.ChangeType"/> 转换为 SOAP PendChanges 的请求类型字符串。</summary>
+    private static string MapChangeTypeToSoapString(Models.ChangeType changeType) =>
         changeType switch
         {
-            Models.ChangeType.Add => VersionControlChangeType.Add,
-            Models.ChangeType.Edit => VersionControlChangeType.Edit,
-            Models.ChangeType.Delete => VersionControlChangeType.Delete,
-            Models.ChangeType.Rename => VersionControlChangeType.Rename,
-            Models.ChangeType.Undelete => VersionControlChangeType.Undelete,
-            _ => VersionControlChangeType.None,
+            Models.ChangeType.Add => "Add",
+            Models.ChangeType.Edit => "Edit",
+            Models.ChangeType.Delete => "Delete",
+            Models.ChangeType.Rename => "Rename",
+            Models.ChangeType.Undelete => "Undelete",
+            _ => "Edit",
         };
 
     private static TfvcChange BuildTfvcChange(
@@ -3056,6 +3039,41 @@ public sealed class TfvcClientService
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// 通过 SOAP 协议创建 changeset（替代 REST CreateChangesetAsync）。
+    /// 流程：CreateWorkspace → PendChanges → Upload → CheckIn → DeleteWorkspace。
+    /// </summary>
+    private async Task<int> CreateChangesetViaSoapAsync(
+        string comment,
+        IReadOnlyList<(string serverPath, string changeType, byte[]? content, int? baseVersion)> changes,
+        CancellationToken ct)
+    {
+        var owner = await ResolveOwnerForSoapAsync(ct).ConfigureAwait(false);
+        var soap = new Soap.TfvcSoapClient(_connection);
+
+        var soapChanges = changes.Select(c => new Models.Soap.SoapContentChange
+        {
+            ChangeType = c.changeType,
+            ServerPath = c.serverPath,
+            Content = c.content,
+            BaseVersion = c.baseVersion,
+        }).ToList();
+
+        return await soap.CheckInWithContentAsync(comment, owner, soapChanges, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Resolve the authenticated user identity (GUID) for SOAP workspace operations.
+    /// </summary>
+    private async Task<string> ResolveOwnerForSoapAsync(CancellationToken ct)
+    {
+        var owner = await _connection.GetAuthenticatedUserGuidAsync(ct).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(owner))
+            throw new InvalidOperationException(
+                "Cannot resolve authenticated user for SOAP operation. Ensure the PAT is valid.");
+        return owner;
     }
 
     /// <summary>

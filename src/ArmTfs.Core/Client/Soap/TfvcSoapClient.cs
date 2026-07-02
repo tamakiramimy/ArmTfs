@@ -727,6 +727,190 @@ public sealed class TfvcSoapClient
         }
     }
 
+    // ─── PendChanges (General) + Upload + CheckInWithContent ─────────────────
+
+    /// <summary>
+    /// 在 workspace 中 pend 一组变更（Edit/Add/Delete/Undelete），返回每个操作的 GetOperation 信息。
+    /// 这是 PendChanges 的通用版本，支持批量 ChangeRequest。
+    /// </summary>
+    public async Task<IReadOnlyList<SoapPendChangeOperation>> PendChangesAsync(
+        string workspaceName,
+        string ownerName,
+        IReadOnlyList<SoapChangeRequest> changeRequests,
+        CancellationToken ct = default)
+    {
+        if (changeRequests.Count == 0)
+            throw new ArgumentException("At least one change request is required.", nameof(changeRequests));
+
+        var changesXml = new StringBuilder();
+        foreach (var req in changeRequests)
+        {
+            var targetAttr = string.IsNullOrEmpty(req.TargetServerPath) ? "" : $@" target=""{Esc(req.TargetServerPath)}""";
+            var encAttr = req.Encoding.HasValue ? $@" enc=""{req.Encoding.Value}""" : "";
+            var typeAttr = string.IsNullOrEmpty(req.ItemType) ? "" : $@" type=""{Esc(req.ItemType)}""";
+            var vspecEl = req.BaseVersion.HasValue
+                ? $@"<tns:vspec xsi:type=""tns:ChangesetVersionSpec"" cs=""{req.BaseVersion.Value}"" />"
+                : @"<tns:vspec xsi:type=""tns:LatestVersionSpec"" />";
+
+            changesXml.AppendLine($@"        <tns:ChangeRequest req=""{Esc(req.RequestType)}"" lock=""Unchanged""{targetAttr}{encAttr}{typeAttr}>
+          <tns:item item=""{Esc(req.ServerPath)}"" recurse=""None"" did=""0"" />
+          {vspecEl}
+        </tns:ChangeRequest>");
+        }
+
+        var body = $@"    <tns:PendChanges>
+      <tns:workspaceName>{Esc(workspaceName)}</tns:workspaceName>
+      <tns:ownerName>{Esc(ownerName)}</tns:ownerName>
+      <tns:changes>
+{changesXml}      </tns:changes>
+      <tns:pendChangesOptions>0</tns:pendChangesOptions>
+      <tns:supportedFeatures>0</tns:supportedFeatures>
+    </tns:PendChanges>";
+
+        var doc = await InvokeAsync("PendChanges", body, ct).ConfigureAwait(false);
+
+        var result = new List<SoapPendChangeOperation>();
+        foreach (var op in doc.Descendants().Where(e => e.Name.LocalName == "GetOperation"))
+        {
+            result.Add(new SoapPendChangeOperation
+            {
+                ItemId = TryParseInt(AttrAny(op, "itemid")) ?? 0,
+                ServerItem = AttrAny(op, "titem") ?? AttrAny(op, "sitem") ?? string.Empty,
+                ChangeType = AttrAny(op, "chg") ?? string.Empty,
+            });
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 上传文件内容到 workspace 中的挂起变更。使用 TFS 的 upload.ashx 端点。
+    /// 对于 Edit/Add 操作，在 PendChanges 之后、CheckIn 之前调用。
+    /// </summary>
+    public async Task UploadFileToWorkspaceAsync(
+        string workspaceName,
+        string ownerName,
+        string serverPath,
+        byte[] content,
+        CancellationToken ct = default)
+    {
+        // TFS upload endpoint: {collection}/VersionControl/v1.0/upload.ashx
+        // This uploads content as a chunked multipart/form-data POST
+        var uploadUrl = _connection.ServerUrl.TrimEnd('/') + "/VersionControl/v1.0/upload.ashx";
+
+        using var httpClient = _connection.CreateHttpClient();
+        using var formContent = new MultipartFormDataContent();
+
+        // The upload requires workspace context and content metadata
+        formContent.Add(new StringContent(content.Length.ToString()), "filelength");
+        formContent.Add(new ByteArrayContent(content), "content", "file");
+
+        // Build the upload URL with workspace and path query parameters
+        var queryUrl = $"{uploadUrl}?item={Uri.EscapeDataString(serverPath)}&wsname={Uri.EscapeDataString(workspaceName)}&wsowner={Uri.EscapeDataString(ownerName)}";
+
+        using var response = await httpClient.PostAsync(queryUrl, formContent, ct).ConfigureAwait(false);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            throw new SoapFaultException("UploadFile", response.StatusCode,
+                $"Upload failed for {serverPath}: {body[..Math.Min(500, body.Length)]}", body);
+        }
+    }
+
+    /// <summary>
+    /// 完整的 SOAP 签入流程：CreateWorkspace → PendChanges → Upload content → CheckIn → DeleteWorkspace。
+    /// 替代 REST CreateChangesetAsync，完全通过 SOAP/TFS 旧版端点实现。
+    /// </summary>
+    /// <param name="changes">每个变更包含: 服务器路径、变更类型(Edit/Add/Delete/Undelete)、文件内容(Delete 时为 null)、基线版本</param>
+    /// <param name="comment">Changeset 注释</param>
+    /// <param name="ownerName">Workspace owner（认证用户 GUID）</param>
+    /// <returns>新创建的 changeset ID</returns>
+    public async Task<int> CheckInWithContentAsync(
+        string comment,
+        string ownerName,
+        IReadOnlyList<SoapContentChange> changes,
+        CancellationToken ct = default)
+    {
+        if (changes.Count == 0)
+            throw new ArgumentException("At least one change is required.", nameof(changes));
+
+        var workspaceName = $"arm-tfs-soap-checkin-{Guid.NewGuid():N}";
+        var computer = Environment.MachineName;
+
+        // Build working folder mappings: map each unique project root
+        var roots = changes
+            .Select(c => GetProjectRoot(c.ServerPath))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var tempRoot = Path.Combine(Path.GetTempPath(), "arm-tfs-checkin", workspaceName);
+        var folders = roots.Select((r, i) => (r, Path.Combine(tempRoot, $"m{i}"))).ToArray();
+
+        SoapWorkspace? createdWs = null;
+        string effectiveOwner = ownerName;
+
+        try
+        {
+            // 1. Create workspace
+            var ws = await CreateWorkspaceAsync(workspaceName, ownerName, computer, "arm-tfs SOAP checkin", folders, ct).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(ws.Owner)) effectiveOwner = ws.Owner;
+            createdWs = ws;
+
+            // 2. PendChanges for all items
+            var changeRequests = changes.Select(c => new SoapChangeRequest
+            {
+                RequestType = c.ChangeType,
+                ServerPath = c.ServerPath,
+                BaseVersion = c.BaseVersion,
+                Encoding = c.Content is not null ? 65001 : null,
+                ItemType = "File",
+                TargetServerPath = c.TargetServerPath,
+            }).ToList();
+
+            var pendOps = await PendChangesAsync(workspaceName, effectiveOwner, changeRequests, ct).ConfigureAwait(false);
+
+            // 3. Upload content for Edit/Add operations
+            foreach (var change in changes)
+            {
+                if (change.Content is null) continue;
+                if (string.Equals(change.ChangeType, "Delete", StringComparison.OrdinalIgnoreCase)) continue;
+
+                await UploadFileToWorkspaceAsync(workspaceName, effectiveOwner, change.ServerPath, change.Content, ct).ConfigureAwait(false);
+            }
+
+            // 4. CheckIn — build pending changes from the PendChanges result
+            var pendingChanges = new List<SoapPendingChange>();
+            foreach (var change in changes)
+            {
+                var matchOp = pendOps.FirstOrDefault(op =>
+                    string.Equals(op.ServerItem, change.ServerPath, StringComparison.OrdinalIgnoreCase));
+                pendingChanges.Add(new SoapPendingChange
+                {
+                    ItemId = matchOp?.ItemId ?? 0,
+                    ServerItem = change.ServerPath,
+                    ChangeType = change.ChangeType,
+                });
+            }
+
+            var changesetId = await CheckInAsync(workspaceName, effectiveOwner, comment, pendingChanges, ct).ConfigureAwait(false);
+            return changesetId;
+        }
+        finally
+        {
+            if (createdWs is not null)
+            {
+                try { await DeleteWorkspaceAsync(workspaceName, effectiveOwner, ct).ConfigureAwait(false); }
+                catch (Exception ex) { Console.Error.WriteLine($"warning: checkin workspace cleanup failed: {ex.Message}"); }
+            }
+        }
+    }
+
+    private static string GetProjectRoot(string serverPath)
+    {
+        var parts = serverPath.TrimStart('$', '/').Split('/');
+        return parts.Length >= 1 ? $"$/{parts[0]}" : serverPath;
+    }
+
     /// <summary>
     /// 在 workspace 中 Pend 一个 Rename 操作，返回目标文件的 itemId（用于 CheckIn）。
     /// </summary>
