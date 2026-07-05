@@ -122,7 +122,11 @@ public class TfsConnection : IDisposable
     /// </summary>
     public virtual HttpClient CreateHttpClient()
     {
-        var client = new HttpClient();
+        var handler = new HttpClientHandler
+        {
+            AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate,
+        };
+        var client = new HttpClient(handler);
         if (!string.IsNullOrEmpty(_config.PersonalAccessToken))
         {
             var token = Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes($":{_config.PersonalAccessToken}"));

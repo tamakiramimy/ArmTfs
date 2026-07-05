@@ -1398,7 +1398,31 @@ public sealed class TfvcSoapClient
         using var httpClient = _connection.CreateHttpClient();
         using var response = await httpClient.GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
-        await response.Content.CopyToAsync(destination, ct).ConfigureAwait(false);
+
+        // TFS item.ashx always returns GZip-compressed content regardless of Accept-Encoding.
+        // Detect and decompress automatically.
+        using var responseStream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        using var buffered = new System.IO.MemoryStream();
+        await responseStream.CopyToAsync(buffered, ct).ConfigureAwait(false);
+        buffered.Position = 0;
+
+        if (buffered.Length >= 2)
+        {
+            var header = new byte[2];
+            buffered.Read(header, 0, 2);
+            buffered.Position = 0;
+
+            if (header[0] == 0x1F && header[1] == 0x8B)
+            {
+                // GZip compressed - decompress
+                using var gzip = new System.IO.Compression.GZipStream(buffered, System.IO.Compression.CompressionMode.Decompress);
+                await gzip.CopyToAsync(destination, ct).ConfigureAwait(false);
+                return;
+            }
+        }
+
+        // Not compressed - copy directly
+        await buffered.CopyToAsync(destination, ct).ConfigureAwait(false);
     }
 }
 
