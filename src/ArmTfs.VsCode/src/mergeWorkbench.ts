@@ -154,12 +154,15 @@ export class ArmTfsMergeWorkbench {
         },
       );
 
+      // Filter out candidates with 0 file changes (already merged)
+      const activeCandidates = candidates.filter((c) => c.changes.length > 0);
+
       this.state = {
         sourcePath,
         targetPath,
-        candidates,
+        candidates: activeCandidates,
         rangeConflicts: [],
-        selectedChangesetId: candidates[0]?.changesetId,
+        selectedChangesetId: activeCandidates[0]?.changesetId,
       };
 
       // SOAP 3-way merge plan for the whole candidate range. The per-changeset REST dry-run above
