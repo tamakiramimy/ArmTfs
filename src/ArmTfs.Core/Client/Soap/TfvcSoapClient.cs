@@ -1181,9 +1181,7 @@ public sealed class TfvcSoapClient
       <tns:workspaceName></tns:workspaceName>
       <tns:workspaceOwner></tns:workspaceOwner>
       <tns:items>
-        <tns:ItemSpec recurse=""{Esc(recursion)}"">
-          <tns:item>{Esc(serverPath)}</tns:item>
-        </tns:ItemSpec>
+        <tns:ItemSpec item=""{Esc(serverPath)}"" recurse=""{Esc(recursion)}"" />
       </tns:items>
       {versionEl}
       <tns:deletedState>NonDeleted</tns:deletedState>
