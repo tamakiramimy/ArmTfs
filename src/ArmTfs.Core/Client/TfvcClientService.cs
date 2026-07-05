@@ -1101,51 +1101,57 @@ public sealed class TfvcClientService
         var baseInfo = await ResolveMergeBaseAsync(sourcePath, targetPath, ct).ConfigureAwait(false);
         var sourceHistory = await GetChangesetsAsync(sourcePath, top: scan, ct: ct).ConfigureAwait(false);
 
-        var mergedRanges = new List<MergeSourceRange>();
         var commentTrackedIds = new HashSet<int>();
 
         // When ignoreMergeHistory is true, skip all merge-history detection
         // This allows re-merging after a rollback
         if (!ignoreMergeHistory)
         {
-            var targetHistory = await GetChangesetsAsync(targetPath, top: scan, ct: ct).ConfigureAwait(false);
-            var sourceMatchPath = baseInfo.SourceBranchPath ?? sourcePath;
+            // Use SOAP range merge dry-run to check if the full source range
+            // has any pending changes against the target. This replaces the old
+            // MergeSources-based detection which broke after SOAP migration
+            // (QueryChangesForChangeset no longer returns MergeSources).
+            if (sourceHistory.Count > 0)
+            {
+                try
+                {
+                    var firstCs = sourceHistory.Last().ChangesetId;  // oldest
+                    var lastCs = sourceHistory.First().ChangesetId;  // newest
+                    var rangePlan = await MergeChangesetRangeViaSoapAsync(
+                        sourcePath, targetPath, firstCs, lastCs,
+                        dryRun: true, ct: ct).ConfigureAwait(false);
+                    if (rangePlan.Changes.Count == 0)
+                    {
+                        // Everything in the scanned range is already merged
+                        return new MergeCandidateQueryResult
+                        {
+                            BaseInfo = baseInfo,
+                            SourceHistoryScanned = sourceHistory.Count,
+                            TargetHistoryScanned = 0,
+                            SourceUniqueFloorChangesetId = GetSourceUniqueFloor(baseInfo),
+                            MergedRanges = Array.Empty<MergeSourceRange>(),
+                            Candidates = Array.Empty<MergeCandidateInfo>(),
+                        };
+                    }
+                }
+                catch
+                {
+                    // Dry-run failed (e.g. workspace conflict) — fall through
+                    // and show full candidate list
+                }
+            }
 
+            // Lightweight comment-marker detection from target history
+            var targetHistory = await GetChangesetsAsync(targetPath, top: scan, ct: ct).ConfigureAwait(false);
             foreach (var targetChangeset in targetHistory)
             {
-                var detail = await GetChangesetAsync(targetChangeset.ChangesetId, ct).ConfigureAwait(false);
-
-                var marker = MergeCommentMarker.Parse(detail.Comment);
+                var marker = MergeCommentMarker.Parse(targetChangeset.Comment);
                 if (marker is not null
                     && marker.SourceChangesetId > 0
                     && IsSameOrDescendantPath(sourcePath, marker.SourcePath)
                     && IsSameOrDescendantPath(targetPath, marker.TargetPath))
                 {
                     commentTrackedIds.Add(marker.SourceChangesetId);
-                }
-
-                if (detail.Changes is null)
-                    continue;
-
-                foreach (var change in detail.Changes)
-                {
-                    if (change.MergeSources is null)
-                        continue;
-
-                    foreach (var mergeSource in change.MergeSources)
-                    {
-                        if (string.IsNullOrEmpty(mergeSource.ServerItem) || !IsSameOrDescendantPath(mergeSource.ServerItem, sourceMatchPath))
-                            continue;
-
-                        mergedRanges.Add(new MergeSourceRange
-                        {
-                            ServerItem = mergeSource.ServerItem,
-                            VersionFrom = mergeSource.VersionFrom,
-                            VersionTo = mergeSource.VersionTo,
-                            IsRename = mergeSource.IsRename,
-                            TargetChangesetId = targetChangeset.ChangesetId,
-                        });
-                    }
                 }
             }
         }
@@ -1159,10 +1165,6 @@ public sealed class TfvcClientService
 
             if (!ignoreMergeHistory)
             {
-                var coveringRange = mergedRanges.FirstOrDefault(range => range.Covers(changeset.ChangesetId));
-                if (coveringRange is not null)
-                    continue;
-
                 if (commentTrackedIds.Contains(changeset.ChangesetId))
                     continue;
 
@@ -1216,12 +1218,9 @@ public sealed class TfvcClientService
         {
             BaseInfo = baseInfo,
             SourceHistoryScanned = sourceHistory.Count,
-            TargetHistoryScanned = ignoreMergeHistory ? 0 : mergedRanges.Count,
+            TargetHistoryScanned = 0,
             SourceUniqueFloorChangesetId = uniqueFloor,
-            MergedRanges = mergedRanges
-                .OrderByDescending(range => range.VersionTo ?? int.MinValue)
-                .ThenByDescending(range => range.TargetChangesetId)
-                .ToList(),
+            MergedRanges = Array.Empty<MergeSourceRange>(),
             Candidates = candidates,
         };
     }
