@@ -342,7 +342,7 @@ public sealed class WorkspaceManager
     public static string ComputeFileHash(string filePath)
     {
         using var sha = SHA256.Create();
-        using var stream = File.OpenRead(filePath);
+        using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         var hash = sha.ComputeHash(stream);
         return Convert.ToHexString(hash).ToLowerInvariant();
     }
