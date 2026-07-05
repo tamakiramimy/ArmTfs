@@ -40,7 +40,7 @@ class SectionNode extends ArmTfsTreeNode {
 
 class BranchNode extends ArmTfsTreeNode {
   constructor(public readonly branch: BranchRef) {
-    super(path.posix.basename(branch.path), vscode.TreeItemCollapsibleState.Collapsed);
+    super(path.posix.basename(branch.path), vscode.TreeItemCollapsibleState.None);
     this.id = `branch:${branch.path}`;
     this.description = branch.path;
     this.tooltip = [branch.path, branch.description, branch.owner?.displayName].filter(Boolean).join('\n');
