@@ -862,10 +862,12 @@ public sealed class TfvcSoapClient
       <tns:options>{options}</tns:options>
     </tns:QueryBranchObjects>";
 
-        var doc = await InvokeAsync("QueryBranchObjects", body, ct).ConfigureAwait(false);
+        try
+        {
+            var doc = await InvokeAsync("QueryBranchObjects", body, ct).ConfigureAwait(false);
 
-        var result = new List<SoapBranchObject>();
-        foreach (var bo in doc.Descendants().Where(e => e.Name.LocalName == "BranchObject"))
+            var result = new List<SoapBranchObject>();
+            foreach (var bo in doc.Descendants().Where(e => e.Name.LocalName == "BranchObject"))
         {
             // BranchObject has a <Properties> child with <RootItem> child that has `item` attribute
             var propsEl = bo.Elements().FirstOrDefault(e => e.Name.LocalName == "Properties");
@@ -909,6 +911,19 @@ public sealed class TfvcSoapClient
         }
 
         return result;
+        }
+        catch (SoapFaultException)
+        {
+            // QueryBranchObjects is only available on Repository4/5.asmx (TFS 2012+).
+            // Fallback: use QueryItems to list subfolders as branch candidates.
+            if (string.IsNullOrEmpty(serverPath)) return new List<SoapBranchObject>();
+
+            var items = await QueryItemsAsync(serverPath, "OneLevel", null, ct).ConfigureAwait(false);
+            return items
+                .Where(i => i.IsFolder && !string.Equals(i.ServerPath, serverPath, StringComparison.OrdinalIgnoreCase))
+                .Select(i => new SoapBranchObject(i.ServerPath, null, i.CheckinDate, null, false, null, null))
+                .ToList();
+        }
     }
 
     // ─── PendChanges (General) + Upload + CheckInWithContent ─────────────────
@@ -1216,8 +1231,8 @@ public sealed class TfvcSoapClient
         <tns:recurse>Full</tns:recurse>
       </tns:itemSpec>
       <tns:versionItem xsi:type=""tns:LatestVersionSpec"" />
-      <tns:versionFrom xsi:nil=""true"" />
-      <tns:versionTo xsi:nil=""true"" />
+      <tns:versionFrom xsi:type=""tns:ChangesetVersionSpec"" cs=""1"" />
+      <tns:versionTo xsi:type=""tns:LatestVersionSpec"" />
       <tns:maxCount>{maxCount}</tns:maxCount>
       <tns:includeFiles>{(includeFiles ? "true" : "false")}</tns:includeFiles>
       <tns:generateDownloadUrls>false</tns:generateDownloadUrls>
