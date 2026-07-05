@@ -1305,7 +1305,7 @@ public sealed class TfvcSoapClient
         while (true)
         {
             var lastItemEl = lastItem is null
-                ? @"<tns:lastItem xsi:nil=""true"" />"
+                ? ""
                 : $"<tns:lastItem>{Esc(lastItem)}</tns:lastItem>";
 
             var body = $@"    <tns:QueryChangesForChangeset>
@@ -1391,7 +1391,7 @@ public sealed class TfvcSoapClient
         int? atChangeset = null,
         CancellationToken ct = default)
     {
-        // 使用 QueryItems 获取下载 URL
+        // Use QueryItems to get the download URL token
         var items = await QueryItemsAsync(serverPath, "None", atChangeset, ct).ConfigureAwait(false);
         var item = items.FirstOrDefault(i => !i.IsFolder);
         if (item is null)
@@ -1399,10 +1399,9 @@ public sealed class TfvcSoapClient
         if (string.IsNullOrEmpty(item.DownloadUrl))
             throw new InvalidOperationException($"No download URL returned for: {serverPath}");
 
-        // 下载 URL 是相对路径，需要拼接 collection base URL
-        var downloadUrl = item.DownloadUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase)
-            ? item.DownloadUrl
-            : _connection.ServerUrl.TrimEnd('/') + "/" + item.DownloadUrl.TrimStart('/');
+        // The durl is a query-string token; prepend the collection's download handler
+        var baseUrl = _connection.ServerUrl.TrimEnd('/');
+        var downloadUrl = $"{baseUrl}/VersionControl/v1.0/item.ashx?{item.DownloadUrl}";
 
         using var httpClient = _connection.CreateHttpClient();
         using var response = await httpClient.GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
