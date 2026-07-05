@@ -1224,10 +1224,7 @@ public sealed class TfvcSoapClient
         var body = $@"    <tns:QueryHistory>
       <tns:workspaceName></tns:workspaceName>
       <tns:workspaceOwner></tns:workspaceOwner>
-      <tns:itemSpec>
-        <tns:item>{Esc(serverPath)}</tns:item>
-        <tns:recurse>Full</tns:recurse>
-      </tns:itemSpec>
+      <tns:itemSpec item=""{Esc(serverPath)}"" recurse=""Full"" />
       <tns:versionItem xsi:type=""tns:LatestVersionSpec"" />
       <tns:versionFrom xsi:type=""tns:ChangesetVersionSpec"" cs=""1"" />
       <tns:versionTo xsi:type=""tns:LatestVersionSpec"" />
