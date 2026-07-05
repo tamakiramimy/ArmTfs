@@ -1107,10 +1107,8 @@ public sealed class TfvcClientService
         // This allows re-merging after a rollback
         if (!ignoreMergeHistory)
         {
-            // Use SOAP range merge dry-run to check if the full source range
-            // has any pending changes against the target. This replaces the old
-            // MergeSources-based detection which broke after SOAP migration
-            // (QueryChangesForChangeset no longer returns MergeSources).
+            // Use SOAP range merge dry-run to determine which source changesets
+            // actually need merging. Only changesets that produce file changes are candidates.
             if (sourceHistory.Count > 0)
             {
                 try
@@ -1133,11 +1131,26 @@ public sealed class TfvcClientService
                             Candidates = Array.Empty<MergeCandidateInfo>(),
                         };
                     }
+
+                    // Extract the source changeset IDs that actually need merging
+                    var neededSourceChangesets = new HashSet<int>(
+                        rangePlan.Changes
+                            .Select(c => c.SourceChangesetId)
+                            .Where(id => id > 0));
+
+                    // Filter source history to only include changesets in the needed set
+                    // or changesets NEWER than the max needed (they might have inter-dependencies)
+                    if (neededSourceChangesets.Count > 0)
+                    {
+                        var maxNeeded = neededSourceChangesets.Max();
+                        sourceHistory = sourceHistory
+                            .Where(cs => neededSourceChangesets.Contains(cs.ChangesetId) || cs.ChangesetId >= maxNeeded)
+                            .ToList();
+                    }
                 }
                 catch
                 {
-                    // Dry-run failed (e.g. workspace conflict) — fall through
-                    // and show full candidate list
+                    // Dry-run failed — fall through and show full candidate list
                 }
             }
 
