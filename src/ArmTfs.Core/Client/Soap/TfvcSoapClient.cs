@@ -843,7 +843,7 @@ public sealed class TfvcSoapClient
     // ─── QueryBranchObjects ──────────────────────────────────────────────────
 
     /// <summary>
-    /// 查询 TFVC 分支对象信息（SOAP QueryBranchObjects）。
+    /// 查询 TFVC 分支对象信息（SOAP QueryBranches）。
     /// 返回指定路径的分支信息，包含父分支和子分支关系。
     /// </summary>
     public async Task<IReadOnlyList<SoapBranchObject>> QueryBranchObjectsAsync(
@@ -851,79 +851,71 @@ public sealed class TfvcSoapClient
         bool includeChildren = true,
         CancellationToken ct = default)
     {
-        var itemsXml = string.IsNullOrEmpty(serverPath)
-            ? @"<tns:items />"
-            : $@"<tns:items><tns:ItemIdentifier item=""{Esc(serverPath)}"" /></tns:items>";
+        if (string.IsNullOrEmpty(serverPath))
+            return new List<SoapBranchObject>();
 
-        var options = includeChildren ? "IncludeParent | IncludeChildren" : "IncludeParent";
+        // Use QueryBranches (supported on all TFS versions) instead of QueryBranchObjects
+        var body = $@"    <tns:QueryBranches>
+      <tns:workspaceName></tns:workspaceName>
+      <tns:workspaceOwner></tns:workspaceOwner>
+      <tns:items>
+        <tns:ItemSpec item=""{Esc(serverPath)}"" recurse=""None"" />
+      </tns:items>
+    </tns:QueryBranches>";
 
-        var body = $@"    <tns:QueryBranchObjects>
-      {itemsXml}
-      <tns:options>{options}</tns:options>
-    </tns:QueryBranchObjects>";
+        var doc = await InvokeAsync("QueryBranches", body, ct).ConfigureAwait(false);
 
-        try
+        // Parse BranchRelative elements to build parent-child relationships
+        var relatives = doc.Descendants()
+            .Where(e => e.Name.LocalName == "BranchRelative")
+            .ToList();
+
+        // Find the requested item (reqstd=true)
+        var requestedRel = relatives.FirstOrDefault(r =>
+            string.Equals(AttrAny(r, "reqstd"), "true", StringComparison.OrdinalIgnoreCase));
+
+        if (requestedRel is null && relatives.Count > 0)
+            requestedRel = relatives.First();
+
+        if (requestedRel is null)
+            return new List<SoapBranchObject>();
+
+        var requestedId = AttrAny(requestedRel, "reltoid") ?? "0";
+        var branchToItem = requestedRel.Elements().FirstOrDefault(e => e.Name.LocalName == "BranchToItem");
+        var requestedPath = AttrAny(branchToItem, "item") ?? serverPath;
+        DateTimeOffset? dateCreated = DateTimeOffset.TryParse(AttrAny(branchToItem, "date"), out var dc) ? dc : null;
+
+        // Find parent (the item that requested item branches FROM)
+        var parentFromId = AttrAny(requestedRel, "relfromid") ?? "0";
+        string? parentPath = null;
+        if (parentFromId != "0")
         {
-            var doc = await InvokeAsync("QueryBranchObjects", body, ct).ConfigureAwait(false);
-
-            var result = new List<SoapBranchObject>();
-            foreach (var bo in doc.Descendants().Where(e => e.Name.LocalName == "BranchObject"))
-        {
-            // BranchObject has a <Properties> child with <RootItem> child that has `item` attribute
-            var propsEl = bo.Elements().FirstOrDefault(e => e.Name.LocalName == "Properties");
-            var rootItemEl = propsEl?.Elements().FirstOrDefault(e => e.Name.LocalName == "RootItem");
-            var path = AttrAny(rootItemEl, "item") ?? AttrAny(bo, "item") ?? string.Empty;
-            var description = (propsEl is not null ? ChildText(propsEl, "Description") : null) ?? ChildText(bo, "Description");
-            DateTimeOffset? dateCreated = DateTimeOffset.TryParse(
-                AttrAny(propsEl, "DateCreated") ?? AttrAny(bo, "DateCreated") ?? (propsEl is not null ? ChildText(propsEl, "DateCreated") : null),
-                out var dc) ? dc : null;
-            var isDeleted = string.Equals(
-                AttrAny(rootItemEl, "del") ?? AttrAny(bo, "IsDeleted"),
-                "true", StringComparison.OrdinalIgnoreCase);
-            var owner = AttrAny(propsEl, "Owner") ?? (propsEl is not null ? ChildText(propsEl, "Owner") : null);
-
-            // Parent branch
-            var parentEl = propsEl?.Elements().FirstOrDefault(e => e.Name.LocalName == "ParentBranch");
-            var parentPath = AttrAny(parentEl, "item");
-
-            // Children
-            var childPaths = new List<string>();
-            var childBranches = bo.Elements().Where(e => e.Name.LocalName == "ChildBranch" || e.Name.LocalName == "ChildItem");
-            foreach (var child in childBranches)
+            var parentRel = relatives.FirstOrDefault(r => AttrAny(r, "reltoid") == parentFromId);
+            if (parentRel != null)
             {
-                var childPath = AttrAny(child, "item");
+                var parentItem = parentRel.Elements().FirstOrDefault(e => e.Name.LocalName == "BranchToItem");
+                parentPath = AttrAny(parentItem, "item");
+            }
+        }
+
+        // Find children (items whose relfromid = requestedId)
+        var childPaths = new List<string>();
+        foreach (var rel in relatives)
+        {
+            if (AttrAny(rel, "relfromid") == requestedId && AttrAny(rel, "reltoid") != requestedId)
+            {
+                var childItem = rel.Elements().FirstOrDefault(e => e.Name.LocalName == "BranchToItem");
+                var childPath = AttrAny(childItem, "item");
                 if (!string.IsNullOrEmpty(childPath))
                     childPaths.Add(childPath);
             }
-            // Also check for ChildBranches container
-            var childBranchesContainer = bo.Elements().FirstOrDefault(e => e.Name.LocalName == "ChildBranches");
-            if (childBranchesContainer is not null)
-            {
-                foreach (var child in childBranchesContainer.Elements())
-                {
-                    var childPath = AttrAny(child, "item");
-                    if (!string.IsNullOrEmpty(childPath))
-                        childPaths.Add(childPath);
-                }
-            }
-
-            result.Add(new SoapBranchObject(path, description, dateCreated, parentPath, isDeleted, owner, childPaths.Count > 0 ? childPaths : null));
         }
 
-        return result;
-        }
-        catch (SoapFaultException)
-        {
-            // QueryBranchObjects is only available on Repository4/5.asmx (TFS 2012+).
-            // Fallback: use QueryItems to list subfolders as branch candidates.
-            if (string.IsNullOrEmpty(serverPath)) return new List<SoapBranchObject>();
+        var result = new SoapBranchObject(
+            requestedPath, null, dateCreated, parentPath, false, null,
+            childPaths.Count > 0 ? childPaths : null);
 
-            var items = await QueryItemsAsync(serverPath, "OneLevel", null, ct).ConfigureAwait(false);
-            return items
-                .Where(i => i.IsFolder && !string.Equals(i.ServerPath, serverPath, StringComparison.OrdinalIgnoreCase))
-                .Select(i => new SoapBranchObject(i.ServerPath, null, i.CheckinDate, null, false, null, null))
-                .ToList();
-        }
+        return new List<SoapBranchObject> { result };
     }
 
     // ─── PendChanges (General) + Upload + CheckInWithContent ─────────────────
