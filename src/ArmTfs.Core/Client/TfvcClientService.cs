@@ -2445,9 +2445,9 @@ public sealed class TfvcClientService
             .Select(path => NormalizeServerPath(path!))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        // TFS REST CreateChangeset silently drops files whose content is identical to the
-        // current target version (server-side dedup). For those paths, verify that the
-        // target now has the expected content instead of failing the whole merge.
+        // SOAP CreateChangeset (via Repository.asmx) silently skips files whose content is
+        // identical to the current target version (server-side dedup). For those paths,
+        // verify that the target now has the expected content instead of failing the merge.
         var missingPaths = expectedTargetPaths
             .Where(path => !changedPaths.Contains(NormalizeServerPath(path)))
             .ToList();
@@ -2693,11 +2693,11 @@ public sealed class TfvcClientService
             return VersionControlChangeType.None;
         }
 
-        // NOTE: The REST "create changeset" (push) API used by CreateChangesetAsync does not
-        // support the TFVC `Merge` change-type flag — the server rejects any combination such as
-        // "Add, Merge" or "Branch, Merge" with "unsupported change type". Merge metadata (the
-        // server-side merge history link) therefore cannot be recorded through this endpoint. To
-        // make the merge actually land, we apply the source content to the target as a plain
+        // NOTE: SOAP Repository.asmx CheckIn with Merge change-type is required to record proper
+        // TFVC merge history. Any other approach (e.g. plain Edit changesets) produces commits
+        // without server-side merge links, so future merge candidate queries will re-propose
+        // already-merged changesets. To apply content without native merge semantics,
+        // we commit the source content to the target as a plain
         // check-in: Edit when the file already exists in the target, Add when it is new, and Delete
         // when the source removed it. The merge lineage is not recorded (callers are warned).
         if (sourceChangeType.HasFlag(VersionControlChangeType.Delete))
@@ -3107,7 +3107,7 @@ public sealed class TfvcClientService
     }
 
     /// <summary>
-    /// 通过 SOAP 协议创建 changeset（替代 REST CreateChangesetAsync）。
+    /// 通过 SOAP Repository.asmx 协议创建 changeset。
     /// 流程：CreateWorkspace → PendChanges → Upload → CheckIn → DeleteWorkspace。
     /// </summary>
     private async Task<int> CreateChangesetViaSoapAsync(
