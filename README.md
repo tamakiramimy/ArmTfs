@@ -1,462 +1,282 @@
-# arm-tfs
+# ArmTfs · arm-tfs
 
-A cross-platform .NET 8 CLI tool for TFVC (Team Foundation Version Control) operations, designed to run natively on **ARM64 macOS** (Apple Silicon / M-series) and **Windows 11 ARM** — where the official `tf.exe` is unavailable.
+> **EN** | Cross-platform TFVC CLI & VS Code Extension · macOS ARM64/x64 · Windows ARM64/x64
+> **中文** | 跨平台 TFVC 命令行工具与 VS Code 扩展 · 支持 macOS / Windows ARM64 & x64
 
-## Why
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.1.8-green.svg)](src/ArmTfs.VsCode/package.json)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey.svg)]()
 
-### The `tf.exe` problem
+---
 
-Microsoft's `tf.exe` is an x86/x64 binary only. It does not run on:
+## English
 
-- macOS (any architecture)
-- Windows 11 ARM (no Rosetta-style emulation for TFVC tooling)
-- Linux
+### What is ArmTfs?
 
-### Why TEE-CLC also doesn't work on ARM64
+ArmTfs is a cross-platform [TFVC (Team Foundation Version Control)](https://learn.microsoft.com/en-us/azure/devops/repos/tfvc/what-is-tfvc) toolchain consisting of:
 
-[JetBrains TEE-CLC](https://github.com/microsoft/team-explorer-everywhere) is a Java-based cross-platform TF client that looks like a promising alternative — but it fails on ARM64 for a deeper reason:
+- **`arm-tfs` CLI** — A .NET 8 command-line tool that communicates with TFS exclusively via the legacy **TFVC SOAP `Repository.asmx`** protocol, enabling full TFVC operations without Visual Studio.
+- **VS Code Extension** — A VS Code UI built on top of the CLI, providing SCM integration, branch management, merge workbench, server explorer, and changeset history.
 
-**The shell script (`tf`) has no `aarch64` mapping:**
+Designed for teams using on-premises TFS / Azure DevOps Server on modern ARM hardware (Apple Silicon Macs, Windows ARM laptops), where the official `tf.exe` is unavailable or unsupported.
 
-```bash
-# TEE-CLC tf script architecture detection (simplified)
-case "`uname -m`" in
-  i386|i686)  ARCH="x86"   ;;
-  x86_64)     ARCH="x86_64" ;;
-  ppc64)      ARCH="ppc"    ;;
-  ia64)       ARCH="ia64_32" ;;
-  # aarch64 → NOT HANDLED → JNI native library lookup fails
-esac
-```
+### Why was this built?
 
-ARM64 Linux reports `aarch64` from `uname -m`, which has no mapping — the `ARCH` variable keeps the raw value and the JNI native library directory is not found. **macOS Apple Silicon is worse**: the Darwin branch hard-codes `ARCH=""` (written when macOS was Intel-only).
+#### The `tf.exe` problem
 
-**The real blocker: `com.microsoft.tfs.jni.jar` has no ARM64 native libraries.**
+Microsoft's `tf.exe` is x86/x64 only — it does not run on macOS (any arch) or Windows 11 ARM natively.
 
-TEE-CLC relies on JNI (Java Native Interface) for critical features: NTLM authentication, credential storage, and file locking. The bundled native `.so`/`.dylib`/`.dll` files only exist for x86/x86_64/PPC/IA64. No ARM64 build exists and the project is archived (no longer maintained).
+#### Why TEE-CLC also fails on ARM64
 
-**Windows 11 ARM special case**: if you run an x64 JDK (via WoW64 emulation), the x64 JNI `.dll` may load. However:
-- Native ARM64 JDK → JNI load fails with `UnsatisfiedLinkError`
-- Even with x64 JDK, NTLM authentication via JNI may fail silently
+[JetBrains TEE-CLC](https://github.com/microsoft/team-explorer-everywhere) is a Java-based TF client, but:
 
-### The arm-tfs approach
+- Its `tf` launch script has no `aarch64` mapping → JNI native library lookup fails on ARM64 Linux / macOS Apple Silicon.
+- The bundled `com.microsoft.tfs.jni.jar` has no ARM64 native `.so`/`.dylib` — the project is **archived and no longer maintained**.
 
-`arm-tfs` uses cross-platform **TFS/Azure DevOps REST APIs** for regular item/history/workspace operations and the legacy **TFVC SOAP Repository.asmx protocol** for operations REST cannot model correctly, such as branch, merge, label, lock, and shelveset workflows. It still uses no JNI, no native TF client, no COM, and no P/Invoke, so it runs anywhere .NET 8 runs.
+#### The `arm-tfs` approach
 
-## Requirements
+`arm-tfs` uses the legacy **TFVC SOAP `Repository.asmx`** protocol exclusively for all TFVC operations.
+No REST, no JNI, no native TF client, no COM, no P/Invoke — runs anywhere .NET 8 runs.
 
-- .NET 8 SDK or Runtime
-- A TFS 2015+ or Azure DevOps Server with REST API enabled
-- A Personal Access Token (PAT) — strongly recommended
+### Supported Platforms
 
-## Installation
+| Platform | Architecture | CLI Binary | VS Code Extension |
+|----------|-------------|-----------|------------------|
+| macOS | ARM64 (Apple Silicon) | ✅ | ✅ |
+| macOS | x64 (Intel) | ✅ | ✅ |
+| Windows 11 | ARM64 | ✅ | ✅ |
+| Windows 11 | x64 | ✅ | ✅ |
 
-### From source
+### Features
 
-```bash
-git clone https://github.com/yourname/arm-tfs
-cd arm-tfs
-dotnet pack src/ArmTfs.Cli/ArmTfs.Cli.csproj -c Release
-dotnet tool install --global --add-source src/ArmTfs.Cli/bin/Release arm-tfs
-```
+| Feature | Description |
+|---------|-------------|
+| 🌿 Branch Management | Create, delete, list, inspect TFVC branches (source can be any folder path) |
+| 🔀 Merge Workbench | Visual merge candidate selection, conflict detection & execution |
+| 📜 Changeset History | Browse history with author, date, and comment |
+| 🔍 Server Explorer | Browse the TFVC server tree and manage items |
+| ✅ SCM Integration | VS Code source control panel with pending changes |
+| 📦 Check-in / Checkout | Stage and commit changes with comments |
+| 🏷️ Label Support | Create and manage TFVC labels |
+| ↩️ Rollback / Revert | Roll back changesets or revert to a specific version |
+| 🌐 i18n | UI supports English and Simplified Chinese |
 
-### Run without installing
+### Installation
 
-```bash
-cd src/ArmTfs.Cli
-dotnet run -- <command> [options]
-```
+#### VS Code Extension
 
-## Authentication
+1. Download `arm-tfs-vscode-x.x.x.vsix` from [Releases](https://github.com/tamakiramimy/ArmTfs/releases).
+2. In VS Code: `Extensions` → `⋯` → `Install from VSIX…` → select the file.
+3. Reload VS Code.
 
-PAT (Personal Access Token) is the recommended method and works on all platforms.
+#### CLI Only
 
-```bash
-arm-tfs configure --url https://tfs.example.com/DefaultCollection --pat YOUR_TOKEN
-```
+Download the zip for your platform from [Releases](https://github.com/tamakiramimy/ArmTfs/releases):
 
-Username/password (Basic Auth) also works if your server supports it:
+| File | Platform |
+|------|----------|
+| `arm-tfs-x.x.x-osx-arm64.zip` | macOS Apple Silicon |
+| `arm-tfs-x.x.x-osx-x64.zip` | macOS Intel |
+| `arm-tfs-x.x.x-win-arm64.zip` | Windows ARM64 |
+| `arm-tfs-x.x.x-win-x64.zip` | Windows x64 |
 
-```bash
-arm-tfs configure --url https://tfs.example.com/DefaultCollection \
-                  --username DOMAIN\user --password yourpassword
-```
+Extract and add to your `PATH`, or point VS Code to it via `arm-tfs: Configure CLI Command`.
 
-Credentials are saved to `~/.arm-tfs/config.json`.  
-Environment variables override the saved config at runtime:
+### Configuration
 
-| Variable         | Description           |
-|------------------|-----------------------|
-| `ARM_TFS_URL`    | Server collection URL |
-| `ARM_TFS_PAT`    | Personal Access Token |
-| `ARM_TFS_USER`   | Username              |
-| `ARM_TFS_PASSWORD` | Password            |
+After installing the extension, run:
+1. **`arm-tfs: Configure CLI Command`** — point to the CLI binary or `.dll`.
+2. **`arm-tfs: Configure TFS Connection`** — enter your server URL and PAT.
 
-## Quick Start
+Credentials are stored securely in VS Code's secret storage (OS keychain) — never written to plain-text config files.
+
+| VS Code Setting | Description |
+|----------------|-------------|
+| `armTfs.cli.command` | Path to `arm-tfs` executable or `dotnet` |
+| `armTfs.cli.commandArgs` | Extra arguments (e.g. `["/path/to/arm-tfs.dll"]`) |
+| `armTfs.ui.language` | UI language: `auto` / `zh-CN` / `en` |
+
+### Quick Start (CLI)
 
 ```bash
 # 1. Configure server and credentials
-arm-tfs configure --url https://tfs.example.com/DefaultCollection --pat TOKEN
+arm-tfs configure --url https://tfs.example.com/DefaultCollection --pat YOUR_TOKEN
 
-# 2. Create a workspace and map a server folder to a local folder
+# 2. Create a workspace and map a server folder
 arm-tfs workspace new --name MyWorkspace
 arm-tfs workspace map --server "$/MyProject/Main" --local ~/code/myproject
 
-# 3. Get the latest files
+# 3. Get latest files
 cd ~/code/myproject
 arm-tfs get
 
-# 4. Edit a file and mark it checked out
+# 4. Edit and check in
 arm-tfs checkout MyFile.cs
-
-# 5. Check in
+# ... make changes ...
 arm-tfs checkin -c "Fix bug in MyFile"
 ```
 
-## Commands
-
-### `configure`
-
-Configure the TFS server connection.
+### Commands Reference
 
 ```
-arm-tfs configure [options]
+arm-tfs configure --url <url> --pat <token> [--display-name <name>] [--show]
 
-Options:
-  --url <url>            Server collection URL (e.g. https://tfs/DefaultCollection)
-  --pat <token>          Personal Access Token
-  --username <user>      Username (DOMAIN\user or user@domain)
-  --password <pass>      Password
-  --display-name <name>  Your display name (for commit attribution)
-  --show                 Print the current configuration (PAT is masked)
-```
-
----
-
-### `workspace`
-
-Manage local workspaces. Workspace metadata is stored in `.tf/workspace.json`.
-
-```
-arm-tfs workspace new [options]
-  --name <name>          Workspace name (default: machine hostname)
-  --server <url>         Override server URL for this workspace
-
+arm-tfs workspace new --name <name>
 arm-tfs workspace show
-  (prints workspace metadata from the nearest .tf/ directory)
+arm-tfs workspace map --server <$/...> --local <path>
 
-arm-tfs workspace map --server <serverPath> --local <localPath>
-  (adds a server→local path mapping)
+arm-tfs get [path] [--version <n>] [--force] [--recursive] [--dry-run]
+arm-tfs status [path] [--all] [--format table|json]
+arm-tfs checkout <paths...> [--recursive]
+arm-tfs add      <paths...> [--recursive]
+arm-tfs undo     <paths...> [--no-restore]
+arm-tfs checkin  [paths...] -c "comment" [--dry-run]
+arm-tfs history  [path] [--top <n>] [--author <name>] [--format table|json]
+arm-tfs diff     <path> [--base] [--version <n>] [--format text|json]
+
+arm-tfs branch list   [scope]
+arm-tfs branch show   <path>
+arm-tfs branch create --source <$/...> --target <$/...> [--version <n>] [--comment <text>]
+arm-tfs branch delete --path  <$/...>  [--comment <text>]
+
+arm-tfs merge base             --source <$/...> --target <$/...>
+arm-tfs merge candidate        --source <$/...> --target <$/...> [--top <n>]
+arm-tfs merge execute          --source <$/...> --target <$/...> --changeset <id>
+arm-tfs merge execute          --source <$/...> --target <$/...> --from <id> --to <id>
+arm-tfs merge preview-conflicts --source <$/...> --target <$/...> --from <id> --to <id>
+
+arm-tfs label list / show / create / delete
+arm-tfs items list <$/...> [--recursive]
+arm-tfs rollback <changesetId>
+arm-tfs revert-to-version <$/...> <id>
+arm-tfs delete / rename / undelete / lock
 ```
 
----
+### Building from Source
 
-### `get`
-
-Download files from the server.
-
-```
-arm-tfs get [path] [options]
-
-Arguments:
-  path                   Local path or server path ($/...) [default: .]
-
-Options:
-  --version/-v <n>       Download a specific changeset version
-  --force/-f             Overwrite even if local file is up-to-date
-  --recursive/-r         Get files recursively [default: true]
-  --dry-run              Show what would be downloaded, without writing
-```
-
----
-
-### `status`
-
-Show pending changes and locally modified tracked files.
-
-```
-arm-tfs status [path] [options]
-
-Options:
-  --all                  Show all tracked files, not just modified ones
-```
-
----
-
-### `checkout` / `co` / `edit`
-
-Mark files as checked out (Edit). This is a **local-only** operation — no server lock is acquired.
-
-```
-arm-tfs checkout <paths...> [options]
-
-Options:
-  --recursive/-r         Include files in subdirectories
-```
-
----
-
-### `add`
-
-Mark new files as pending Add.
-
-```
-arm-tfs add <paths...> [options]
-
-Options:
-  --recursive/-r         Include files in subdirectories
-```
-
----
-
-### `undo`
-
-Undo pending changes and optionally restore file contents from the server.
-
-```
-arm-tfs undo <paths...> [options]
-
-Arguments:
-  paths                  Files to undo, or '.' to undo all pending changes
-
-Options:
-  --no-restore           Remove from pending list without restoring file
-```
-
----
-
-### `checkin` / `ci`
-
-Check in pending changes to the server.
-
-```
-arm-tfs checkin [paths...] [options]
-
-Options:
-  -c, --comment <text>   Changeset comment (required)
-  --dry-run              Show what would be checked in without submitting
-  --keep-pending         Keep pending changes after a dry-run
-```
-
----
-
-### `history` / `hist`
-
-Show changeset history for a path.
-
-```
-arm-tfs history [path] [options]
-
-Options:
-  --top/-n <n>           Maximum number of changesets [default: 20]
-  --author/-u <name>     Filter by author display name
-  --format <fmt>         Output format: table | json [default: table]
-```
-
----
-
-### `shelveset` / `shelve`
-
-List or inspect shelvesets.
-
-```
-arm-tfs shelveset list [options]
-  --owner <name>         Filter by owner
-  --name <name>          Filter by shelveset name
-
-arm-tfs shelveset show <name>
-  (name can be "shelvesetname;owner" to specify an owner)
-```
-
-### `diff`
-
-Compare a local file with the latest, tracked base, or a specific changeset.
-
-```
-arm-tfs diff <path> [options]
-
-Options:
-  --base                 Compare against the tracked base version
-  --version <n>          Compare against a specific changeset
-  --format <fmt>         Output format: text | json [default: text]
-```
-
-### `branch`
-
-Inspect TFVC branch topology.
-
-```
-arm-tfs branch list [scope] [options]
-arm-tfs branch show <path> [options]
-
-Options:
-  --format <fmt>         Output format: table | json [default: table]
-```
-
-### `changeset`
-
-Inspect a single changeset including file-level detail.
-
-```
-arm-tfs changeset show <id> [options]
-
-Options:
-  --format <fmt>         Output format: table | json [default: table]
-```
-
-### `label`
-
-List or inspect TFVC labels.
-
-```
-arm-tfs label list [options]
-arm-tfs label show <id> [options]
-
-Options:
-  --format <fmt>         Output format: table | json [default: table]
-```
-
-### `merge`
-
-Merge analysis and execution built from branch ancestry plus TFVC history. Execution uses TFVC
-SOAP `Repository.asmx` by default so the server records real merge history.
-
-```
-arm-tfs merge base --source <path> --target <path> [options]
-arm-tfs merge candidate --source <path> --target <path> [options]
-arm-tfs merge execute --source <path> --target <path> --changeset <id> [options]
-arm-tfs merge execute --source <path> --target <path> --from <id> --to <id> [options]
-arm-tfs merge preview-conflicts --source <path> --target <path> --from <id> --to <id> [options]
-
-Options:
-  --top <n>              Maximum candidate changesets to return [default: 20]
-  --scan <n>             Source/target history window to scan [default: 80]
-  --dry-run              Build a merge plan without checking in
-  --resolution-file <f>  Per-file source/target/manual conflict resolutions
-  --mode <mode>          Merge protocol: soap | rest [default: soap]
-  --format <fmt>         Output format: table | json [default: table]
-```
-
-`merge candidate` output is inferential: it uses branch ancestry, branch creation-time history,
-and merge source ranges found in target changesets. `merge execute --from/--to --dry-run` asks
-the server for one SOAP merge plan across the whole range, so all server-detected conflicts are
-listed up front instead of being discovered one changeset at a time.
-
-Conflict resolution behavior:
-
-- `source` uses SOAP `Resolve(AcceptTheirs)` and keeps TFVC merge history.
-- `target` uses SOAP `Resolve(AcceptYours)` and keeps TFVC merge history when the server returns
-  merge operations to check in.
-- `manual` uses the supplied merged file content and falls back to a REST content check-in because
-  SOAP `Resolve(AcceptMerge)` expects a real local workspace file, not raw file bytes.
-
-## JSON Contracts
-
-The CLI now exposes stable JSON envelopes for thin clients and automation.
-
-- `arm-tfs status . --all --format json`
-- `arm-tfs history . --top 20 --format json`
-- `arm-tfs diff <path> --format json`
-- `arm-tfs branch list "$/' --format json`
-- `arm-tfs branch show <path> --format json`
-- `arm-tfs changeset show <id> --format json`
-- `arm-tfs label list --format json`
-- `arm-tfs label show <id> --format json`
-- `arm-tfs merge base --source <path> --target <path> --format json`
-- `arm-tfs merge candidate --source <path> --target <path> --format json`
-
-Each response contains `schemaVersion` and `command` as a stable outer envelope.
-
-## VS Code Thin Adapter
-
-A minimal VS Code extension now lives in [src/ArmTfs.VsCode](src/ArmTfs.VsCode). It does not reimplement TFVC logic; it only:
-
-- resolves an `arm-tfs` CLI invocation
-- executes CLI commands with `--format json`
-- parses the stable envelopes into typed TypeScript contracts
-- exposes commands and an exported client API for tree views/webviews
-- uses VS Code's native diff editor for source-vs-target comparisons
-- uses VS Code's native conflict marker editor for manual merge resolution
-
-Build it with:
+**Prerequisites**: [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8), [Node.js 18+](https://nodejs.org/)
 
 ```bash
-cd src/ArmTfs.VsCode
-npm install
-npm run compile
+git clone https://github.com/tamakiramimy/ArmTfs.git
+cd ArmTfs
+
+# Build CLI (macOS Apple Silicon)
+dotnet publish src/ArmTfs.Cli -r osx-arm64 -c Release --self-contained true -p:PublishSingleFile=true -o publish/osx-arm64
+
+# Build CLI (Windows x64)
+dotnet publish src/ArmTfs.Cli -r win-x64 -c Release --self-contained true -p:PublishSingleFile=true -o publish/win-x64
+
+# Build VS Code extension
+cd src/ArmTfs.VsCode && npm install && npm run compile
+npx @vscode/vsce package --no-dependencies
 ```
 
-## Local Workspace Model
-
-`arm-tfs` uses a **local workspace** model:
-
-- No server-side locks are acquired on checkout.
-- Workspace metadata is stored in a `.tf/` directory at the workspace root:
-  - `.tf/workspace.json` — workspace definition and path mappings
-  - `.tf/pending.json` — pending changes (add / edit / delete / rename)
-  - `.tf/versions/<hash>.json` — per-file version tracking (changeset ID + content hash)
-- Files are identified as modified by comparing their SHA-256 hash against the stored hash at the time of last `get`.
-
-## Building from Source
-
-```bash
-git clone https://github.com/yourname/arm-tfs
-cd arm-tfs
-dotnet build
-dotnet test
-```
-
-To publish a self-contained single-file binary for ARM64 macOS:
-
-```bash
-dotnet publish src/ArmTfs.Cli -c Release -r osx-arm64 --self-contained true -p:PublishSingleFile=true -o publish/osx-arm64
-```
-
-For Windows ARM64:
-
-```bash
-dotnet publish src/ArmTfs.Cli -c Release -r win-arm64 --self-contained true -p:PublishSingleFile=true -o publish/win-arm64
-```
-
-## Architecture
+### Architecture
 
 ```
-arm-tfs.sln
+ArmTfs/
 ├── src/
-│   ├── ArmTfs.Core/          # TFVC REST/SOAP clients, workspace management, models
-│   │   ├── Client/
-│   │   │   ├── TfsConnection.cs       # VssConnection wrapper (PAT auth)
-│   │   │   └── TfvcClientService.cs   # TFVC operations via TfvcHttpClient
-│   │   ├── Config/
-│   │   │   └── TfsConfig.cs           # ~/.arm-tfs/config.json
-│   │   ├── Models/
-│   │   │   ├── PendingChange.cs
-│   │   │   ├── MergeQueryModels.cs
-│   │   │   ├── TfsServerItem.cs
-│   │   │   ├── TrackedFileVersion.cs
-│   │   │   └── WorkspaceMetadata.cs
-│   │   └── Workspace/
-│   │       └── WorkspaceManager.cs    # .tf/ metadata management
-│   └── ArmTfs.Cli/           # CLI entry point (System.CommandLine)
-│       ├── Program.cs
-│       └── Commands/          # One file per command
-│   └── ArmTfs.VsCode/        # Thin VS Code adapter over CLI JSON contracts
-│       ├── package.json
-│       └── src/
-│           ├── armTfsCliClient.ts
-│           ├── contracts.ts
-│           └── extension.ts
+│   ├── ArmTfs.Core/       # SOAP client, workspace model, merge engine
+│   │   ├── Client/        # TfvcClientService, TfsConnection, TfvcSoapClient
+│   │   ├── Config/        # TfsConfig, credential storage
+│   │   ├── Models/        # TFVC domain models & SOAP DTOs
+│   │   └── Workspace/     # Local workspace (.tf/) management
+│   ├── ArmTfs.Cli/        # CLI entry point (System.CommandLine)
+│   └── ArmTfs.VsCode/     # VS Code extension (TypeScript)
 └── tests/
-    └── ArmTfs.Core.Tests/    # xUnit tests for Core
 ```
 
-## Known Limitations
+### License
 
-- **Manual merge content does not use SOAP Resolve yet** — source/target conflict resolutions use SOAP Resolve, but manual merged content falls back to a REST content check-in.
-- **Merge candidate detection is inferential** — results are derived from branch ancestry plus scanned history windows, so old or atypical merge flows may require a larger `--scan` value. Use SOAP range dry-run to validate the final conflict plan before executing.
-- **No workspace locking** — concurrent edits by multiple clients on the same workspace folder are not protected.
-- **PAT required for macOS** — Windows Integrated Auth (NTLM/Kerberos) is not supported cross-platform.
+MIT License — Copyright (c) 2024-2026 [tamakiramimy](mailto:tamakiramimy@163.com)
 
-## License
+Free to use, fork, and modify. **Attribution required**: retain the copyright notice in all copies. See [LICENSE](LICENSE).
 
-MIT
+### Contact
+
+- **Email**: tamakiramimy@163.com
+- **Issues**: [GitHub Issues](https://github.com/tamakiramimy/ArmTfs/issues)
+
+---
+
+## 中文
+
+### 项目简介
+
+ArmTfs 是一套跨平台的 [TFVC（Team Foundation 版本控制）](https://learn.microsoft.com/zh-cn/azure/devops/repos/tfvc/what-is-tfvc) 工具链，包含两个组件：
+
+- **`arm-tfs` 命令行工具** — 基于 .NET 8，通过 **TFVC SOAP `Repository.asmx`** 协议直接与 TFS 通信，实现完整的 TFVC 操作，无需安装 Visual Studio。
+- **VS Code 扩展** — 提供图形界面，包括 SCM 集成、分支管理、合并工作台、服务器资源管理器、变更集历史等。
+
+专为在 ARM 设备（Apple Silicon Mac、Windows ARM 笔记本）上使用本地部署 TFS / Azure DevOps Server 的团队设计。
+
+### 为什么要做这个工具？
+
+微软官方的 `tf.exe` 仅有 x86/x64 版本，无法在 macOS 或 Windows 11 ARM 上原生运行。JetBrains TEE-CLC 虽是跨平台方案，但其 JNI 本地库不支持 ARM64，项目已归档不再维护。
+
+`arm-tfs` 全量使用 TFVC SOAP `Repository.asmx` 协议，无 REST 依赖、无 JNI、无原生客户端，可在所有支持 .NET 8 的平台上运行。
+
+### 支持平台
+
+| 平台 | 架构 | CLI 工具 | VS Code 扩展 |
+|------|------|---------|-------------|
+| macOS | ARM64（Apple Silicon） | ✅ | ✅ |
+| macOS | x64（Intel） | ✅ | ✅ |
+| Windows 11 | ARM64 | ✅ | ✅ |
+| Windows 11 | x64 | ✅ | ✅ |
+
+### 功能特性
+
+| 功能 | 说明 |
+|------|------|
+| 🌿 分支管理 | 创建、删除、查看 TFVC 分支（source 支持普通文件夹路径） |
+| 🔀 合并工作台 | 可视化合并候选选择、冲突检测与执行 |
+| 📜 变更集历史 | 按作者、日期、备注浏览历史 |
+| 🔍 服务器资源管理器 | 浏览 TFVC 服务器目录树，管理文件 |
+| ✅ SCM 集成 | VS Code 源代码管理面板，显示待处理变更 |
+| 📦 签入/签出 | 暂存并提交带备注的变更 |
+| 🏷️ 标签支持 | 创建和管理 TFVC 标签 |
+| ↩️ 回滚/还原 | 回滚变更集或还原到指定版本 |
+| 🌐 国际化 | 界面支持中文和英文 |
+
+### 安装方法
+
+#### VS Code 扩展
+
+1. 从 [Releases](https://github.com/tamakiramimy/ArmTfs/releases) 下载 `arm-tfs-vscode-x.x.x.vsix`。
+2. 在 VS Code 中：`扩展` → `⋯` → `从 VSIX 安装…` → 选择文件。
+3. 重新加载 VS Code。
+
+#### 仅使用命令行工具
+
+从 [Releases](https://github.com/tamakiramimy/ArmTfs/releases) 下载对应平台的 zip 包并解压，加入 `PATH` 即可直接使用。
+
+### 快速上手
+
+```bash
+# 1. 配置服务器和认证
+arm-tfs configure --url http://your-tfs-server/DefaultCollection --pat YOUR_TOKEN
+
+# 2. 创建工作区并映射服务器目录
+arm-tfs workspace new --name MyWorkspace
+arm-tfs workspace map --server "$/MyProject/Main" --local ~/code/myproject
+
+# 3. 获取最新文件
+cd ~/code/myproject
+arm-tfs get
+
+# 4. 签出、修改、签入
+arm-tfs checkout MyFile.cs
+arm-tfs checkin -c "修复 MyFile 中的 Bug"
+```
+
+### 开源协议
+
+MIT License — Copyright (c) 2024-2026 [tamakiramimy](mailto:tamakiramimy@163.com)
+
+本项目可自由使用、Fork 和修改。**使用时须保留原始版权声明**。详见 [LICENSE](LICENSE) 文件。
+
+### 联系方式
+
+- **邮箱**：tamakiramimy@163.com
+- **问题反馈**：[GitHub Issues](https://github.com/tamakiramimy/ArmTfs/issues)

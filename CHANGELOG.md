@@ -58,7 +58,7 @@
 
 ### Validation and packaging
 
-- Revalidated `MindrayApp.TeamsPortal-P_V20260515` to `MindrayApp.TeamsPortal` with SOAP range dry-run for `cs212325~cs213671`; it completed in about 1.56 seconds and surfaced the two expected `.csproj` conflicts without creating a changeset.
+- Revalidated `<project>` to `<project>` with SOAP range dry-run for `csXXXXXX~csXXXXXX`; it completed in about 1.56 seconds and surfaced the two expected `.csproj` conflicts without creating a changeset.
 - Bumped `ArmTfs.Cli`, `ArmTfs.Core`, and the VS Code extension package version to `0.1.6`.
 - Built `osx-arm64`, `win-arm64`, and VSIX release artifacts for `0.1.6`.
 
@@ -72,7 +72,7 @@
 
 ### Validation and packaging
 
-- Validated SOAP range preview against `MindrayApp.TeamsPortal-P_V20260515` to `MindrayApp.TeamsPortal`; the full range preview completed in about 1.55 seconds and surfaced two `.csproj` conflicts without creating pending changes.
+- Validated SOAP range preview against `<project>` to `<project>`; the full range preview completed in about 1.55 seconds and surfaced two `.csproj` conflicts without creating pending changes.
 - Bumped `ArmTfs.Cli`, `ArmTfs.Core`, and the VS Code extension package version to `0.1.5`.
 
 ## 0.1.4 - 2026-06-30

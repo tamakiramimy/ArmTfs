@@ -9,7 +9,7 @@ using System.Text.RegularExpressions;
 namespace ArmTfs.Core.Client;
 
 /// <summary>
-/// 封装 <see cref="TfvcHttpClient"/>，提供面向业务的 TFVC 操作接口。
+/// 封装 TFVC SOAP 客户端，提供面向业务的 TFVC 操作接口。所有操作均通过 SOAP Repository.asmx 协议执行，无 REST 依赖。
 /// 所有操作均为 REST 调用，无平台原生依赖，支持 ARM64 macOS / Windows ARM / Linux。
 /// <para>
 /// 调用方应自行维护 <see cref="TfsConnection"/> 的生命周期（<c>using</c> 语句）。

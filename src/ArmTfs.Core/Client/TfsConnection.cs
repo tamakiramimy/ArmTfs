@@ -77,38 +77,36 @@ public class TfsConnection : IDisposable
     }
 
     /// <summary>
-    /// 发送一个轻量级请求（获取分支列表）以验证凭据和连通性。
-    /// 在执行实际操作前可调用此方法提前失败。
+    /// 通过 SOAP QueryWorkspaces 发送一个轻量级请求以验证凭据和连通性。
+    /// 在执行实际操作前可调用此方法提前失败。纯 SOAP，无 REST 依赖。
     /// </summary>
-    /// <exception cref="Microsoft.VisualStudio.Services.Common.VssUnauthorizedException">凭据错误时</exception>
     public async Task TestConnectionAsync(CancellationToken ct = default)
     {
-        var client = GetTfvcClient();
-        // 用最小请求验证连接是否可用
-        await client.GetBranchesAsync(cancellationToken: ct).ConfigureAwait(false);
+        // Use SOAP QueryWorkspaces as a lightweight ping — read-only, no side effects.
+        var soap = new Soap.TfvcSoapClient(this);
+        await soap.QueryWorkspacesAsync(ct: ct).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// 查询当前认证用户的身份 GUID（REST <c>_apis/connectionData</c>）。
-    /// SOAP CreateWorkspace 要求 OwnerName = 认证用户身份；用 GUID 最稳定。
-    /// 解析失败返回 null。
+    /// 通过 SOAP QueryWorkspaces 获取当前认证用户的身份标识（Owner 字段）。
+    /// SOAP CreateWorkspace 要求 OwnerName 与认证用户匹配；从已有 workspace 的
+    /// Owner 属性提取最可靠。若无工作区则退回到配置的 DisplayName / Username。
+    /// 纯 SOAP，无 REST 依赖。
     /// </summary>
     public async Task<string?> GetAuthenticatedUserGuidAsync(CancellationToken ct = default)
     {
         try
         {
-            using var http = CreateHttpClient();
-            var url = ServerUrl.TrimEnd('/') + "/_apis/connectionData?api-version=5.0-preview";
-            using var resp = await http.GetAsync(url, ct).ConfigureAwait(false);
-            if (!resp.IsSuccessStatusCode)
-                return null;
-            var json = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            using var doc = System.Text.Json.JsonDocument.Parse(json);
-            if (doc.RootElement.TryGetProperty("authenticatedUser", out var user)
-                && user.TryGetProperty("id", out var id))
-            {
-                return id.GetString();
-            }
+            var soap = new Soap.TfvcSoapClient(this);
+            var workspaces = await soap.QueryWorkspacesAsync(ct: ct).ConfigureAwait(false);
+            var owner = workspaces.FirstOrDefault()?.Owner;
+            if (!string.IsNullOrWhiteSpace(owner))
+                return owner;
+            // Fallback: use configured display name or username when no workspaces exist yet.
+            if (!string.IsNullOrWhiteSpace(_config.UserDisplayName))
+                return _config.UserDisplayName;
+            if (!string.IsNullOrWhiteSpace(_config.Username))
+                return _config.Username;
         }
         catch
         {
