@@ -2626,7 +2626,11 @@ public sealed class TfvcClientService
         {
             var soap = new Soap.TfvcSoapClient(_connection);
             var items = await soap.QueryItemsAsync(serverPath, "None", null, ct).ConfigureAwait(false);
-            var item = items.FirstOrDefault(i => !i.IsFolder);
+            // Prefer a file item's changeset ID; fall back to the folder/branch-root item itself.
+            // Without the fallback, a path that is a folder (e.g. a branch root) would incorrectly
+            // be reported as non-existent because TFS SOAP QueryItems with recursion=None returns
+            // only the folder node, which has IsFolder=true.
+            var item = items.FirstOrDefault(i => !i.IsFolder) ?? items.FirstOrDefault();
             return item?.ChangesetId;
         }
         catch

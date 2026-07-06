@@ -1,21 +1,28 @@
-.vs/*
-publish/*
-src/*/bin/*
-src/*/obj/*
-src/ArmTfs.VsCode/node_modules/*
-src/ArmTfs.VsCode/out/*
-tests/*/bin/*
-tests/*/obj/*
-.kiro/specs/tfvc-merge-workspace-fixes/design.md
-.kiro/specs/tfvc-merge-workspace-fixes/tasks.md
-.gitignore
-.gitignore
-.codebuddy/memory/2025-06-17.md
-.codebuddy/memory/MEMORY.md
-Temp-arm-tfs/
-src/ArmTfs.Cli/.DS_Store
-Temp-arm-tfs-vscode/temp/*
-src/ArmTfs.VsCode/.vscode/*
-src/ArmTfs.VsCode/release/*
+# macOS metadata
+.DS_Store
+**/.DS_Store
+
+# IDE / build artifacts
+.vs/
+publish/
+src/*/bin/
+src/*/obj/
+tests/*/bin/
+tests/*/obj/
+
+# VS Code extension build
+src/ArmTfs.VsCode/node_modules/
+src/ArmTfs.VsCode/out/
+src/ArmTfs.VsCode/.vscode/
+src/ArmTfs.VsCode/release/
 src/ArmTfs.VsCode/.vscodeignore
 src/ArmTfs.VsCode/arm-tfs-vscode*
+
+# AI tool caches & local memory
+.codebuddy/
+.kiro/specs/tfvc-merge-workspace-fixes/design.md
+.kiro/specs/tfvc-merge-workspace-fixes/tasks.md
+
+# Temp working directories
+Temp-arm-tfs/
+Temp-arm-tfs-vscode/temp/
