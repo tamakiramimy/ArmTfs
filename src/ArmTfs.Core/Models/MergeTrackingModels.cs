@@ -1,8 +1,8 @@
 namespace ArmTfs.Core.Models;
 
 /// <summary>
-/// 记录一次通过 REST API 执行的合并操作。
-/// 由于 REST API 不支持 Merge 变更类型，服务器不会记录合并历史，
+/// 记录一次合并操作的执行结果。
+/// 采用手动内容复制方式完成合并（服务器不记录合并历史），
 /// 因此需要在本地追踪已合并的 changeset 以避免候选列表重复显示。
 /// </summary>
 public sealed class MergeRecord
@@ -22,8 +22,8 @@ public sealed class MergeRecord
     /// <summary>合并执行时间 (UTC)</summary>
     public DateTime MergedAtUtc { get; init; } = DateTime.UtcNow;
 
-    /// <summary>合并方式：rest-takesource | soap-merge</summary>
-    public string Method { get; init; } = "rest-takesource";
+    /// <summary>合并方式：manual-takesource | soap-merge | soap-takesource</summary>
+    public string Method { get; init; } = "manual-takesource";
 }
 
 /// <summary>

@@ -1,12 +1,9 @@
 using ArmTfs.Core.Config;
-using Microsoft.TeamFoundation.SourceControl.WebApi;
-using Microsoft.VisualStudio.Services.Common;
-using Microsoft.VisualStudio.Services.WebApi;
 
 namespace ArmTfs.Core.Client;
 
 /// <summary>
-/// 与 TFS/Azure DevOps Server 建立 REST 连接，封装认证逻辑。
+/// 封装对 TFS/Azure DevOps Server 的连接和认证逻辑，为 SOAP 客户端提供 HttpClient 和配置访问。
 /// <para>
 /// <b>跨平台认证策略（按优先级）：</b>
 /// <list type="number">
@@ -14,17 +11,14 @@ namespace ArmTfs.Core.Client;
 ///   <item>Basic Auth（用户名+密码）— 适用于服务器已开启 Basic Auth 且配合 HTTPS 的场景</item>
 /// </list>
 /// 此类有意不包含 Windows 集成认证（NTLM/Kerberos）：
-/// 相关 API（<c>WindowsCredential</c>/<c>VssFederatedCredential</c>）仅存在于
-/// <c>Microsoft.VisualStudio.Services.Client</c> 包中，该包没有 netstandard2.0 目标，無法在非 Windows 平台编译。
+/// 相关 API 仅存在于 Windows 专用包中，无法在非 Windows 平台编译。
 /// </para>
 /// </summary>
 public class TfsConnection : IDisposable
 {
-    private VssConnection? _connection;
-    private TfvcHttpClient? _tfvcClient;
     private readonly TfsConfig _config;
 
-    /// <summary>初始化连接对象。不会立即建立网络连接，延迟到首次调用 <see cref="GetTfvcClient"/> 时。</summary>
+    /// <summary>初始化连接对象。不会立即建立网络连接。</summary>
     /// <param name="config">已加载并应用环境变量覆盖的配置对象</param>
     public TfsConnection(TfsConfig config)
     {
@@ -34,47 +28,6 @@ public class TfsConnection : IDisposable
     /// <summary>TFS Server Collection URL，未配置时抛出 <see cref="InvalidOperationException"/></summary>
     public string ServerUrl => _config.ServerUrl
         ?? throw new InvalidOperationException("TFS server URL is not configured. Run 'arm-tfs configure' first.");
-
-    /// <summary>
-    /// 惰性建立 <see cref="VssConnection"/>，根据配置选择最适合的凭据类型。
-    /// </summary>
-    /// <exception cref="InvalidOperationException">无任何凭据时抛出</exception>
-    private VssConnection EnsureConnection()
-    {
-        if (_connection is not null) return _connection;
-
-        var serverUri = new Uri(ServerUrl);
-        VssCredentials credentials;
-
-        if (!string.IsNullOrEmpty(_config.PersonalAccessToken))
-        {
-            // PAT 认证：跨平台首选（ARM64 macOS / Windows ARM 均支持）
-            credentials = new VssBasicCredential(string.Empty, _config.PersonalAccessToken);
-        }
-        else if (!string.IsNullOrEmpty(_config.Username))
-        {
-            // 用户名/密码 Basic 认证（需服务器开启 Basic Auth 或使用 HTTPS）
-            credentials = new VssBasicCredential(_config.Username, _config.Password ?? string.Empty);
-        }
-        else
-        {
-            throw new InvalidOperationException(
-                "No credentials configured. Run 'arm-tfs configure --pat <token>' or 'arm-tfs configure --username <user> --password <pass>'.");
-        }
-
-        _connection = new VssConnection(serverUri, credentials);
-        return _connection;
-    }
-
-    /// <summary>
-    /// 获取 <see cref="TfvcHttpClient"/> 实例，内部缓存，多次调用安全。
-    /// </summary>
-    public TfvcHttpClient GetTfvcClient()
-    {
-        if (_tfvcClient is not null) return _tfvcClient;
-        _tfvcClient = EnsureConnection().GetClient<TfvcHttpClient>();
-        return _tfvcClient;
-    }
 
     /// <summary>
     /// 通过 SOAP QueryWorkspaces 发送一个轻量级请求以验证凭据和连通性。
@@ -140,8 +93,5 @@ public class TfsConnection : IDisposable
         return client;
     }
 
-    public void Dispose()
-    {
-        _connection?.Dispose();
-    }
+    public void Dispose() { }
 }

@@ -1,7 +1,13 @@
 # ArmTfs · arm-tfs
 
-> **EN** | Cross-platform TFVC CLI & VS Code Extension · macOS ARM64/x64 · Windows ARM64/x64
-> **中文** | 跨平台 TFVC 命令行工具与 VS Code 扩展 · 支持 macOS / Windows ARM64 & x64
+<div align="center">
+
+[English](#english) &nbsp;·&nbsp; [中文](#中文)
+
+</div>
+
+> Cross-platform TFVC CLI & VS Code Extension · macOS ARM64/x64 · Windows ARM64/x64  
+> 跨平台 TFVC 命令行工具与 VS Code 扩展 · 支持 macOS / Windows ARM64 & x64
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.1.8-green.svg)](src/ArmTfs.VsCode/package.json)

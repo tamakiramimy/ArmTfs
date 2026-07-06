@@ -272,7 +272,7 @@ public sealed class WorkspaceManager
         File.WriteAllText(MergeHistoryPath, JsonSerializer.Serialize(history, _jsonOptions));
     }
 
-    /// <summary>记录一次 REST merge 执行结果。</summary>
+    /// <summary>记录一次手动合并执行结果。</summary>
     public void RecordMerge(MergeRecord record)
     {
         var history = LoadMergeHistory();
@@ -281,7 +281,7 @@ public sealed class WorkspaceManager
     }
 
     /// <summary>
-    /// 查询指定源/目标路径对下，已通过 REST 方式合并的源 changeset ID 集合。
+    /// 查询指定源/目标路径对下，已通过手动方式合并的源 changeset ID 集合。
     /// 用于过滤合并候选列表。
     /// </summary>
     public HashSet<int> GetLocallyMergedChangesetIds(string sourcePath, string targetPath)

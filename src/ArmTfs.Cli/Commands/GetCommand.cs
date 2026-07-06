@@ -34,14 +34,14 @@ public static class GetCommand
 
         cmd.SetHandler(async (path, versionSpec, force, clean, recursive, dryRun, localPathOverride, parallel) =>
         {
-            // Parse version spec → int? (changeset) for REST
+            // Parse version spec → int? (changeset)
             int? version = ParseVersionSpec(versionSpec);
             Microsoft.TeamFoundation.SourceControl.WebApi.TfvcVersionDescriptor? versionDescriptor = null;
             if (!string.IsNullOrWhiteSpace(versionSpec) && version is null)
             {
                 // Non-numeric version spec — pass through as label or date descriptor via TfvcVersionDescriptor
                 // We'll plumb this in GetItemsAsync via the existing atChangeset=null path (not yet supported)
-                // For now, try resolving label/date to a changeset ID via REST items call
+                // For now, try resolving label/date to a changeset ID via SOAP QueryItems
                 versionDescriptor = ParseVersionDescriptor(versionSpec);
             }
             var ws = WorkspaceManager.FindWorkspace(Directory.GetCurrentDirectory());

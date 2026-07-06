@@ -13,7 +13,7 @@ namespace ArmTfs.Cli.Commands;
 /// <list type="number">
 ///   <item>从 .tf/pending.json 读取待提交变更</item>
 ///   <item>按路径过滤（默认提交所有挂起变更）</item>
-///   <item>读取 Add/Edit 文件内容，通过 REST API 创建 Changeset</item>
+///   <item>读取 Add/Edit 文件内容，通过 SOAP Repository.asmx 创建 Changeset</item>
 ///   <item>提交成功后更新 .tf/versions/ 并清理 pending.json</item>
 /// </list>
 /// </para>

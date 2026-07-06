@@ -2,7 +2,7 @@ namespace ArmTfs.Core.Models;
 
 /// <summary>
 /// TFVC 服务器端条目的快照信息，由 <c>GetItemsAsync</c> 返回。
-/// 对应 REST API 的 <c>TfvcItem</c> 对象的简化投影。
+/// TFVC 服务器端条目快照，由 SOAP QueryItems 返回。
 /// </summary>
 public sealed class TfsServerItem
 {

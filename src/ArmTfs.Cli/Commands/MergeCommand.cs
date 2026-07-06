@@ -105,7 +105,7 @@ public static class MergeCommand
         var dryRunOpt = new Option<bool>("--dry-run") { Description = "Show the merge plan without creating a TFVC changeset" };
         var resolutionFileOpt = new Option<FileInfo?>("--resolution-file") { Description = "JSON file with per-file merge resolutions" };
         var formatOpt = new Option<string>("--format", () => "table") { Description = "Output format: table | json" };
-        var modeOpt = new Option<string>("--mode", () => "soap") { Description = "Merge protocol: soap (default, real merge history via Repository.asmx) | rest (take-source, no merge history)" };
+        var modeOpt = new Option<string>("--mode", () => "soap") { Description = "Merge protocol: soap (default, real merge history via Repository.asmx). Only soap is supported." };
         var soapOwnerOpt = new Option<string?>("--soap-owner") { Description = "Owner identity (DOMAIN\\\\user or user@domain) for the temporary SOAP workspace. Defaults to configured username, then auto-inferred from the authenticated user's existing workspaces." };
 
         sourceOpt.IsRequired = true;
@@ -231,7 +231,7 @@ public static class MergeCommand
                 }
                 else
                 {
-                    // REST path errors (VssServiceException etc.): print full detail incl. inner
+                    // Non-SOAP errors: print full detail incl. inner
                     // exceptions so "部分更改无效" type rejections show which change/file was rejected.
                     Console.Error.WriteLine("Detail:");
                     for (var e = ex; e is not null; e = e.InnerException)

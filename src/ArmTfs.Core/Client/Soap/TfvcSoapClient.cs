@@ -8,7 +8,7 @@ namespace ArmTfs.Core.Client.Soap;
 
 /// <summary>
 /// 通过 TFVC 旧版 SOAP 协议（Repository.asmx）调用 TFS。
-/// REST API 不支持的变更类型（Branch、Merge）必须走此接口。
+/// Branch、Merge 等高级变更类型只能通过此 SOAP 接口实现。
 /// <para>
 /// 协议：自定义 SOAP/XML，端点 <c>{collection}/VersionControl/v1.0/Repository.asmx</c>，
 /// XML namespace 见 <see cref="Ns"/>。参考 TEE Java 源码
@@ -109,7 +109,7 @@ public sealed class TfvcSoapClient
 
     /// <summary>
     /// 创建 TFVC 分支。返回新创建的 changeset ID。
-    /// REST changeset API 不支持 <c>Branch</c> 变更类型，必须走 SOAP。
+    /// SOAP 专属：Branch 变更类型必须通过 Repository.asmx 实现。
     /// </summary>
     public async Task<int> CreateBranchAsync(
         string sourcePath,
@@ -655,7 +655,7 @@ public sealed class TfvcSoapClient
 
     /// <summary>
     /// 创建（或更新）TFVC Label，并将指定路径附加到该 label。
-    /// TFS REST API 不支持 label 创建，必须使用 SOAP LabelItem。
+    /// SOAP 专属：Label 创建必须通过 Repository.asmx LabelItem 实现。
     /// </summary>
     public async Task<string> LabelItemAsync(
         string labelName,
@@ -1011,7 +1011,7 @@ public sealed class TfvcSoapClient
 
     /// <summary>
     /// 完整的 SOAP 签入流程：CreateWorkspace → PendChanges → Upload content → CheckIn → DeleteWorkspace。
-    /// 替代 REST CreateChangesetAsync，完全通过 SOAP/TFS 旧版端点实现。
+    /// 通过 SOAP Repository.asmx 端点创建 Changeset。
     /// </summary>
     /// <param name="changes">每个变更包含: 服务器路径、变更类型(Edit/Add/Delete/Undelete)、文件内容(Delete 时为 null)、基线版本</param>
     /// <param name="comment">Changeset 注释</param>
@@ -1154,7 +1154,7 @@ public sealed class TfvcSoapClient
     // ─── QueryItems / QueryHistory / DownloadFile ────────────────────────────
 
     /// <summary>
-    /// 查询 TFVC 项列表（文件和文件夹）。等价于 <c>tf dir</c> / REST <c>GET /items</c>。
+    /// 查询 TFVC 项列表（文件和文件夹）。等价于 <c>tf dir</c>（SOAP: QueryItems）。
     /// </summary>
     /// <param name="serverPath">服务器路径，例如 <c>$/Project/Main</c></param>
     /// <param name="recursion">递归级别：Full（全递归）、OneLevel（一层）、None（仅自身）</param>
@@ -1202,7 +1202,7 @@ public sealed class TfvcSoapClient
     }
 
     /// <summary>
-    /// 查询 TFVC 变更历史。等价于 <c>tf history</c> / REST <c>GET /changesets</c>。
+    /// 查询 TFVC 变更历史。等价于 <c>tf history</c>（SOAP: QueryHistory）。
     /// </summary>
     /// <param name="serverPath">服务器路径</param>
     /// <param name="maxCount">最大返回条数</param>

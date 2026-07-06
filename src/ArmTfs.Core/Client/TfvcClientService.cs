@@ -10,7 +10,6 @@ namespace ArmTfs.Core.Client;
 
 /// <summary>
 /// 封装 TFVC SOAP 客户端，提供面向业务的 TFVC 操作接口。所有操作均通过 SOAP Repository.asmx 协议执行，无 REST 依赖。
-/// 所有操作均为 REST 调用，无平台原生依赖，支持 ARM64 macOS / Windows ARM / Linux。
 /// <para>
 /// 调用方应自行维护 <see cref="TfsConnection"/> 的生命周期（<c>using</c> 语句）。
 /// </para>
@@ -214,7 +213,7 @@ public sealed class TfvcClientService
 
     /// <summary>
     /// 通过 SOAP Repository.asmx CreateBranch 接口创建 TFVC 分支。
-    /// REST Changeset API 不支持 Branch 变更类型，必须使用旧版 SOAP 接口。
+    /// SOAP Repository.asmx 专属接口：Branch 变更类型不能通过其他协议实现。
     /// </summary>
     public async Task<TfvcChangesetRef> CreateBranchAsync(
         string sourcePath,
@@ -249,7 +248,7 @@ public sealed class TfvcClientService
         string comment,
         CancellationToken ct)
     {
-        // TFS REST API does not support Branch change type; use legacy SOAP endpoint.
+        // Branch change type requires SOAP Repository.asmx — the server records proper branch ancestry.
         var soap = new TfvcSoapClient(_connection);
         return await soap.CreateBranchAsync(sourcePath, targetPath, sourceChangesetId, comment, ct).ConfigureAwait(false);
     }
@@ -321,7 +320,7 @@ public sealed class TfvcClientService
 
     /// <summary>
     /// 还原已删除的服务器文件/文件夹（tf undelete）。
-    /// 通过查找删除前的最后版本内容并重新 Add 实现（REST Undelete 变更类型不被服务器支持）。
+    /// 通过查找删除前的最后版本内容并重新 Add 实现（SOAP Undelete 需目标路径仍存在；此方案更可靠）。
     /// </summary>
     public async Task<TfvcChangesetRef> UndeleteItemAsync(
         string serverPath,
@@ -589,7 +588,7 @@ public sealed class TfvcClientService
 
     /// <summary>
     /// 创建 TFVC Label（给服务器路径打标签）。
-    /// 通过 SOAP LabelItem 实现（REST 不支持创建 label）。
+    /// 通过 SOAP Repository.asmx LabelItem 实现。
     /// </summary>
     public async Task<string> CreateLabelAsync(
         string labelName,
@@ -744,7 +743,7 @@ public sealed class TfvcClientService
 
     /// <summary>
     /// Unshelve：将 shelveset 内容下载到本地工作区（不 checkin，放入挂起变更）。
-    /// REST GetShelvesetChanges → download each file content → write to local workspace.
+    /// SOAP QueryShelvesetChanges → download each file content → write to local workspace.
     /// </summary>
     public async Task<IReadOnlyList<string>> UnshelveAsync(
         string shelvesetName,
@@ -753,7 +752,7 @@ public sealed class TfvcClientService
         string serverRoot,
         CancellationToken ct = default)
     {
-        // Resolve owner to GUID if needed (REST API requires name;GUID format)
+        // Resolve owner identity — must match the authenticated user for SOAP workspace operations.
         string? resolvedOwner = owner;
         if (string.IsNullOrEmpty(resolvedOwner))
         {
@@ -1245,14 +1244,14 @@ public sealed class TfvcClientService
         string? comment = null,
         bool dryRun = false,
         IReadOnlyList<MergeExecutionResolution>? resolutions = null,
-        string mergeMode = "rest",
+        string mergeMode = "soap",
         string? soapOwner = null,
         CancellationToken ct = default)
     {
         var normalizedSource = NormalizeServerPath(sourcePath);
         var normalizedTarget = NormalizeServerPath(targetPath);
 
-        // SOAP path: lets the server record real merge history (REST cannot).
+        // SOAP path: records real merge history on the server via Repository.asmx.
         // Also use SOAP for dry-run to get accurate 3-way conflict detection.
         if (string.Equals(mergeMode, "soap", StringComparison.OrdinalIgnoreCase))
         {
@@ -1435,7 +1434,7 @@ public sealed class TfvcClientService
             if (dryRun)
                 continue;
 
-            // The REST changeset API does not accept merge change types or merge sources, so we
+            // The SOAP Repository.asmx is the only way to create a changeset with merge semantics, so we
             // push a plain Add/Edit/Delete carrying the source content instead of merge metadata.
             // TFS requires the item's current changesetVersion for an Edit ("请指定项版本"), so we
             // pass the target's current version (targetExists) as the base.
@@ -1579,7 +1578,7 @@ public sealed class TfvcClientService
         // requires OwnerName and it MUST equal the authenticated user (else Merge fails with
         // TF204017 no Use permission). We must NOT infer it from QueryWorkspaces — that returns other
         // users' workspaces on this server and previously picked the wrong identity. The authenticated
-        // user's GUID comes from REST connectionData. An explicit --soap-owner overrides this.
+        // Owner identity is resolved from existing workspaces via SOAP. An explicit --soap-owner overrides this.
         var owner = soapOwner;
         if (string.IsNullOrWhiteSpace(owner))
         {
@@ -1592,9 +1591,9 @@ public sealed class TfvcClientService
                 + "Pass --soap-owner explicitly, or ensure the PAT is valid.");
         }
 
-        // Conflict pre-check (same logic as the REST path). Unresolved conflicts block the merge.
+        // Conflict pre-check: unresolved conflicts block the SOAP merge.
         // Explicit source/target choices are later resolved through SOAP Resolve; manual content
-        // falls back to REST because Repository.asmx Resolve does not accept file bytes.
+        // falls back to manual content copy because Repository.asmx Resolve requires a real workspace file.
         var detail = await GetChangesetAsync(sourceChangesetId, ct).ConfigureAwait(false);
         var conflictAssessments = await AssessMergeConflictsAsync(
             detail, normalizedSource, normalizedTarget, mergeBase, resolutionBySource, ct).ConfigureAwait(false);
@@ -1634,26 +1633,26 @@ public sealed class TfvcClientService
         // source -> AcceptTheirs, target -> AcceptYours. Manual content is different: Repository.asmx
         // Resolve(AcceptMerge) expects a real local workspace file that already contains the merged
         // content. This tool currently uses a temporary server workspace, so manual content still
-        // falls back to the REST content check-in path.
+        // falls back to the manual content copy path (mergeMode=manual, SOAP write without native merge semantics).
         if (resolutionBySource.Values.Any(r => NormalizeResolutionChoice(r.Choice) == "manual"))
         {
-            warnings.Add("SOAP merge fell back to REST for manual conflict content; TFVC merge history is not recorded for this changeset. Source/target resolutions are handled via SOAP Resolve.");
-            var restResult = await MergeChangesetAsync(
+            warnings.Add("SOAP merge fell back to manual content copy for manual conflict resolution; TFVC merge history is not recorded for this changeset. Source/target resolutions are handled via SOAP Resolve.");
+            var manualResult = await MergeChangesetAsync(
                 normalizedSource, normalizedTarget, sourceChangesetId, comment,
-                dryRun: false, resolutions, mergeMode: "rest", soapOwner: soapOwner, ct).ConfigureAwait(false);
+                dryRun: false, resolutions, mergeMode: "manual", soapOwner: soapOwner, ct).ConfigureAwait(false);
             return new MergeExecutionResult
             {
-                SourcePath = restResult.SourcePath,
-                TargetPath = restResult.TargetPath,
-                SourceChangesetId = restResult.SourceChangesetId,
-                SourceFromChangesetId = restResult.SourceFromChangesetId,
-                SourceToChangesetId = restResult.SourceToChangesetId,
-                Comment = restResult.Comment,
-                DryRun = restResult.DryRun,
-                CreatedChangesetId = restResult.CreatedChangesetId,
-                BaseInfo = restResult.BaseInfo,
-                Changes = restResult.Changes,
-                Warnings = warnings.Concat(restResult.Warnings).ToList(),
+                SourcePath = manualResult.SourcePath,
+                TargetPath = manualResult.TargetPath,
+                SourceChangesetId = manualResult.SourceChangesetId,
+                SourceFromChangesetId = manualResult.SourceFromChangesetId,
+                SourceToChangesetId = manualResult.SourceToChangesetId,
+                Comment = manualResult.Comment,
+                DryRun = manualResult.DryRun,
+                CreatedChangesetId = manualResult.CreatedChangesetId,
+                BaseInfo = manualResult.BaseInfo,
+                Changes = manualResult.Changes,
+                Warnings = warnings.Concat(manualResult.Warnings).ToList(),
             };
         }
 
@@ -2364,7 +2363,7 @@ public sealed class TfvcClientService
     /// <summary>
     /// 用 SOAP 服务器 3-way merge 预检一段 changeset 范围 [fromChangeset, toChangeset] 的冲突，
     /// 不实际提交。在临时 server workspace 里 PendMerge，读取 isresolved=false 的冲突，然后删除 workspace。
-    /// 比 REST 启发式准确（REST 在分支点检测失败或文件在 base 不存在时会漏检 add/add、edit/edit 冲突）。
+    /// 比启发式估算准确（后者在分支点检测失败或文件在 base 不存在时会漏检 add/add、edit/edit 冲突）。
     /// </summary>
     public async Task<IReadOnlyList<MergeConflictPreview>> PreviewMergeConflictsAsync(
         string sourcePath,
