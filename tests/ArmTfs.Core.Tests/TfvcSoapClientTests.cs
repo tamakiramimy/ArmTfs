@@ -118,6 +118,28 @@ public class TfvcSoapClientTests
     }
 
     [Fact]
+    public async Task QueryItems_parses_itemid_attribute()
+    {
+        var soap = BuildSoapWithFakeHandler(_ => CreateXmlResponse("""
+            <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+              <soap:Body>
+                <QueryItemsResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                  <QueryItemsResult>
+                    <Item itemid="12483428" item="$/P/a.txt" type="File" cs="42" len="5" hash="abc" />
+                  </QueryItemsResult>
+                </QueryItemsResponse>
+              </soap:Body>
+            </soap:Envelope>
+            """));
+
+        var items = await soap.QueryItemsAsync("$/P/a.txt", recursion: "None");
+
+        Assert.Single(items);
+        Assert.Equal(12483428, items[0].ItemId);
+        Assert.Equal("$/P/a.txt", items[0].ServerPath);
+    }
+
+    [Fact]
     public async Task CreateBranch_returns_changeset_id_from_response()
     {
         var soap = BuildSoapWithFakeHandler(_ => CreateXmlResponse("""
@@ -399,6 +421,410 @@ public class TfvcSoapClientTests
 
         var cs = await soap.CheckInAsync("ws", "alice", "test merge", changes);
         Assert.Equal(9876, cs);
+    }
+
+    [Fact]
+    public async Task UpdateLocalVersion_sends_legacy_local_version_shape()
+    {
+        string capturedBody = string.Empty;
+        var soap = BuildSoapWithFakeHandler(async req =>
+        {
+            capturedBody = await req.Content!.ReadAsStringAsync();
+            Assert.Contains("/UpdateLocalVersion\"", req.Headers.GetValues("SOAPAction").First());
+            return CreateXmlResponse("""
+                <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                  <soap:Body>
+                    <UpdateLocalVersionResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03" />
+                  </soap:Body>
+                </soap:Envelope>
+                """);
+        });
+
+        await soap.UpdateLocalVersionAsync(
+            "ws",
+            "owner-guid",
+            new[]
+            {
+                new Models.Soap.SoapLocalVersionUpdate
+                {
+                    ServerPath = "$/P/a.txt",
+                    LocalPath = @"C:\temp\a.txt",
+                    LocalVersion = 42,
+                    ItemId = 123,
+                },
+            });
+
+        Assert.Contains("<UpdateLocalVersion xmlns=\"http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03\">", capturedBody);
+        Assert.Contains("<workspaceName>ws</workspaceName>", capturedBody);
+        Assert.Contains("<ownerName>owner-guid</ownerName>", capturedBody);
+        Assert.Contains("<LocalVersionUpdate xsi:type=\"LocalVersionUpdate\"", capturedBody);
+        Assert.Contains("tlocal=\"C:\\temp\\a.txt\"", capturedBody);
+        Assert.Contains("lver=\"42\"", capturedBody);
+        Assert.DoesNotContain("sitem=", capturedBody);
+        Assert.Contains("itemid=\"123\"", capturedBody);
+        Assert.DoesNotContain("maxClientPathLength", capturedBody);
+    }
+
+    [Fact]
+    public async Task CheckInWithContent_updates_local_version_before_pending_edits()
+    {
+        var actions = new List<string>();
+        string updateLocalVersionBody = string.Empty;
+
+        var soap = BuildSoapWithFakeHandler(async req =>
+        {
+            if (req.RequestUri!.AbsolutePath.EndsWith("/upload.ashx", StringComparison.OrdinalIgnoreCase))
+            {
+                actions.Add("Upload");
+                return new HttpResponseMessage(HttpStatusCode.OK);
+            }
+
+            var body = await req.Content!.ReadAsStringAsync();
+            var action = req.Headers.GetValues("SOAPAction").First();
+
+            if (action.Contains("/CreateWorkspace\"", StringComparison.Ordinal))
+            {
+                actions.Add("CreateWorkspace");
+                return CreateXmlResponse("""
+                    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                      <soap:Body>
+                        <CreateWorkspaceResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                          <CreateWorkspaceResult computer="PC1" islocal="false" name="ws" owner="owner-guid" ownerdisp="Owner" permissions="9">
+                            <Comment>arm-tfs SOAP checkin</Comment>
+                            <Folders />
+                          </CreateWorkspaceResult>
+                        </CreateWorkspaceResponse>
+                      </soap:Body>
+                    </soap:Envelope>
+                    """);
+            }
+
+            if (action.Contains("/QueryItems\"", StringComparison.Ordinal))
+            {
+                actions.Add("QueryItems");
+                Assert.Contains("$/P/a.txt", body);
+                return CreateXmlResponse("""
+                    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                      <soap:Body>
+                        <QueryItemsResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                          <QueryItemsResult>
+                            <Item itemid="123" item="$/P/a.txt" type="File" cs="42" len="5" />
+                          </QueryItemsResult>
+                        </QueryItemsResponse>
+                      </soap:Body>
+                    </soap:Envelope>
+                    """);
+            }
+
+            if (action.Contains("/UpdateLocalVersion\"", StringComparison.Ordinal))
+            {
+                actions.Add("UpdateLocalVersion");
+                updateLocalVersionBody = body;
+                return CreateXmlResponse("""
+                    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                      <soap:Body>
+                        <UpdateLocalVersionResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03" />
+                      </soap:Body>
+                    </soap:Envelope>
+                    """);
+            }
+
+            if (action.Contains("/PendChanges\"", StringComparison.Ordinal))
+            {
+                actions.Add("PendChanges");
+                return CreateXmlResponse("""
+                    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                      <soap:Body>
+                        <PendChangesResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                          <PendChangesResult>
+                            <GetOperation itemid="123" titem="$/P/a.txt" chg="Edit" />
+                          </PendChangesResult>
+                        </PendChangesResponse>
+                      </soap:Body>
+                    </soap:Envelope>
+                    """);
+            }
+
+            if (action.Contains("/CheckIn\"", StringComparison.Ordinal))
+            {
+                actions.Add("CheckIn");
+                return CreateXmlResponse("""
+                    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                      <soap:Body>
+                        <CheckInResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                          <CheckInResult cset="45678" />
+                        </CheckInResponse>
+                      </soap:Body>
+                    </soap:Envelope>
+                    """);
+            }
+
+            if (action.Contains("/DeleteWorkspace\"", StringComparison.Ordinal))
+            {
+                actions.Add("DeleteWorkspace");
+                return CreateXmlResponse("""
+                    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                      <soap:Body>
+                        <DeleteWorkspaceResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03" />
+                      </soap:Body>
+                    </soap:Envelope>
+                    """);
+            }
+
+            throw new InvalidOperationException($"Unexpected SOAP action: {action}");
+        });
+
+        var changeset = await soap.CheckInWithContentAsync(
+            "checkin",
+            "owner-guid",
+            new[]
+            {
+                new Models.Soap.SoapContentChange
+                {
+                    ChangeType = "Edit",
+                    ServerPath = "$/P/a.txt",
+                    Content = System.Text.Encoding.UTF8.GetBytes("hello"),
+                    BaseVersion = 42,
+                },
+            });
+
+        Assert.Equal(45678, changeset);
+        Assert.Equal(new[] { "CreateWorkspace", "QueryItems", "UpdateLocalVersion", "PendChanges", "Upload", "CheckIn", "DeleteWorkspace" }, actions);
+        Assert.Contains("itemid=\"123\"", updateLocalVersionBody);
+        Assert.Contains("lver=\"42\"", updateLocalVersionBody);
+        Assert.Contains("tlocal=", updateLocalVersionBody);
+    }
+
+    [Fact]
+    public async Task CheckInWithContent_keeps_original_owner_when_CreateWorkspace_returns_display_owner()
+    {
+        const string originalOwner = "0cbfc36d-7ad1-4d7d-919e-581a311ce2e2";
+        const string returnedDisplayOwner = "display-owner";
+        var nonCreateSoapBodies = new List<string>();
+        string uploadBody = string.Empty;
+
+        var soap = BuildSoapWithFakeHandler(async req =>
+        {
+            if (req.RequestUri!.AbsolutePath.EndsWith("/upload.ashx", StringComparison.OrdinalIgnoreCase))
+            {
+                var bytes = await req.Content!.ReadAsByteArrayAsync();
+                uploadBody = System.Text.Encoding.UTF8.GetString(bytes);
+                return new HttpResponseMessage(HttpStatusCode.OK);
+            }
+
+            var body = await req.Content!.ReadAsStringAsync();
+            var action = req.Headers.GetValues("SOAPAction").First();
+
+            if (action.Contains("/CreateWorkspace\"", StringComparison.Ordinal))
+            {
+                Assert.Contains($"owner=\"{originalOwner}\"", body);
+                return CreateXmlResponse($"""
+                    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                      <soap:Body>
+                        <CreateWorkspaceResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                          <CreateWorkspaceResult computer="PC1" islocal="false" name="ws" owner="{returnedDisplayOwner}" ownerdisp="{returnedDisplayOwner}" permissions="9">
+                            <Comment>arm-tfs SOAP checkin</Comment>
+                            <Folders />
+                          </CreateWorkspaceResult>
+                        </CreateWorkspaceResponse>
+                      </soap:Body>
+                    </soap:Envelope>
+                    """);
+            }
+
+            nonCreateSoapBodies.Add(body);
+
+            if (action.Contains("/PendChanges\"", StringComparison.Ordinal))
+            {
+                return CreateXmlResponse("""
+                    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                      <soap:Body>
+                        <PendChangesResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                          <PendChangesResult>
+                            <GetOperation itemid="123" titem="$/P/a.txt" chg="Add" />
+                          </PendChangesResult>
+                        </PendChangesResponse>
+                      </soap:Body>
+                    </soap:Envelope>
+                    """);
+            }
+
+            if (action.Contains("/CheckIn\"", StringComparison.Ordinal))
+            {
+                return CreateXmlResponse("""
+                    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                      <soap:Body>
+                        <CheckInResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                          <CheckInResult cset="12345" />
+                        </CheckInResponse>
+                      </soap:Body>
+                    </soap:Envelope>
+                    """);
+            }
+
+            if (action.Contains("/DeleteWorkspace\"", StringComparison.Ordinal))
+            {
+                return CreateXmlResponse("""
+                    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                      <soap:Body>
+                        <DeleteWorkspaceResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03" />
+                      </soap:Body>
+                    </soap:Envelope>
+                    """);
+            }
+
+            throw new InvalidOperationException($"Unexpected SOAP action: {action}");
+        });
+
+        var changeset = await soap.CheckInWithContentAsync(
+            "checkin",
+            originalOwner,
+            new[]
+            {
+                new Models.Soap.SoapContentChange
+                {
+                    ChangeType = "Add",
+                    ServerPath = "$/P/a.txt",
+                    Content = System.Text.Encoding.UTF8.GetBytes("hello"),
+                },
+            });
+
+        Assert.Equal(12345, changeset);
+        Assert.NotEmpty(nonCreateSoapBodies);
+        Assert.All(nonCreateSoapBodies, body =>
+        {
+            Assert.Contains($"<tns:ownerName>{originalOwner}</tns:ownerName>", body);
+            Assert.DoesNotContain(returnedDisplayOwner, body);
+        });
+        Assert.Contains(originalOwner, uploadBody);
+        Assert.DoesNotContain(returnedDisplayOwner, uploadBody);
+    }
+
+    [Fact]
+    public async Task TfvcClientService_Checkin_retries_with_authenticated_owner_from_TF204017()
+    {
+        const string wrongOwner = "8adbeef9-f3da-4bd2-8d3f-7974d73f8b18";
+        const string authenticatedOwner = "0cbfc36d-7ad1-4d7d-919e-581a311ce2e2";
+        var createOwners = new List<string>();
+        var pendOwners = new List<string>();
+        var firstPend = true;
+
+        using var connection = new FakeTfsConnection(async req =>
+        {
+            if (req.RequestUri!.AbsolutePath.EndsWith("/upload.ashx", StringComparison.OrdinalIgnoreCase))
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK);
+            }
+
+            var body = await req.Content!.ReadAsStringAsync();
+            var action = req.Headers.GetValues("SOAPAction").First();
+
+            if (action.Contains("/QueryWorkspaces\"", StringComparison.Ordinal))
+            {
+                return CreateXmlResponse($"""
+                    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                      <soap:Body>
+                        <QueryWorkspacesResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                          <QueryWorkspacesResult>
+                            <Workspace name="other-user-ws" owner="{wrongOwner}" ownerdisp="Wrong User" computer="PC1" />
+                          </QueryWorkspacesResult>
+                        </QueryWorkspacesResponse>
+                      </soap:Body>
+                    </soap:Envelope>
+                    """);
+            }
+
+            if (action.Contains("/CreateWorkspace\"", StringComparison.Ordinal))
+            {
+                var owner = body.Contains(wrongOwner, StringComparison.Ordinal) ? wrongOwner : authenticatedOwner;
+                createOwners.Add(owner);
+                return CreateXmlResponse($"""
+                    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                      <soap:Body>
+                        <CreateWorkspaceResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                          <CreateWorkspaceResult computer="PC1" islocal="false" name="ws" owner="{owner}" ownerdisp="Owner" permissions="9">
+                            <Comment>arm-tfs SOAP checkin</Comment>
+                            <Folders />
+                          </CreateWorkspaceResult>
+                        </CreateWorkspaceResponse>
+                      </soap:Body>
+                    </soap:Envelope>
+                    """);
+            }
+
+            if (action.Contains("/PendChanges\"", StringComparison.Ordinal))
+            {
+                var owner = body.Contains(wrongOwner, StringComparison.Ordinal) ? wrongOwner : authenticatedOwner;
+                pendOwners.Add(owner);
+                if (firstPend)
+                {
+                    firstPend = false;
+                    return new HttpResponseMessage(HttpStatusCode.InternalServerError)
+                    {
+                        Content = new StringContent($"""
+                            <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                              <soap:Body>
+                                <soap:Fault>
+                                  <faultcode>soap:Server</faultcode>
+                                  <faultstring>TF204017: Cannot complete the operation because the user ({authenticatedOwner}) does not have Use permission.</faultstring>
+                                </soap:Fault>
+                              </soap:Body>
+                            </soap:Envelope>
+                            """, System.Text.Encoding.UTF8, "text/xml")
+                    };
+                }
+
+                return CreateXmlResponse("""
+                    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                      <soap:Body>
+                        <PendChangesResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                          <PendChangesResult>
+                            <GetOperation itemid="123" titem="$/P/a.txt" chg="Add" />
+                          </PendChangesResult>
+                        </PendChangesResponse>
+                      </soap:Body>
+                    </soap:Envelope>
+                    """);
+            }
+
+            if (action.Contains("/CheckIn\"", StringComparison.Ordinal))
+            {
+                return CreateXmlResponse("""
+                    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                      <soap:Body>
+                        <CheckInResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                          <CheckInResult cset="23456" />
+                        </CheckInResponse>
+                      </soap:Body>
+                    </soap:Envelope>
+                    """);
+            }
+
+            if (action.Contains("/DeleteWorkspace\"", StringComparison.Ordinal))
+            {
+                return CreateXmlResponse("""
+                    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                      <soap:Body>
+                        <DeleteWorkspaceResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03" />
+                      </soap:Body>
+                    </soap:Envelope>
+                    """);
+            }
+
+            throw new InvalidOperationException($"Unexpected SOAP action: {action}");
+        });
+        var service = new TfvcClientService(connection);
+
+        var changes = new List<(string serverPath, Models.ChangeType changeType, byte[]? content, int? baseChangesetId)>
+        {
+            ("$/P/a.txt", Models.ChangeType.Add, System.Text.Encoding.UTF8.GetBytes("hello"), null),
+        };
+
+        var result = await service.CheckinAsync("checkin", changes);
+
+        Assert.Equal(23456, result.ChangesetId);
+        Assert.Equal(new[] { wrongOwner, authenticatedOwner }, createOwners);
+        Assert.Equal(new[] { wrongOwner, authenticatedOwner }, pendOwners);
     }
 
     [Fact]

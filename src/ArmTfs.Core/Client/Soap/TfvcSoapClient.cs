@@ -1,4 +1,5 @@
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Security;
 using System.Text;
 using System.Xml.Linq;
@@ -918,7 +919,42 @@ public sealed class TfvcSoapClient
         return new List<SoapBranchObject> { result };
     }
 
-    // ─── PendChanges (General) + Upload + CheckInWithContent ─────────────────
+    // ─── Local version + PendChanges (General) + Upload + CheckInWithContent ──
+
+    /// <summary>
+    /// Records local-version rows for mapped files in a temporary workspace. Server workspaces still
+    /// require this before pending Edit changes through local paths; otherwise upload.ashx reports
+    /// ItemNotCheckedOut because the workspace has no baseline for the file.
+    /// </summary>
+    public async Task UpdateLocalVersionAsync(
+        string workspaceName,
+        string ownerName,
+        IReadOnlyList<SoapLocalVersionUpdate> updates,
+        CancellationToken ct = default)
+    {
+        if (updates.Count == 0)
+            throw new ArgumentException("At least one local version update is required.", nameof(updates));
+
+        var updatesXml = new StringBuilder();
+        foreach (var update in updates)
+        {
+            if (update.ItemId <= 0)
+            {
+                throw new ArgumentException($"Local version update for '{update.ServerPath}' is missing a valid item id.", nameof(updates));
+            }
+
+            updatesXml.AppendLine($@"        <LocalVersionUpdate xsi:type=""LocalVersionUpdate"" tlocal=""{Esc(update.LocalPath)}"" lver=""{update.LocalVersion}"" itemid=""{update.ItemId}"" />");
+        }
+
+        var body = $@"    <UpdateLocalVersion xmlns=""{Ns}"">
+      <workspaceName>{Esc(workspaceName)}</workspaceName>
+      <ownerName>{Esc(ownerName)}</ownerName>
+      <updates>
+{updatesXml}      </updates>
+    </UpdateLocalVersion>";
+
+        _ = await InvokeAsync("UpdateLocalVersion", body, ct).ConfigureAwait(false);
+    }
 
     /// <summary>
     /// 在 workspace 中 pend 一组变更（Edit/Add/Delete/Undelete），返回每个操作的 GetOperation 信息。
@@ -986,26 +1022,42 @@ public sealed class TfvcSoapClient
         CancellationToken ct = default)
     {
         // TFS upload endpoint: {collection}/VersionControl/v1.0/upload.ashx
-        // This uploads content as a chunked multipart/form-data POST
+        // TEE/Visual Studio send upload metadata as multipart fields (not query params).
+        // Required fields: item, wsname, wsowner, filelength, hash, range, content.
         var uploadUrl = _connection.ServerUrl.TrimEnd('/') + "/VersionControl/v1.0/upload.ashx";
+        const string boundary = "----------------314159265358979323846";
 
         using var httpClient = _connection.CreateHttpClient();
-        using var formContent = new MultipartFormDataContent();
 
-        // The upload requires workspace context and content metadata
-        formContent.Add(new StringContent(content.Length.ToString()), "filelength");
-        formContent.Add(new ByteArrayContent(content), "content", "file");
+        var contentHash = Convert.ToBase64String(MD5.HashData(content));
+        // TFS expects a range field even for single-shot uploads, with a trailing CRLF.
+        var rangeValue = content.Length == 0
+            ? "bytes=0--1/0\r\n"
+            : $"bytes=0-{content.Length - 1}/{content.Length}\r\n";
 
-        // Build the upload URL with workspace and path query parameters
-        var queryUrl = $"{uploadUrl}?item={Uri.EscapeDataString(serverPath)}&wsname={Uri.EscapeDataString(workspaceName)}&wsowner={Uri.EscapeDataString(ownerName)}";
+        using var payload = new MemoryStream();
+        WriteStringPart(payload, boundary, "item", serverPath);
+        WriteStringPart(payload, boundary, "wsname", workspaceName);
+        WriteStringPart(payload, boundary, "wsowner", ownerName);
+        WriteStringPart(payload, boundary, "filelength", content.Length.ToString());
+        WriteStringPart(payload, boundary, "hash", contentHash);
+        WriteStringPart(payload, boundary, "range", rangeValue);
+        WriteFilePart(payload, boundary, "content", "item", "application/octet-stream", content);
+        WriteMultipartEnd(payload, boundary);
 
-        using var response = await httpClient.PostAsync(queryUrl, formContent, ct).ConfigureAwait(false);
+        using var request = new HttpRequestMessage(HttpMethod.Post, uploadUrl);
+        request.Content = new ByteArrayContent(payload.ToArray());
+        request.Content.Headers.ContentType = new MediaTypeHeaderValue("multipart/form-data");
+        request.Content.Headers.ContentType.Parameters.Add(new NameValueHeaderValue("boundary", boundary));
+
+        using var response = await httpClient.SendAsync(request, ct).ConfigureAwait(false);
 
         if (!response.IsSuccessStatusCode)
         {
             var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            var headerSummary = string.Join("; ", response.Headers.SelectMany(h => h.Value.Select(v => $"{h.Key}={v}")));
             throw new SoapFaultException("UploadFile", response.StatusCode,
-                $"Upload failed for {serverPath}: {body[..Math.Min(500, body.Length)]}", body);
+                $"Upload failed for {serverPath}: headers=[{headerSummary}] body={body[..Math.Min(500, body.Length)]}", body);
         }
     }
 
@@ -1036,29 +1088,64 @@ public sealed class TfvcSoapClient
             .ToList();
         var tempRoot = Path.Combine(Path.GetTempPath(), "arm-tfs-checkin", workspaceName);
         var folders = roots.Select((r, i) => (r, Path.Combine(tempRoot, $"m{i}"))).ToArray();
+        var localMappings = folders.ToDictionary(tuple => tuple.Item1, tuple => tuple.Item2, StringComparer.OrdinalIgnoreCase);
 
         SoapWorkspace? createdWs = null;
-        string effectiveOwner = ownerName;
 
         try
         {
             // 1. Create workspace
             var ws = await CreateWorkspaceAsync(workspaceName, ownerName, computer, "arm-tfs SOAP checkin", folders, ct).ConfigureAwait(false);
-            if (!string.IsNullOrWhiteSpace(ws.Owner)) effectiveOwner = ws.Owner;
             createdWs = ws;
+            // Keep using the exact owner identity that created the workspace. Some TFS servers
+            // return a display name in CreateWorkspaceResult.Owner; using that for local-path
+            // PendChanges resolves a different workspace identity and fails with TF204017.
 
-            // 2. PendChanges for all items
-            var changeRequests = changes.Select(c => new SoapChangeRequest
+            // 2. Prepare mapped files and record baselines for Edit changes before pending them.
+            var preparedChanges = changes
+                .Select(c => (Change: c, PendingPath: PreparePendingItemPath(c, localMappings)))
+                .ToList();
+
+            var localVersionUpdates = new List<SoapLocalVersionUpdate>();
+            foreach (var p in preparedChanges)
             {
-                RequestType = c.ChangeType,
-                ServerPath = c.ServerPath,
-                BaseVersion = c.BaseVersion,
-                Encoding = c.Content is not null ? 65001 : null,
+                if (p.Change.Content is null
+                    || !p.Change.BaseVersion.HasValue
+                    || !string.Equals(p.Change.ChangeType, "Edit", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                localVersionUpdates.Add(new SoapLocalVersionUpdate
+                {
+                    ServerPath = p.Change.ServerPath,
+                    LocalPath = p.PendingPath,
+                    LocalVersion = p.Change.BaseVersion.Value,
+                    ItemId = await ResolveItemIdAsync(p.Change.ServerPath, ct).ConfigureAwait(false),
+                });
+            }
+
+            if (localVersionUpdates.Count > 0)
+            {
+                await UpdateLocalVersionAsync(workspaceName, ownerName, localVersionUpdates, ct).ConfigureAwait(false);
+            }
+
+            var changeRequests = preparedChanges.Select(p => new SoapChangeRequest
+            {
+                RequestType = p.Change.ChangeType,
+                ServerPath = p.PendingPath,
+                BaseVersion = p.Change.BaseVersion,
+                Encoding = p.Change.Content is not null ? GetPendingEncoding(p.Change.Content) : null,
                 ItemType = "File",
-                TargetServerPath = c.TargetServerPath,
+                TargetServerPath = p.Change.TargetServerPath,
             }).ToList();
 
-            var pendOps = await PendChangesAsync(workspaceName, effectiveOwner, changeRequests, ct).ConfigureAwait(false);
+            var pendOps = new List<SoapPendChangeOperation>();
+            foreach (var group in changeRequests.GroupBy(request => request.RequestType, StringComparer.OrdinalIgnoreCase))
+            {
+                var groupOps = await PendChangesAsync(workspaceName, ownerName, group.ToList(), ct).ConfigureAwait(false);
+                pendOps.AddRange(groupOps);
+            }
 
             // 3. Upload content for Edit/Add operations
             foreach (var change in changes)
@@ -1066,7 +1153,7 @@ public sealed class TfvcSoapClient
                 if (change.Content is null) continue;
                 if (string.Equals(change.ChangeType, "Delete", StringComparison.OrdinalIgnoreCase)) continue;
 
-                await UploadFileToWorkspaceAsync(workspaceName, effectiveOwner, change.ServerPath, change.Content, ct).ConfigureAwait(false);
+                await UploadFileToWorkspaceAsync(workspaceName, ownerName, change.ServerPath, change.Content, ct).ConfigureAwait(false);
             }
 
             // 4. CheckIn — build pending changes from the PendChanges result
@@ -1083,14 +1170,14 @@ public sealed class TfvcSoapClient
                 });
             }
 
-            var changesetId = await CheckInAsync(workspaceName, effectiveOwner, comment, pendingChanges, ct).ConfigureAwait(false);
+            var changesetId = await CheckInAsync(workspaceName, ownerName, comment, pendingChanges, ct).ConfigureAwait(false);
             return changesetId;
         }
         finally
         {
             if (createdWs is not null)
             {
-                try { await DeleteWorkspaceAsync(workspaceName, effectiveOwner, ct).ConfigureAwait(false); }
+                try { await DeleteWorkspaceAsync(workspaceName, ownerName, ct).ConfigureAwait(false); }
                 catch (Exception ex) { Console.Error.WriteLine($"warning: checkin workspace cleanup failed: {ex.Message}"); }
             }
         }
@@ -1100,6 +1187,122 @@ public sealed class TfvcSoapClient
     {
         var parts = serverPath.TrimStart('$', '/').Split('/');
         return parts.Length >= 1 ? $"$/{parts[0]}" : serverPath;
+    }
+
+    private async Task<int> ResolveItemIdAsync(string serverPath, CancellationToken ct)
+    {
+        var items = await QueryItemsAsync(serverPath, recursion: "None", atChangeset: null, ct).ConfigureAwait(false);
+        var item = items.FirstOrDefault(i => string.Equals(i.ServerPath, serverPath, StringComparison.OrdinalIgnoreCase))
+                   ?? items.FirstOrDefault();
+        if (item is null || item.ItemId <= 0)
+        {
+            throw new InvalidOperationException($"Unable to resolve TFVC item id for '{serverPath}'.");
+        }
+
+        return item.ItemId;
+    }
+
+    private static string PreparePendingItemPath(
+        SoapContentChange change,
+        IReadOnlyDictionary<string, string> localMappings)
+    {
+        if (change.Content is null || string.Equals(change.ChangeType, "Delete", StringComparison.OrdinalIgnoreCase))
+        {
+            return change.ServerPath;
+        }
+
+        var root = GetProjectRoot(change.ServerPath);
+        if (!localMappings.TryGetValue(root, out var mappedRoot))
+        {
+            throw new InvalidOperationException($"Working folder mapping not found for '{change.ServerPath}'.");
+        }
+
+        var localPath = MapServerPathToLocal(root, mappedRoot, change.ServerPath);
+        var parent = Path.GetDirectoryName(localPath);
+        if (!string.IsNullOrEmpty(parent))
+        {
+            Directory.CreateDirectory(parent);
+        }
+
+        File.WriteAllBytes(localPath, change.Content);
+        return localPath;
+    }
+
+    private static string MapServerPathToLocal(string mappedServerRoot, string mappedLocalRoot, string serverPath)
+    {
+        var relative = serverPath.Substring(mappedServerRoot.Length).TrimStart('/');
+        return Path.Combine(mappedLocalRoot, relative.Replace('/', Path.DirectorySeparatorChar));
+    }
+
+    private static int GetPendingEncoding(byte[] content)
+    {
+        return IsLikelyBinary(content) ? -1 : 65001;
+    }
+
+    private static bool IsLikelyBinary(byte[] content)
+    {
+        if (content.Length == 0)
+        {
+            return false;
+        }
+
+        var sampleLength = Math.Min(content.Length, 8192);
+        var suspicious = 0;
+        for (var i = 0; i < sampleLength; i++)
+        {
+            var b = content[i];
+            if (b == 0)
+            {
+                return true;
+            }
+
+            var isCommonWhitespace = b is 9 or 10 or 12 or 13;
+            var isPrintableAscii = b >= 32 && b <= 126;
+            if (!isCommonWhitespace && !isPrintableAscii)
+            {
+                suspicious++;
+            }
+        }
+
+        return suspicious * 100 / sampleLength > 30;
+    }
+
+    private static void WriteStringPart(Stream stream, string boundary, string name, string value)
+    {
+        WriteAscii(stream, $"--{boundary}\r\n");
+        WriteAscii(stream, $"Content-Disposition: form-data; name=\"{name}\"\r\n");
+        WriteAscii(stream, "Content-Type: text/plain; charset=utf-8\r\n");
+        WriteAscii(stream, "Content-Transfer-Encoding: 8bit\r\n");
+        WriteAscii(stream, "\r\n");
+        stream.Write(Encoding.UTF8.GetBytes(value));
+        WriteAscii(stream, "\r\n");
+    }
+
+    private static void WriteFilePart(
+        Stream stream,
+        string boundary,
+        string name,
+        string fileName,
+        string contentType,
+        byte[] content)
+    {
+        WriteAscii(stream, $"--{boundary}\r\n");
+        WriteAscii(stream, $"Content-Disposition: form-data; name=\"{name}\"; filename=\"{fileName}\"\r\n");
+        WriteAscii(stream, $"Content-Type: {contentType}\r\n");
+        WriteAscii(stream, "Content-Transfer-Encoding: binary\r\n");
+        WriteAscii(stream, "\r\n");
+        stream.Write(content);
+        WriteAscii(stream, "\r\n");
+    }
+
+    private static void WriteMultipartEnd(Stream stream, string boundary)
+    {
+        WriteAscii(stream, $"--{boundary}--\r\n");
+    }
+
+    private static void WriteAscii(Stream stream, string value)
+    {
+        stream.Write(Encoding.ASCII.GetBytes(value));
     }
 
     /// <summary>
@@ -1195,7 +1398,8 @@ public sealed class TfvcSoapClient
             var durl = AttrAny(item, "durl");
             DateTimeOffset? date = DateTimeOffset.TryParse(AttrAny(item, "date"), out var d) ? d : null;
 
-            result.Add(new SoapItem(itemPath, string.Equals(type, "Folder", StringComparison.OrdinalIgnoreCase), cs, len, hash, durl, date));
+            var itemId = TryParseInt(AttrAny(item, "itemid")) ?? 0;
+            result.Add(new SoapItem(itemPath, string.Equals(type, "Folder", StringComparison.OrdinalIgnoreCase), cs, len, hash, durl, date, itemId));
         }
 
         return result;

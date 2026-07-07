@@ -138,7 +138,7 @@ public static class CheckinCommand
             }
 
             using var conn = new TfsConnection(config);
-            var svc = new TfvcClientService(conn);
+            var svc = new TfvcClientService(conn, ws);
 
             try
             {

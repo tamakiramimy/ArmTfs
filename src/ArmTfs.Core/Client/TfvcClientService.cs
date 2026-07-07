@@ -3126,7 +3126,18 @@ public sealed class TfvcClientService
             BaseVersion = c.baseVersion,
         }).ToList();
 
-        return await soap.CheckInWithContentAsync(comment, owner, soapChanges, ct).ConfigureAwait(false);
+        try
+        {
+            return await soap.CheckInWithContentAsync(comment, owner, soapChanges, ct).ConfigureAwait(false);
+        }
+        catch (SoapFaultException ex) when (TryExtractAuthenticatedUserGuidFromTf204017(ex.FaultMessage, out var authenticatedOwner)
+            && !string.Equals(authenticatedOwner, owner, StringComparison.OrdinalIgnoreCase))
+        {
+            // QueryWorkspaces without an owner filter can return another visible workspace first.
+            // TF204017 includes the authenticated identity that TFS expects for Use permission, so
+            // retry once with that SOAP-provided owner instead of failing the user-facing checkin.
+            return await soap.CheckInWithContentAsync(comment, authenticatedOwner, soapChanges, ct).ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -3134,11 +3145,38 @@ public sealed class TfvcClientService
     /// </summary>
     private async Task<string> ResolveOwnerForSoapAsync(CancellationToken ct)
     {
+        try
+        {
+            var metadataOwner = _workspaceManager?.LoadMetadata().Owner;
+            if (!string.IsNullOrWhiteSpace(metadataOwner))
+                return metadataOwner;
+        }
+        catch
+        {
+            // Fall back to the connection-level SOAP probe when local metadata is unavailable.
+        }
+
         var owner = await _connection.GetAuthenticatedUserGuidAsync(ct).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(owner))
             throw new InvalidOperationException(
                 "Cannot resolve authenticated user for SOAP operation. Ensure the PAT is valid.");
         return owner;
+    }
+
+    internal static bool TryExtractAuthenticatedUserGuidFromTf204017(string? message, out string ownerGuid)
+    {
+        ownerGuid = string.Empty;
+        if (string.IsNullOrWhiteSpace(message) || !message.Contains("TF204017", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var match = Regex.Match(
+            message,
+            @"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
+        if (!match.Success)
+            return false;
+
+        ownerGuid = match.Value;
+        return true;
     }
 
     /// <summary>

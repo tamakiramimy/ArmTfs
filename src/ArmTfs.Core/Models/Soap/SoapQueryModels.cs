@@ -10,7 +10,8 @@ public sealed record SoapItem(
     long ContentLength,
     string? HashValue,
     string? DownloadUrl,
-    DateTimeOffset? CheckinDate);
+    DateTimeOffset? CheckinDate,
+    int ItemId = 0);
 
 /// <summary>
 /// QueryHistory 返回的单个 changeset 摘要。

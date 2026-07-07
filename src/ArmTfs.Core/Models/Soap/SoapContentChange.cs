@@ -60,3 +60,21 @@ public sealed class SoapPendChangeOperation
     /// <summary>变更类型字符串。</summary>
     public string ChangeType { get; init; } = string.Empty;
 }
+
+/// <summary>
+/// Local-version bookkeeping entry for Repository5.UpdateLocalVersion.
+/// </summary>
+public sealed class SoapLocalVersionUpdate
+{
+    /// <summary>Server item path whose local baseline is being recorded.</summary>
+    public string ServerPath { get; init; } = string.Empty;
+
+    /// <summary>Mapped local file path inside the temporary workspace.</summary>
+    public string LocalPath { get; init; } = string.Empty;
+
+    /// <summary>Base changeset version currently represented by the local item.</summary>
+    public int LocalVersion { get; init; }
+
+    /// <summary>Server item id required by the legacy Repository.UpdateLocalVersion SOAP shape.</summary>
+    public int ItemId { get; init; }
+}
