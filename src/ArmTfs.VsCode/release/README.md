@@ -1,7 +1,51 @@
-# ARM TFS v0.1.7 Release Files
+# ARM TFS v0.5.1 Release Files
 
 ## 发布日期
-2026-07-02
+2026-07-07
+
+## 文件说明
+
+### VSCode 扩展
+- **arm-tfs-vscode-0.5.1.vsix** (~774 KB)
+  - ARM TFS VSCode 扩展安装包
+  - 安装命令: `code --install-extension arm-tfs-vscode-0.5.1.vsix`
+  - 兼容 VSCode 1.90.0+
+
+### CLI 运行时 - macOS arm64
+- **arm-tfs-0.5.1-osx-arm64.zip** (~34 MB)
+  - macOS ARM64 平台自包含单文件可执行程序
+  - 解压后直接运行: `./arm-tfs --help`
+  - 适用于: Apple Silicon Macs (M1/M2/M3)
+
+### CLI 运行时 - macOS x64
+- **arm-tfs-0.5.1-osx-x64.zip** (~36 MB)
+  - macOS Intel x64 平台自包含单文件可执行程序
+  - 适用于: Intel Macs
+
+### CLI 运行时 - Windows arm64
+- **arm-tfs-0.5.1-win-arm64.zip** (~35 MB)
+  - Windows ARM64 平台自包含单文件可执行程序
+  - 解压后运行: `arm-tfs.exe --help`
+  - 适用于: Windows on ARM 设备
+
+### CLI 运行时 - Windows x64
+- **arm-tfs-0.5.1-win-x64.zip** (~36 MB)
+  - Windows x64 平台自包含单文件可执行程序
+  - 适用于: 标准 Windows PC
+
+## 新功能 (v0.5.1)
+
+### Checkin SOAP 流程修复
+- 新增 `UpdateLocalVersionAsync`（服务端工作区 pend Edit 前必须设置本地版本基线）
+- 修复 `UploadFileToWorkspaceAsync`：正确的 multipart form-data 格式（含 MD5 hash/range）
+- 重构 `CheckInWithContentAsync`：分类型批量 pend + 本地路径写文件 + 二进制/文本编码自动检测
+- 修复 owner 解析：优先读 workspace metadata，捕获 TF204017 用错误中 GUID 重试
+
+### 历史记录时间显示修复
+- 修复时间显示为零时区（UTC）的问题
+- 所有 history/changeset/label/shelveset/branch 时间现在正确显示本地时间
+
+
 
 ## 文件说明
 

@@ -1,6 +1,37 @@
 # Changelog
 
-## 0.1.8 - 2026-07-02
+## 0.5.1 - 2026-07-07
+
+### 核心修复
+
+**Checkin SOAP 流程修复**:
+- 新增 `UpdateLocalVersionAsync`：服务端工作区在 pend Edit 前必须先设置本地版本基线，否则 upload.ashx 报 ItemNotCheckedOut
+- 修复 `UploadFileToWorkspaceAsync`：使用正确的 multipart form-data 格式，包含 item / wsname / wsowner / filelength / MD5 hash / range 字段
+- 重构 `CheckInWithContentAsync`：按变更类型分组批量 pend、写本地文件路径、自动检测二进制/文本编码
+- 修复 owner 解析：`ResolveOwnerForSoapAsync` 优先读 workspace metadata owner；捕获 TF204017 并用错误中的 GUID 重试
+
+**历史记录时间显示修复（UTC → 本地时间）**:
+- 根本原因：TFS SOAP 返回 UTC 时间，但 `DateTimeOffset.TryParse` 对无时区标记的字符串默认按本地时间解析，且 `.DateTime` 属性丢失 Kind 信息，导致 JSON 序列化无 Z 后缀，VS Code 扩展 `toLocaleString()` 无法正确转换时区
+- `TfvcSoapClient`：所有 `DateTimeOffset.TryParse` 增加 `AssumeUniversal | AdjustToUniversal`
+- `TfvcClientService`：所有 `.DateTime` 改为 `.UtcDateTime`，确保 Kind=UTC
+- CLI 所有命令日期显示增加 `.ToLocalTime()` 转换
+
+**模型变更**:
+- `SoapItem` 增加 `ItemId` 字段
+- 新增 `SoapLocalVersionUpdate` 模型
+
+### 测试
+- 补充 QueryItems itemid 属性解析测试
+- 补充 UpdateLocalVersion SOAP 报文格式验证测试
+
+### 发布包
+- macOS arm64: `arm-tfs-0.5.1-osx-arm64.zip`
+- macOS x64: `arm-tfs-0.5.1-osx-x64.zip`
+- Windows arm64: `arm-tfs-0.5.1-win-arm64.zip`
+- Windows x64: `arm-tfs-0.5.1-win-x64.zip`
+- VSCode 扩展: `arm-tfs-vscode-0.5.1.vsix`
+
+
 
 ### VS Code extension - 手动合并编辑器改进
 
