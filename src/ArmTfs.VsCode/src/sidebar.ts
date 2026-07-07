@@ -206,6 +206,11 @@ export class ArmTfsSidebarController implements vscode.Disposable {
       this.branchView,
       this.historyView,
       this.mergeView,
+      this.mergeView.onDidChangeVisibility((e) => {
+        if (e.visible) {
+          void this.refreshMerge();
+        }
+      }),
       this.branchView.onDidChangeSelection((event) => {
         const branches = event.selection.filter((item): item is BranchNode => item instanceof BranchNode);
         if (branches.length === 2) {
@@ -502,6 +507,11 @@ export class ArmTfsSidebarController implements vscode.Disposable {
   }
 
   async refreshMerge(): Promise<void> {
+    // 避免在 merge 面板不可见时发起不必要的网络请求（尤其是 branch show）。
+    // 当面板变为可见时，onDidChangeVisibility 会触发一次完整刷新。
+    if (!this.mergeView.visible) {
+      return;
+    }
     const sourcePath = this.getMergeSourcePath();
     const targetPath = await this.getMergeTargetPath(sourcePath);
     const configNodes: ArmTfsTreeNode[] = [

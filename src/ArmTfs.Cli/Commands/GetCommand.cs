@@ -156,9 +156,10 @@ public static class GetCommand
                 if (!force && File.Exists(localPath))
                 {
                     var tracked = ws.GetTrackedVersion(localPath);
-                    if (tracked is not null &&
-                        tracked.ChangesetId == item.ChangesetId &&
-                        tracked.ContentHash == WorkspaceManager.ComputeFileHash(localPath))
+                    // TFS changeset ID 是不可变的版本标识符：若服务器 changeset ID
+                    // 与本地已追踪的一致，则文件在服务器上未变更，无需下载。
+                    // 避免对每个文件都计算 SHA-256 哈希（对大型分支代价极高）。
+                    if (tracked is not null && tracked.ChangesetId == item.ChangesetId)
                     {
                         if (ws.GetCachedBaseFilePath(localPath) is null)
                             ws.SaveBaseFileFromDisk(localPath);

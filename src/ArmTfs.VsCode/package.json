@@ -2,7 +2,7 @@
   "name": "arm-tfs-vscode",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.1.8",
+  "version": "0.5.1",
   "publisher": "local",
   "engines": {
     "vscode": "^1.90.0"
