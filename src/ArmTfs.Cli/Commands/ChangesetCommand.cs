@@ -47,7 +47,7 @@ public static class ChangesetCommand
                 Console.WriteLine($"Changeset : {changeset.ChangesetId}");
                 Console.WriteLine($"Author    : {changeset.Author?.DisplayName}");
                 Console.WriteLine($"CheckedIn : {changeset.CheckedInBy?.DisplayName}");
-                Console.WriteLine($"Created   : {changeset.CreatedDate:u}");
+                Console.WriteLine($"Created   : {changeset.CreatedDate.ToLocalTime():yyyy-MM-dd HH:mm:ss}");
                 Console.WriteLine($"Comment   : {changeset.Comment}");
                 Console.WriteLine($"Changes   : {changeset.Changes?.Count() ?? 0}");
 

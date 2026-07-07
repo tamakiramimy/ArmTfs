@@ -80,7 +80,7 @@ public static class HistoryCommand
 
                 foreach (var cs in changesets)
                 {
-                    var date = cs.CreatedDate.ToString("yyyy-MM-dd HH:mm:ss");
+                    var date = cs.CreatedDate.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
                     var authorName = (cs.Author?.DisplayName ?? "").PadRight(25)[..Math.Min(25, cs.Author?.DisplayName?.Length ?? 0)];
                     var comment = (cs.Comment ?? "").Replace('\n', ' ').Replace('\r', ' ');
                     if (comment.Length > 70) comment = comment[..67] + "...";

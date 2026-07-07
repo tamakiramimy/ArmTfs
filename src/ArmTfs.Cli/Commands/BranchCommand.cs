@@ -170,7 +170,7 @@ public static class BranchCommand
                 foreach (var branch in branches.OrderBy(b => b.Path, StringComparer.OrdinalIgnoreCase))
                 {
                     var owner = branch.Owner?.DisplayName ?? string.Empty;
-                    var created = branch.CreatedDate == default ? string.Empty : branch.CreatedDate.ToString("yyyy-MM-dd HH:mm");
+                    var created = branch.CreatedDate == default ? string.Empty : branch.CreatedDate.ToLocalTime().ToString("yyyy-MM-dd HH:mm");
                     Console.WriteLine($"{branch.Path,-80}  {owner,-25}  {created,-20}  {(branch.IsDeleted ? "yes" : "no")}");
                 }
 
@@ -227,7 +227,7 @@ public static class BranchCommand
 
                 Console.WriteLine($"Path       : {branch.Path}");
                 Console.WriteLine($"Owner      : {branch.Owner?.DisplayName}");
-                Console.WriteLine($"Created    : {branch.CreatedDate:u}");
+                Console.WriteLine($"Created    : {branch.CreatedDate.ToLocalTime():yyyy-MM-dd HH:mm:ss}");
                 Console.WriteLine($"Deleted    : {(branch.IsDeleted ? "yes" : "no")}");
                 Console.WriteLine($"Description: {branch.Description}");
                 Console.WriteLine($"Parent     : {branch.Parent?.Path}");

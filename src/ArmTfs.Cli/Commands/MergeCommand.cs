@@ -329,7 +329,7 @@ public static class MergeCommand
                     {
                         var comment = (candidate.Comment ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ');
                         if (comment.Length > 70) comment = comment[..67] + "...";
-                        Console.WriteLine($"{candidate.ChangesetId,-8}  {candidate.CreatedAt:yyyy-MM-dd HH:mm:ss,-20}  {(candidate.AuthorDisplayName ?? string.Empty),-24}  {comment}");
+                        Console.WriteLine($"{candidate.ChangesetId,-8}  {candidate.CreatedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss,-20}  {(candidate.AuthorDisplayName ?? string.Empty),-24}  {comment}");
                     }
                 }
 

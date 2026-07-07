@@ -48,7 +48,7 @@ public static class ShelvesetCommand
                 foreach (var ss in shelvesets.OrderByDescending(s => s.CreatedDate))
                 {
                     var ownerName = (ss.Owner?.DisplayName ?? "").PadRight(25);
-                    var date = ss.CreatedDate.ToString("yyyy-MM-dd HH:mm");
+                    var date = ss.CreatedDate.ToLocalTime().ToString("yyyy-MM-dd HH:mm");
                     var comment = (ss.Comment ?? "").Replace('\n', ' ');
                     if (comment.Length > 50) comment = comment[..47] + "...";
                     Console.WriteLine($"{ss.Name,-40}  {ownerName,-25}  {date,-22}  {comment}");
@@ -97,7 +97,7 @@ public static class ShelvesetCommand
 
                 Console.WriteLine($"Name    : {ss.Name}");
                 Console.WriteLine($"Owner   : {ss.Owner?.DisplayName}");
-                Console.WriteLine($"Date    : {ss.CreatedDate:u}");
+                Console.WriteLine($"Date    : {ss.CreatedDate.ToLocalTime():yyyy-MM-dd HH:mm:ss}");
                 Console.WriteLine($"Comment : {ss.Comment}");
                 Console.WriteLine();
 

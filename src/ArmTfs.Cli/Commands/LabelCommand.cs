@@ -72,7 +72,7 @@ public static class LabelCommand
                 Console.WriteLine($"{new string('-', 8)}  {new string('-', 30)}  {new string('-', 25)}  {new string('-', 20)}  {new string('-', 30)}");
                 foreach (var label in labels.OrderByDescending(l => l.ModifiedDate))
                 {
-                    Console.WriteLine($"{label.Id,-8}  {label.Name,-30}  {(label.Owner?.DisplayName ?? string.Empty),-25}  {label.ModifiedDate:yyyy-MM-dd HH:mm,-20}  {label.LabelScope}");
+                    Console.WriteLine($"{label.Id,-8}  {label.Name,-30}  {(label.Owner?.DisplayName ?? string.Empty),-25}  {label.ModifiedDate.ToLocalTime():yyyy-MM-dd HH:mm,-20}  {label.LabelScope}");
                 }
             }
             catch (Exception ex)

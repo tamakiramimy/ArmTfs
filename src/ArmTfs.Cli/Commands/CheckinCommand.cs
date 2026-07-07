@@ -145,7 +145,7 @@ public static class CheckinCommand
                 var result = await svc.CheckinAsync(comment, changes).ConfigureAwait(false);
                 Console.WriteLine($"Changeset {result.ChangesetId} created successfully.");
                 Console.WriteLine($"  Author : {result.Author?.DisplayName}");
-                Console.WriteLine($"  Date   : {result.CreatedDate}");
+                Console.WriteLine($"  Date   : {result.CreatedDate.ToLocalTime():yyyy-MM-dd HH:mm:ss}");
                 Console.WriteLine($"  Comment: {result.Comment}");
 
                 if (!keepPending)

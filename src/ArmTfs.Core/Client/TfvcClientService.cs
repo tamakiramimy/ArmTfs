@@ -119,7 +119,7 @@ public sealed class TfvcClientService
         {
             ChangesetId = h.ChangesetId,
             Author = h.Author != null ? new IdentityRef { DisplayName = h.Author, UniqueName = h.AuthorUniqueName ?? h.Author } : null,
-            CreatedDate = h.CreatedDate?.DateTime ?? DateTime.MinValue,
+            CreatedDate = h.CreatedDate?.UtcDateTime ?? DateTime.MinValue,
             Comment = h.Comment,
         }).ToList();
     }
@@ -154,7 +154,7 @@ public sealed class TfvcClientService
             Author = metadata.Author != null
                 ? new IdentityRef { DisplayName = metadata.Author, UniqueName = metadata.AuthorUniqueName ?? metadata.Author }
                 : null,
-            CreatedDate = metadata.CreatedDate?.DateTime ?? DateTime.MinValue,
+            CreatedDate = metadata.CreatedDate?.UtcDateTime ?? DateTime.MinValue,
             Comment = metadata.Comment,
             HasMoreChanges = false,
         };
@@ -841,7 +841,7 @@ public sealed class TfvcClientService
             Name = l.Name,
             Description = l.Comment,
             LabelScope = l.Scope,
-            ModifiedDate = l.Date?.DateTime ?? DateTime.MinValue,
+            ModifiedDate = l.Date?.UtcDateTime ?? DateTime.MinValue,
             Owner = l.Owner != null ? new IdentityRef { DisplayName = l.Owner, UniqueName = l.Owner } : null,
         }).ToList();
     }
@@ -866,7 +866,7 @@ public sealed class TfvcClientService
             Name = found.Name,
             Description = found.Comment,
             LabelScope = found.Scope,
-            ModifiedDate = found.Date?.DateTime ?? DateTime.MinValue,
+            ModifiedDate = found.Date?.UtcDateTime ?? DateTime.MinValue,
             Owner = found.Owner != null ? new IdentityRef { DisplayName = found.Owner, UniqueName = found.Owner } : null,
         };
     }
@@ -894,7 +894,7 @@ public sealed class TfvcClientService
                 UniqueName = ss.Owner,
                 Id = ss.Owner,
             } : null,
-            CreatedDate = ss.Date?.DateTime ?? DateTime.MinValue,
+            CreatedDate = ss.Date?.UtcDateTime ?? DateTime.MinValue,
             Comment = ss.Comment,
         }).ToList();
     }
@@ -963,7 +963,7 @@ public sealed class TfvcClientService
             Path = b.Path,
             Description = b.Description,
             Owner = b.Owner != null ? new IdentityRef { DisplayName = b.Owner, UniqueName = b.Owner } : null,
-            CreatedDate = b.DateCreated?.DateTime ?? DateTime.MinValue,
+            CreatedDate = b.DateCreated?.UtcDateTime ?? DateTime.MinValue,
             IsDeleted = b.IsDeleted,
         }).ToList();
     }
@@ -990,7 +990,7 @@ public sealed class TfvcClientService
             Path = found.Path,
             Description = found.Description,
             Owner = found.Owner != null ? new IdentityRef { DisplayName = found.Owner, UniqueName = found.Owner } : null,
-            CreatedDate = found.DateCreated?.DateTime ?? DateTime.MinValue,
+            CreatedDate = found.DateCreated?.UtcDateTime ?? DateTime.MinValue,
             IsDeleted = found.IsDeleted,
             Parent = !string.IsNullOrEmpty(found.ParentPath) ? new TfvcShallowBranchRef { Path = found.ParentPath } : null,
             Children = found.ChildPaths?.Select(cp => new TfvcBranch { Path = cp }).ToList(),

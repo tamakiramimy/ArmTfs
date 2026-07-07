@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Security;
@@ -760,7 +761,7 @@ public sealed class TfvcSoapClient
             var lid = TryParseInt(AttrAny(label, "lid")) ?? 0;
             var scope = AttrAny(label, "scope");
             var labelOwner = AttrAny(label, "owner");
-            DateTimeOffset? date = DateTimeOffset.TryParse(AttrAny(label, "date"), out var d) ? d : null;
+            DateTimeOffset? date = DateTimeOffset.TryParse(AttrAny(label, "date"), null, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var d) ? d : null;
             var comment = ChildText(label, "Comment");
 
             result.Add(new SoapLabel(name, lid, scope, labelOwner, date, comment));
@@ -799,7 +800,7 @@ public sealed class TfvcSoapClient
             var name = AttrAny(ss, "name") ?? string.Empty;
             var ssOwner = AttrAny(ss, "owner");
             var ssOwnerDisp = AttrAny(ss, "ownerdisp");
-            DateTimeOffset? date = DateTimeOffset.TryParse(AttrAny(ss, "date"), out var d) ? d : null;
+            DateTimeOffset? date = DateTimeOffset.TryParse(AttrAny(ss, "date"), null, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var d) ? d : null;
             var comment = ChildText(ss, "Comment");
 
             result.Add(new SoapShelveset(name, ssOwner, ssOwnerDisp, date, comment));
@@ -884,7 +885,7 @@ public sealed class TfvcSoapClient
         var requestedId = AttrAny(requestedRel, "reltoid") ?? "0";
         var branchToItem = requestedRel.Elements().FirstOrDefault(e => e.Name.LocalName == "BranchToItem");
         var requestedPath = AttrAny(branchToItem, "item") ?? serverPath;
-        DateTimeOffset? dateCreated = DateTimeOffset.TryParse(AttrAny(branchToItem, "date"), out var dc) ? dc : null;
+        DateTimeOffset? dateCreated = DateTimeOffset.TryParse(AttrAny(branchToItem, "date"), null, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var dc) ? dc : null;
 
         // Find parent (the item that requested item branches FROM)
         var parentFromId = AttrAny(requestedRel, "relfromid") ?? "0";
@@ -1396,7 +1397,7 @@ public sealed class TfvcSoapClient
             _ = long.TryParse(AttrAny(item, "len"), out var len);
             var hash = AttrAny(item, "hash");
             var durl = AttrAny(item, "durl");
-            DateTimeOffset? date = DateTimeOffset.TryParse(AttrAny(item, "date"), out var d) ? d : null;
+            DateTimeOffset? date = DateTimeOffset.TryParse(AttrAny(item, "date"), null, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var d) ? d : null;
 
             var itemId = TryParseInt(AttrAny(item, "itemid")) ?? 0;
             result.Add(new SoapItem(itemPath, string.Equals(type, "Folder", StringComparison.OrdinalIgnoreCase), cs, len, hash, durl, date, itemId));
@@ -1439,7 +1440,7 @@ public sealed class TfvcSoapClient
             var csetId = TryParseInt(AttrAny(cs, "cset")) ?? 0;
             var author = AttrAny(cs, "cmtr");
             var authorUnique = AttrAny(cs, "cmtru");
-            DateTimeOffset? date = DateTimeOffset.TryParse(AttrAny(cs, "date"), out var d) ? d : null;
+            DateTimeOffset? date = DateTimeOffset.TryParse(AttrAny(cs, "date"), null, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var d) ? d : null;
             var comment = ChildText(cs, "Comment");
 
             result.Add(new SoapChangeset(csetId, author, authorUnique, date, comment));
@@ -1480,7 +1481,7 @@ public sealed class TfvcSoapClient
         var cset = TryParseInt(AttrAny(result, "cset")) ?? changesetId;
         var author = AttrAny(result, "cmtr");
         var authorUnique = AttrAny(result, "cmtru");
-        DateTimeOffset? date = DateTimeOffset.TryParse(AttrAny(result, "date"), out var d) ? d : null;
+        DateTimeOffset? date = DateTimeOffset.TryParse(AttrAny(result, "date"), null, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var d) ? d : null;
         var comment = ChildText(result, "Comment");
 
         return new SoapChangeset(cset, author, authorUnique, date, comment);
