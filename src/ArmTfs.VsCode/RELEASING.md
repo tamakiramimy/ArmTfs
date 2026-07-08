@@ -19,13 +19,13 @@ cd /Users/tamakirami/Desktop/arm-tfs
 This does all of the following:
 
 - rebuilds CLI outputs for `osx-arm64`
+- rebuilds CLI outputs for `osx-x64`
 - rebuilds CLI outputs for `win-arm64`
 - rebuilds CLI outputs for `win-x64`
-- rebuilds CLI outputs for `linux-arm64`
-- rebuilds CLI outputs for `linux-x64`
 - compiles the VS Code extension
 - packages the latest `.vsix`
-- clears macOS quarantine from the `osx-arm64` release folder
+- copies the 4 platform zip packages and both VSIX files into `src/ArmTfs.VsCode/release`
+- clears macOS quarantine from the `macos-arm64` and `macos-x64` release folders
 
 ## 3. Manual CLI build commands
 
@@ -34,19 +34,17 @@ If you want to run them one by one:
 ```bash
 cd /Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.Cli
 dotnet build -c Release -r osx-arm64
+dotnet build -c Release -r osx-x64
 dotnet build -c Release -r win-arm64
 dotnet build -c Release -r win-x64
-dotnet build -c Release -r linux-arm64
-dotnet build -c Release -r linux-x64
 ```
 
 Outputs are generated here:
 
 - `/Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.Cli/bin/Release/net8.0/osx-arm64`
+- `/Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.Cli/bin/Release/net8.0/osx-x64`
 - `/Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.Cli/bin/Release/net8.0/win-arm64`
 - `/Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.Cli/bin/Release/net8.0/win-x64`
-- `/Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.Cli/bin/Release/net8.0/linux-arm64`
-- `/Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.Cli/bin/Release/net8.0/linux-x64`
 
 On macOS, clear quarantine after rebuilding:
 
@@ -64,7 +62,7 @@ npx @vscode/vsce package -o arm-tfs-vscode-0.1.4.vsix
 
 Output:
 
-- `/Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.VsCode/arm-tfs-vscode-0.1.4.vsix`
+- `/Users/tamakirami/Desktop/arm-tfs/src/ArmTfs.VsCode/arm-tfs-vscode-<version>.vsix`
 
 ## 5. Install VSIX locally
 

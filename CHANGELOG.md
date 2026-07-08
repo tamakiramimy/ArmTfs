@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.5.2 - 2026-07-08
+
+### VS Code extension
+
+- 修复 TFVC 变更文件在不同入口下的菜单和行为不一致问题，统一 `撤销 / 回退 / 暂存 / 取消暂存` 语义。
+- 修复 VS Code 文件浏览器、Arm TFS Explorer、Arm TFS 变更视图里的文件操作行为，确保 `Add` 与 `Edit` 的撤销/回退符合 TFVC 语义。
+- 修复 `查看差异` 与 `查看历史记录` 路由，统一打开 Arm TFS 历史面板并正确展示选中文件历史。
+- 修复 Arm TFS 变更提交过滤逻辑，`取消暂存 / 暂存` 现在会正确影响 checkin 包含文件。
+- 移除启动时残留的 GUI smoke 自动执行逻辑。
+- 收敛分支徽章的查询范围，避免无关工作区分支触发多余历史查询与调试日志。
+
+### 验证
+
+- 在真实 VS Code 宿主中完成两套工作区的端到端验证，覆盖历史、差异、撤销、回退、取消暂存、暂存与提交流程。
+
+### 发布包
+
+- macOS arm64: `arm-tfs-0.5.2-osx-arm64.zip`
+- macOS x64: `arm-tfs-0.5.2-osx-x64.zip`
+- Windows arm64: `arm-tfs-0.5.2-win-arm64.zip`
+- Windows x64: `arm-tfs-0.5.2-win-x64.zip`
+- VSCode 扩展: `arm-tfs-vscode-0.5.2.vsix`
+
 ## 0.5.1 - 2026-07-07
 
 ### 核心修复
