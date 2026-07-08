@@ -25,7 +25,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   const output = vscode.window.createOutputChannel('arm-tfs');
   const client = new ArmTfsCliClient(output);
   const historyBrowser = new ArmTfsHistoryBrowser(client, output);
-  const scm = new ArmTfsScmController(client, output, getWorkspaceRoot());
+  const scm = new ArmTfsScmController(client, output, getWorkspaceRoot(), context.workspaceState);
   const changesView = new ArmTfsChangesViewController(scm, client);
   const sidebar = new ArmTfsSidebarController(client, output, getWorkspaceRoot(), async () => scm.refresh(), historyBrowser);
   let connections: ArmTfsConnectionsController;
@@ -373,7 +373,12 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   });
 
   register('armTfs.checkout', async (input) => {
-    const targetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.checkoutPath'), getActivePath() ?? '.');
+    const rawTargetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.checkoutPath'), getActivePath() ?? '.');
+    if (!rawTargetPath) {
+      return;
+    }
+
+    const targetPath = await resolveLocalTargetPath(rawTargetPath);
     if (!targetPath) {
       return;
     }
@@ -391,7 +396,12 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   });
 
   register('armTfs.add', async (input) => {
-    const targetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.addPath'), getActivePath() ?? '.');
+    const rawTargetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.addPath'), getActivePath() ?? '.');
+    if (!rawTargetPath) {
+      return;
+    }
+
+    const targetPath = await resolveLocalTargetPath(rawTargetPath);
     if (!targetPath) {
       return;
     }
@@ -436,21 +446,64 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
   });
 
   register('armTfs.undo', async (input) => {
-    const targetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.undoPath'), getActivePath() ?? '.');
+    const rawTargetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.undoPath'), getActivePath() ?? '.');
+    if (!rawTargetPath) {
+      return;
+    }
+
+    const targetPath = await resolveLocalTargetPath(rawTargetPath);
     if (!targetPath) {
       return;
     }
 
-    const noRestore = readBooleanOption(input, 'noRestore') ?? await promptBoolean(t('extension.prompt.undoNoRestore'), false);
-    if (noRestore === undefined) {
+    await scm.undo(vscode.Uri.file(targetPath));
+    await refreshUi();
+    return;
+  });
+
+  register('armTfs.unstage', async (input) => {
+    const rawTargetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.undoPath'), getActivePath() ?? '.');
+    if (!rawTargetPath) {
       return;
     }
 
-    const result = await runAndShowText(t('extension.operation.undo'), output, async () =>
-      withLocalWorkspace(targetPath, (localContext) => client.undo([targetPath], noRestore, { cwdOverride: localContext.commandCwd })),
-    );
+    const targetPath = await resolveLocalTargetPath(rawTargetPath);
+    if (!targetPath) {
+      return;
+    }
+
+    await scm.excludeFromCheckin(vscode.Uri.file(targetPath));
     await refreshUi();
-    return result;
+  });
+
+  register('armTfs.stageCheckin', async (input) => {
+    const rawTargetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.undoPath'), getActivePath() ?? '.');
+    if (!rawTargetPath) {
+      return;
+    }
+
+    const targetPath = await resolveLocalTargetPath(rawTargetPath);
+    if (!targetPath) {
+      return;
+    }
+
+    await scm.stageCheckin(vscode.Uri.file(targetPath));
+    await refreshUi();
+  });
+
+  register('armTfs.revertLocal', async (input) => {
+    const rawTargetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.undoPath'), getActivePath() ?? '.');
+    if (!rawTargetPath) {
+      return;
+    }
+
+    const targetPath = await resolveLocalTargetPath(rawTargetPath);
+    if (!targetPath) {
+      return;
+    }
+
+    await scm.revertLocalChange(vscode.Uri.file(targetPath));
+    await refreshUi();
   });
 
   register('armTfs.checkin', async (input) => {
@@ -459,7 +512,12 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
       return;
     }
 
-    const targetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.checkinPath'), '.');
+    const rawTargetPath = readStringOption(input, 'path') ?? await promptPath(t('extension.prompt.checkinPath'), '.');
+    if (!rawTargetPath) {
+      return;
+    }
+
+    const targetPath = await resolveLocalTargetPath(rawTargetPath);
     if (!targetPath) {
       return;
     }
@@ -503,7 +561,12 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     }
 
     if (isServerPath(targetPath)) {
-      await historyBrowser.open(targetPath);
+      const isFolder = readBooleanOption(input, 'isFolder');
+      if (isFolder === false) {
+        await historyBrowser.openFileHistory(targetPath);
+      } else {
+        await historyBrowser.open(targetPath);
+      }
       return undefined;
     }
 
@@ -517,7 +580,12 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
       if (!serverPath) {
         throw new Error(t('extension.error.resolveServerPath', { path: targetPath }));
       }
-      await historyBrowser.open(serverPath);
+      const useFileHistory = !isDirectorySafe(targetPath);
+      if (useFileHistory) {
+        await historyBrowser.openFileHistory(serverPath);
+      } else {
+        await historyBrowser.open(serverPath);
+      }
       return undefined;
     });
   });
@@ -529,7 +597,22 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     }
 
     if (!isServerPath(targetPath)) {
-      await scm.openDiff(vscode.Uri.file(targetPath));
+      const localContext = await resolveLocalWorkspaceContext(targetPath);
+      if (!localContext) {
+        return undefined;
+      }
+
+      const serverPath = await resolveServerPathForLocalTarget(client, targetPath, localContext);
+      if (serverPath && !isDirectorySafe(targetPath)) {
+        await historyBrowser.openFileHistory(serverPath);
+      } else {
+        await scm.openDiff(vscode.Uri.file(targetPath));
+      }
+      return undefined;
+    }
+
+    if (readBooleanOption(input, 'isFolder') === false) {
+      await historyBrowser.openFileHistory(targetPath);
       return undefined;
     }
 
@@ -578,8 +661,11 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
 
   // ─── 删除服务器文件/文件夹 ─────────────────────────────────────────────
   register('armTfs.deleteServerItem', async (input) => {
-    const serverPath = readStringOption(input, 'path')
+    const rawTargetPath = readStringOption(input, 'path')
       ?? await promptPath(t('extension.prompt.deleteServerPath'), getActivePath() ?? '$/');
+    const serverPath = rawTargetPath
+      ? await resolveServerTargetPath(client, rawTargetPath)
+      : undefined;
     if (!serverPath) { return; }
     const comment = await promptPath(t('extension.prompt.deleteComment'), '') ?? '';
     return runAndShowText(t('extension.operation.deleteServerItem'), output, () =>
@@ -629,15 +715,21 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
 
   // ─── 锁定/解锁服务器文件 ──────────────────────────────────────────────
   register('armTfs.lockServerItem', async (input) => {
-    const serverPath = readStringOption(input, 'path')
+    const rawTargetPath = readStringOption(input, 'path')
       ?? await promptPath(t('extension.prompt.lockPath'), getActivePath() ?? '$/');
+    const serverPath = rawTargetPath
+      ? await resolveServerTargetPath(client, rawTargetPath)
+      : undefined;
     if (!serverPath) { return; }
     return runAndShowText(t('extension.operation.lockServerItem'), output, () => client.lockItem(serverPath));
   });
 
   register('armTfs.unlockServerItem', async (input) => {
-    const serverPath = readStringOption(input, 'path')
+    const rawTargetPath = readStringOption(input, 'path')
       ?? await promptPath(t('extension.prompt.unlockPath'), getActivePath() ?? '$/');
+    const serverPath = rawTargetPath
+      ? await resolveServerTargetPath(client, rawTargetPath)
+      : undefined;
     if (!serverPath) { return; }
     return runAndShowText(t('extension.operation.unlockServerItem'), output, () => client.unlockItem(serverPath));
   });
@@ -923,6 +1015,13 @@ function parseCommandInput(raw: unknown): CommandInput | undefined {
     return { path: raw.resourceUri.fsPath };
   }
 
+  if (isChangeTreeItemLike(raw)) {
+    return {
+      path: raw.resource.resourceUri.fsPath,
+      isFolder: false,
+    };
+  }
+
   if (typeof raw === 'string') {
     try {
       const parsed = JSON.parse(raw);
@@ -943,6 +1042,7 @@ function parseCommandInput(raw: unknown): CommandInput | undefined {
     return {
       path: raw.entry.serverPath,
       serverPath: raw.entry.serverPath,
+      isFolder: raw.entry.isFolder,
     };
   }
 
@@ -958,7 +1058,7 @@ function isBranchNodeLike(value: unknown): value is { branch: { path: string } }
   return typeof branch === 'object' && branch !== null && 'path' in branch && typeof (branch as { path: unknown }).path === 'string';
 }
 
-function isServerExplorerNodeLike(value: unknown): value is { entry: { serverPath: string } } {
+function isServerExplorerNodeLike(value: unknown): value is { entry: { serverPath: string; isFolder?: boolean } } {
   if (typeof value !== 'object' || value === null || !('entry' in value)) {
     return false;
   }
@@ -968,6 +1068,18 @@ function isServerExplorerNodeLike(value: unknown): value is { entry: { serverPat
     && entry !== null
     && 'serverPath' in entry
     && typeof (entry as { serverPath: unknown }).serverPath === 'string';
+}
+
+function isChangeTreeItemLike(value: unknown): value is { resource: { resourceUri: vscode.Uri } } {
+  if (typeof value !== 'object' || value === null || !('resource' in value)) {
+    return false;
+  }
+
+  const resource = (value as { resource?: unknown }).resource;
+  return typeof resource === 'object'
+    && resource !== null
+    && 'resourceUri' in resource
+    && (resource as { resourceUri?: unknown }).resourceUri instanceof vscode.Uri;
 }
 
 function isCommandInput(value: unknown): value is CommandInput {
@@ -1021,6 +1133,20 @@ function readBooleanOption(input: CommandInput | undefined, key: string): boolea
     }
   }
 
+  return undefined;
+}
+
+async function resolveLocalTargetPath(targetPath: string): Promise<string | undefined> {
+  if (!isServerPath(targetPath)) {
+    return targetPath;
+  }
+
+  const localPath = computeLocalPathForServerPath(targetPath);
+  if (localPath) {
+    return localPath;
+  }
+
+  void vscode.window.showWarningMessage(t('serverExplorer.warning.localPathUnavailable', { path: targetPath }));
   return undefined;
 }
 
@@ -1092,6 +1218,41 @@ function remapLocalToServer(targetPath: string, localRoot: string, serverRoot: s
 
   const relativePath = path.relative(localRoot, targetPath).split(path.sep).join('/');
   return `${serverRoot.replace(/\/+$/, '')}/${relativePath.replace(/^\/+/, '')}`;
+}
+
+async function resolveServerPathForLocalTarget(
+  client: ArmTfsCliClient,
+  targetPath: string,
+  localContext: LocalWorkspaceContext,
+): Promise<string | undefined> {
+  const status = await client.status(targetPath, false, { cwdOverride: localContext.commandCwd });
+  return status.items.find((item) => item.localPath === targetPath)?.serverPath
+    ?? status.workspace.mappings
+      .filter((mapping) => targetPath === mapping.localPath || targetPath.startsWith(`${mapping.localPath}${pathSeparator()}`))
+      .sort((left, right) => right.localPath.length - left.localPath.length)
+      .map((mapping) => remapLocalToServer(targetPath, mapping.localPath, mapping.serverPath))[0];
+}
+
+async function resolveServerTargetPath(
+  client: ArmTfsCliClient,
+  targetPath: string,
+): Promise<string | undefined> {
+  if (isServerPath(targetPath)) {
+    return targetPath;
+  }
+
+  const localContext = await resolveLocalWorkspaceContext(targetPath);
+  if (!localContext) {
+    return undefined;
+  }
+
+  const serverPath = await resolveServerPathForLocalTarget(client, targetPath, localContext);
+  if (serverPath) {
+    return serverPath;
+  }
+
+  void vscode.window.showWarningMessage(t('extension.error.resolveServerPath', { path: targetPath }));
+  return undefined;
 }
 
 function pathSeparator(): string {

@@ -576,15 +576,19 @@ export class ArmTfsCliClient {
 
   private async resolveInvocation(commandArgs: string[], cwdOverride?: string): Promise<ArmTfsInvocation> {
     const configuredCommand = getConfigValue<string>('cli.command', '').trim();
-    const configuredArgs = getConfigValue<string[]>('cli.commandArgs', []);
+    const configuredArgs = normalizeConfiguredArgs(getConfigValue<string[] | string>('cli.commandArgs', []));
     const configuredCwd = getConfigValue<string>('cli.cwd', '').trim();
     const cwd = cwdOverride || configuredCwd || this.getDefaultCwd();
 
     if (configuredCommand) {
+      const parsedConfiguredCommand = splitCommandLine(configuredCommand);
+      const command = parsedConfiguredCommand[0] ?? configuredCommand;
+      const inlineArgs = parsedConfiguredCommand.slice(1);
+      const configuredInvocation = resolvePackagedReleaseInvocation(command, [...inlineArgs, ...configuredArgs], cwd);
       return {
-        command: configuredCommand,
-        args: [...configuredArgs, ...commandArgs],
-        cwd,
+        command: configuredInvocation?.command ?? command,
+        args: [...(configuredInvocation?.args ?? [...inlineArgs, ...configuredArgs]), ...commandArgs],
+        cwd: configuredInvocation?.cwd ?? cwd,
       };
     }
 
@@ -683,4 +687,131 @@ export class ArmTfsCliClient {
     const parts = [invocation.command, ...invocation.args].map((part) => (part.includes(' ') ? JSON.stringify(part) : part));
     return invocation.cwd ? `${parts.join(' ')}  (cwd: ${invocation.cwd})` : parts.join(' ');
   }
+}
+
+function normalizeConfiguredArgs(value: string[] | string): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    return splitCommandLine(value);
+  }
+
+  return [];
+}
+
+function splitCommandLine(value: string): string[] {
+  const parts: string[] = [];
+  let current = '';
+  let quote: '"' | '\'' | undefined;
+  let escaping = false;
+
+  for (const char of value) {
+    if (escaping) {
+      current += char;
+      escaping = false;
+      continue;
+    }
+
+    if (char === '\\') {
+      escaping = true;
+      continue;
+    }
+
+    if (quote) {
+      if (char === quote) {
+        quote = undefined;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (char === '"' || char === '\'') {
+      quote = char;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      if (current) {
+        parts.push(current);
+        current = '';
+      }
+      continue;
+    }
+
+    current += char;
+  }
+
+  if (escaping) {
+    current += '\\';
+  }
+
+  if (current) {
+    parts.push(current);
+  }
+
+  return parts;
+}
+
+function resolvePackagedReleaseInvocation(command: string, args: string[], cwd?: string): ArmTfsInvocation | undefined {
+  const packagedPath = findPackagedReleasePath(command, args);
+  if (!packagedPath) {
+    return undefined;
+  }
+
+  const executableName = process.platform === 'win32' ? 'arm-tfs.exe' : 'arm-tfs';
+  const releaseRoot = path.dirname(path.dirname(packagedPath));
+  const remainingArgs = command === 'dotnet' && args[0] === packagedPath
+    ? args.slice(1)
+    : args;
+
+  for (const folder of getPackagedRidFolderCandidates()) {
+    const executablePath = path.join(releaseRoot, folder, executableName);
+    if (existsSync(executablePath)) {
+      return {
+        command: executablePath,
+        args: remainingArgs,
+        cwd,
+      };
+    }
+  }
+
+  return undefined;
+}
+
+function findPackagedReleasePath(command: string, args: string[]): string | undefined {
+  if (isPackagedReleasePath(command)) {
+    return command;
+  }
+
+  return args.find((arg) => isPackagedReleasePath(arg));
+}
+
+function isPackagedReleasePath(value: string): boolean {
+  if (!value) {
+    return false;
+  }
+
+  const normalized = value.replace(/\\/g, '/');
+  return /\/release\/(macos|osx|windows|win|linux)-(x64|arm64)\/arm-tfs(\.dll|\.exe)?$/i.test(normalized);
+}
+
+function getPackagedRidFolderCandidates(): string[] {
+  if (process.platform === 'darwin') {
+    return process.arch === 'arm64'
+      ? ['macos-arm64', 'osx-arm64', 'macos-x64', 'osx-x64']
+      : ['macos-x64', 'osx-x64', 'macos-arm64', 'osx-arm64'];
+  }
+
+  if (process.platform === 'win32') {
+    return process.arch === 'arm64'
+      ? ['windows-arm64', 'win-arm64', 'windows-x64', 'win-x64']
+      : ['windows-x64', 'win-x64', 'windows-arm64', 'win-arm64'];
+  }
+
+  return process.arch === 'arm64'
+    ? ['linux-arm64', 'linux-x64']
+    : ['linux-x64', 'linux-arm64'];
 }

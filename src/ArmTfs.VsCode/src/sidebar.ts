@@ -2146,8 +2146,8 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
         this.refreshLabels();
       }),
 
-      vscode.commands.registerCommand('armTfs.serverExplorer.setRoot', async (node?: ServerExplorerNode) => {
-        const current = node?.entry.serverPath
+      vscode.commands.registerCommand('armTfs.serverExplorer.setRoot', async (node?: BranchNode | ServerExplorerNode) => {
+        const current = getNodeServerPath(node)
           ?? getConfigValue<string>('serverExplorer.rootPath', '').trim()
           ?? '$/';
         const value = await vscode.window.showInputBox({
@@ -2167,12 +2167,12 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
         // Note: setting the explorer root no longer affects the branches view.
       }),
 
-      vscode.commands.registerCommand('armTfs.serverExplorer.getLatest', async (node?: ServerExplorerNode) => {
-        if (!node) {
+      vscode.commands.registerCommand('armTfs.serverExplorer.getLatest', async (node?: BranchNode | ServerExplorerNode) => {
+        const serverPath = getNodeServerPath(node);
+        if (!serverPath) {
           return;
         }
 
-        const serverPath = node.entry.serverPath;
         const computedPath = computeLocalPathForServerPath(serverPath);
         const localPath = await vscode.window.showInputBox({
           prompt: t('serverExplorer.prompt.downloadPath', { path: serverPath }),
@@ -2205,10 +2205,16 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
         }
 
         const serverPath = node.entry.serverPath;
+        const workspaceAnchor = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        const localPath = await resolveLocalPathForServerPath(this.client, serverPath, workspaceAnchor);
+        if (!localPath) {
+          void vscode.window.showWarningMessage(t('serverExplorer.warning.localPathUnavailable', { path: serverPath }));
+          return;
+        }
         try {
           const result = await vscode.window.withProgress(
             { location: vscode.ProgressLocation.Notification, title: t('serverExplorer.progress.checkout', { path: serverPath }) },
-            () => this.client.checkout([serverPath]),
+            () => this.client.checkout([localPath]),
           );
           reportCommandOutput(this.output, t('serverExplorer.progress.checkout', { path: serverPath }), result);
           await this.refreshScm();
@@ -2226,7 +2232,12 @@ export class ArmTfsServerExplorerController implements vscode.Disposable {
         }
 
         const serverPath = node.entry.serverPath;
-        await this.historyBrowser?.open(serverPath);
+        if (node.entry.isFolder) {
+          await this.historyBrowser?.open(serverPath);
+          return;
+        }
+
+        await this.historyBrowser?.openFileHistory(serverPath);
       }),
 
       vscode.commands.registerCommand('armTfs.serverExplorer.openLocalPath', async (node?: ServerExplorerNode) => {

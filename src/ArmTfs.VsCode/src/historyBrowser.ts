@@ -13,6 +13,11 @@ import {
 interface HistoryTarget {
   label: string;
   serverPath: string;
+  kind?: 'file' | 'folder';
+}
+
+interface HistoryBrowserOpenOptions {
+  mode?: 'history' | 'fileHistory';
 }
 
 interface BrowserMessage {
@@ -46,6 +51,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
   private panel: vscode.WebviewPanel | undefined;
   private targets: HistoryTarget[] = [];
   private initialChangesetId: number | undefined;
+  private mode: 'history' | 'fileHistory' = 'history';
   private readonly disposables: vscode.Disposable[] = [];
 
   constructor(
@@ -58,16 +64,26 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
     vscode.Disposable.from(...this.disposables).dispose();
   }
 
-  async open(serverPath: string, initialChangesetId?: number): Promise<void> {
+  async open(serverPath: string, initialChangesetId?: number, options?: HistoryBrowserOpenOptions): Promise<void> {
     await this.openTargets([{
       label: path.posix.basename(serverPath) || serverPath,
       serverPath,
-    }], initialChangesetId);
+    }], initialChangesetId, options);
   }
 
-  async openTargets(targets: HistoryTarget[], initialChangesetId?: number): Promise<void> {
+  async openFileHistory(serverPath: string, initialChangesetId?: number): Promise<void> {
+    await this.openTargets([{
+      label: path.posix.basename(serverPath) || serverPath,
+      serverPath,
+      kind: 'file',
+    }], initialChangesetId, { mode: 'fileHistory' });
+  }
+
+  async openTargets(targets: HistoryTarget[], initialChangesetId?: number, options?: HistoryBrowserOpenOptions): Promise<void> {
     this.targets = targets;
     this.initialChangesetId = initialChangesetId;
+    this.mode = options?.mode ?? (this.isSingleFileTarget() ? 'fileHistory' : 'history');
+    await this.focusHub();
     const panel = this.ensurePanel();
     panel.title = this.getPanelTitle(targets);
     panel.reveal(vscode.ViewColumn.Active, false);
@@ -121,11 +137,14 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
         type: 'histories',
         groups,
         initialChangesetId,
+        viewMode: this.mode,
         pathLabel: this.targets.length === 1
           ? this.targets[0].serverPath
           : this.targets.map((target) => target.serverPath).join('  ↔  '),
       });
-      if (initialChangesetId !== undefined) {
+      if (this.shouldShowFileHistoryByDefault()) {
+        await this.loadFileHistory(this.targets[0].serverPath, initialChangesetId);
+      } else if (initialChangesetId !== undefined) {
         await this.loadChangeset(initialChangesetId);
       }
     } catch (error) {
@@ -145,7 +164,11 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
         case 'selectChangeset':
           if (message.changesetId !== undefined) {
             this.initialChangesetId = message.changesetId;
-            await this.loadChangeset(message.changesetId);
+            if (this.shouldShowFileHistoryByDefault()) {
+              await this.loadFileHistory(this.targets[0].serverPath, message.changesetId);
+            } else {
+              await this.loadChangeset(message.changesetId);
+            }
           }
           break;
         case 'compareChangesets':
@@ -270,13 +293,30 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
     );
   }
 
-  private async loadFileHistory(serverPath: string): Promise<void> {
+  private async loadFileHistory(serverPath: string, activeChangesetId?: number): Promise<void> {
     const history = await this.client.history(serverPath, 100);
     await this.panel?.webview.postMessage({
       type: 'fileHistoryDetails',
       serverPath,
+      activeChangesetId,
       items: history.items,
     });
+  }
+
+  private isSingleFileTarget(): boolean {
+    return this.targets.length === 1 && this.targets[0]?.kind === 'file';
+  }
+
+  private shouldShowFileHistoryByDefault(): boolean {
+    return this.mode === 'fileHistory' && this.isSingleFileTarget();
+  }
+
+  private async focusHub(): Promise<void> {
+    try {
+      await vscode.commands.executeCommand('workbench.view.extension.armTfsHub');
+    } catch {
+      // Best-effort focus only.
+    }
   }
 
   private async showDiff(
@@ -639,6 +679,8 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       historyRows: [],
       selectedChangesets: [],
       activeChangesetId: null,
+      historyMode: 'history',
+      historyTargetPath: '',
       latestPayload: null,
       latestPathLabel: '',
       fileHistoryPath: '',
@@ -653,7 +695,11 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
     compareButton.addEventListener('click', () => {
       const selected = getComparablePair(state.selectedChangesets);
       if (selected.length === 2) {
-        vscode.postMessage({ type: 'compareChangesets', changesetIds: selected });
+        if (state.historyMode === 'fileHistory' && state.historyTargetPath) {
+          vscode.postMessage({ type: 'compareFileVersions', serverPath: state.historyTargetPath, changesetIds: selected });
+        } else {
+          vscode.postMessage({ type: 'compareChangesets', changesetIds: selected });
+        }
       }
     });
     window.addEventListener('click', () => hideContextMenu());
@@ -677,13 +723,15 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
       state.fileHistorySelected = normalizeSelection(values);
     }
 
-    function renderHistories(groups, initialChangesetId, currentPathLabel) {
+    function renderHistories(groups, initialChangesetId, currentPathLabel, viewMode) {
       state.historyRows = groups.flatMap(group => group.items.map(item => ({ ...item, scopePath: group.serverPath, scopeLabel: group.label })));
+      state.historyMode = viewMode || 'history';
+      state.historyTargetPath = groups.length === 1 ? (groups[0].serverPath || '') : '';
       setHistorySelection([]);
       state.activeChangesetId = initialChangesetId ?? null;
       state.latestPathLabel = currentPathLabel || '';
       pathLabel.textContent = currentPathLabel || '';
-      masterTitle.textContent = labels.modeHistory;
+      masterTitle.textContent = state.historyMode === 'fileHistory' ? labels.modeFileHistory : labels.modeHistory;
       compareButton.disabled = true;
 
       historyBody.innerHTML = state.historyRows.map(item => \`
@@ -707,13 +755,20 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
             setHistorySelection(selected);
             refreshHistorySelection();
           }
-          showContextMenu(event.clientX, event.clientY, [
-            { label: labels.contextDetails, run: () => activateChangeset(changesetId) },
-            { label: labels.contextCompare, disabled: selected.length !== 2, run: () => vscode.postMessage({ type: 'compareChangesets', changesetIds: selected }) },
-            { label: labels.contextGet, run: () => vscode.postMessage({ type: 'checkoutChangeset', changesetId }) },
-            { label: labels.contextRollback, run: () => vscode.postMessage({ type: 'rollbackChangeset', changesetId }) },
-            { label: labels.contextRevertTo, run: () => vscode.postMessage({ type: 'revertToChangeset', changesetId }) },
-          ]);
+          const actions = state.historyMode === 'fileHistory' && state.historyTargetPath
+            ? [
+              { label: labels.contextViewCurrent, run: () => vscode.postMessage({ type: 'viewCurrentVersion', serverPath: state.historyTargetPath, changesetId }) },
+              { label: labels.contextDiff, run: () => vscode.postMessage({ type: 'diffPrevious', serverPath: state.historyTargetPath, changesetId }) },
+              { label: labels.contextPair, disabled: selected.length !== 2, run: () => vscode.postMessage({ type: 'compareFileVersions', serverPath: state.historyTargetPath, changesetIds: selected }) },
+            ]
+            : [
+              { label: labels.contextDetails, run: () => activateChangeset(changesetId) },
+              { label: labels.contextCompare, disabled: selected.length !== 2, run: () => vscode.postMessage({ type: 'compareChangesets', changesetIds: selected }) },
+              { label: labels.contextGet, run: () => vscode.postMessage({ type: 'checkoutChangeset', changesetId }) },
+              { label: labels.contextRollback, run: () => vscode.postMessage({ type: 'rollbackChangeset', changesetId }) },
+              { label: labels.contextRevertTo, run: () => vscode.postMessage({ type: 'revertToChangeset', changesetId }) },
+            ];
+          showContextMenu(event.clientX, event.clientY, actions);
         });
       });
 
@@ -830,7 +885,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
     function renderFileHistoryDetails(message) {
       state.latestPayload = message;
       state.fileHistoryPath = message.serverPath;
-      setFileHistorySelection([]);
+      setFileHistorySelection(message.activeChangesetId ? [message.activeChangesetId] : []);
       masterTitle.textContent = labels.modeFileHistory;
       detailWrap.innerHTML = \`
         <div class="card">
@@ -1194,7 +1249,7 @@ export class ArmTfsHistoryBrowser implements vscode.Disposable {
 
     window.addEventListener('message', event => {
       const message = event.data;
-      if (message.type === 'histories') renderHistories(message.groups, message.initialChangesetId, message.pathLabel);
+      if (message.type === 'histories') renderHistories(message.groups, message.initialChangesetId, message.pathLabel, message.viewMode);
       if (message.type === 'changesetDetails') renderChangesetDetails(message);
       if (message.type === 'comparisonDetails') renderComparisonDetails(message);
       if (message.type === 'fileHistoryDetails') renderFileHistoryDetails(message);

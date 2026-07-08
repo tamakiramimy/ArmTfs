@@ -7,10 +7,10 @@ import { t } from './i18n';
 type ChangeGroupKind = 'pending' | 'working' | 'conflicts';
 
 class ChangeGroupItem extends vscode.TreeItem {
-  constructor(public readonly kind: ChangeGroupKind, count: number) {
+  constructor(public readonly kind: ChangeGroupKind, count: number, description?: string) {
     super(labelForKind(kind), vscode.TreeItemCollapsibleState.Expanded);
     this.contextValue = `armTfsChangeGroup.${kind}`;
-    this.description = count.toString();
+    this.description = description ?? count.toString();
     this.iconPath = new vscode.ThemeIcon(iconForKind(kind));
   }
 }
@@ -19,13 +19,19 @@ class ChangeFileItem extends vscode.TreeItem {
   constructor(
     public readonly kind: ChangeGroupKind,
     public readonly resource: ArmTfsResourceState | ArmTfsUntrackedResourceState,
+    public readonly excludedFromCheckin: boolean,
   ) {
     const label = path.basename(resource.resourceUri.fsPath);
     super(label, vscode.TreeItemCollapsibleState.None);
-    this.contextValue = contextForResource(kind, resource);
+    this.contextValue = contextForResource(kind, resource, excludedFromCheckin);
     this.resourceUri = resource.resourceUri;
-    this.description = path.dirname(resource.resourceUri.fsPath);
-    this.tooltip = resource.resourceUri.fsPath;
+    const directory = path.dirname(resource.resourceUri.fsPath);
+    this.description = excludedFromCheckin
+      ? `${directory} • ${t('changesView.checkin.excludedBadge')}`
+      : directory;
+    this.tooltip = excludedFromCheckin
+      ? `${resource.resourceUri.fsPath}\n${t('changesView.checkin.excludedTooltip')}`
+      : resource.resourceUri.fsPath;
     this.command = { command: 'armTfs.openResourceDiff', title: t('command.openTfsDiff'), arguments: [resource] };
   }
 }
@@ -48,7 +54,13 @@ class ChangesProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     if (!element) {
       const groups: ChangeGroupItem[] = [];
       if (this.scm.pendingChanges.length) {
-        groups.push(new ChangeGroupItem('pending', this.scm.pendingChanges.length));
+        const pendingTotal = this.scm.pendingChanges.length;
+        const pendingIncluded = this.scm.getIncludedPendingChangeCount();
+        groups.push(new ChangeGroupItem(
+          'pending',
+          pendingTotal,
+          pendingIncluded === pendingTotal ? pendingTotal.toString() : `${pendingIncluded}/${pendingTotal}`,
+        ));
       }
       if (this.scm.conflicts.length) {
         groups.push(new ChangeGroupItem('conflicts', this.scm.conflicts.length));
@@ -69,14 +81,16 @@ class ChangesProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     if (element instanceof ChangeGroupItem) {
       switch (element.kind) {
         case 'pending':
-          return this.scm.pendingChanges.map((r) => new ChangeFileItem('pending', r));
+          return sortPendingResources(this.scm.pendingChanges, this.scm)
+            .map((r) => new ChangeFileItem('pending', r, this.scm.isExcludedFromCheckin(r)));
         case 'working':
           return [
-            ...this.scm.localChanges.map((r) => new ChangeFileItem('working', r)),
-            ...this.scm.untrackedFiles.map((r) => new ChangeFileItem('working', r)),
+            ...this.scm.localChanges.map((r) => new ChangeFileItem('working', r, false)),
+            ...this.scm.untrackedFiles.map((r) => new ChangeFileItem('working', r, false)),
           ];
         case 'conflicts':
-          return this.scm.conflicts.map((r) => new ChangeFileItem('conflicts', r));
+          return sortPendingResources(this.scm.conflicts, this.scm)
+            .map((r) => new ChangeFileItem('conflicts', r, this.scm.isExcludedFromCheckin(r)));
       }
     }
     return [];
@@ -133,12 +147,17 @@ export class ArmTfsChangesViewController implements vscode.Disposable {
       }),
       vscode.commands.registerCommand('armTfs.changes.undo', (item?: ChangeFileItem) => {
         if (item?.resource) {
-          return this.scm.discardPendingChange(item.resource as ArmTfsResourceState);
+          return this.scm.undo(item.resource as ArmTfsResourceState);
         }
       }),
       vscode.commands.registerCommand('armTfs.changes.unstage', (item?: ChangeFileItem) => {
         if (item?.resource) {
-          return this.scm.unstage(item.resource as ArmTfsResourceState);
+          return this.scm.excludeFromCheckin(item.resource as ArmTfsResourceState);
+        }
+      }),
+      vscode.commands.registerCommand('armTfs.changes.stageCheckin', (item?: ChangeFileItem) => {
+        if (item?.resource) {
+          return this.scm.stageCheckin(item.resource as ArmTfsResourceState);
         }
       }),
       vscode.commands.registerCommand('armTfs.changes.unstageAll', () => this.scm.unstageAllPendingChanges()),
@@ -175,7 +194,7 @@ export class ArmTfsChangesViewController implements vscode.Disposable {
         if (!item?.resource) {
           return;
         }
-        return this.scm.discardPendingChange(item.resource as ArmTfsResourceState);
+        return this.scm.revertLocalChange(item.resource as ArmTfsResourceState);
       }),
     );
   }
@@ -226,6 +245,7 @@ function iconForKind(kind: ChangeGroupKind): string {
 function contextForResource(
   kind: ChangeGroupKind,
   resource: ArmTfsResourceState | ArmTfsUntrackedResourceState,
+  excludedFromCheckin: boolean,
 ): string {
   if ('localPath' in resource) {
     return 'armTfsChangeFile.untracked';
@@ -233,5 +253,19 @@ function contextForResource(
   if (kind === 'working') {
     return 'armTfsChangeFile.localChanges';
   }
-  return `armTfsChangeFile.${kind}`;
+  if (kind === 'pending') {
+    return excludedFromCheckin ? 'armTfsChangeFile.pendingExcluded' : 'armTfsChangeFile.pending';
+  }
+  return excludedFromCheckin ? 'armTfsChangeFile.conflictsExcluded' : 'armTfsChangeFile.conflicts';
+}
+
+function sortPendingResources<T extends ArmTfsResourceState>(resources: T[], scm: ArmTfsScmController): T[] {
+  return [...resources].sort((left, right) => {
+    const leftExcluded = scm.isExcludedFromCheckin(left);
+    const rightExcluded = scm.isExcludedFromCheckin(right);
+    if (leftExcluded !== rightExcluded) {
+      return leftExcluded ? 1 : -1;
+    }
+    return left.resourceUri.fsPath.localeCompare(right.resourceUri.fsPath);
+  });
 }

@@ -69,6 +69,8 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
   private resourcesByPath = new Map<string, ArmTfsResourceState>();
   private refreshInFlight: Promise<void> | undefined;
   private refreshQueued = false;
+  private excludedCheckinPaths = new Set<string>();
+  private excludedCheckinWorkspaceRoot: string | undefined;
 
   // Public, read-only snapshot of the latest scan. Subscribed by the changes view.
   pendingChanges: ArmTfsResourceState[] = [];
@@ -87,6 +89,7 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
     private readonly client: ArmTfsCliClient,
     private readonly output: vscode.OutputChannel,
     private readonly rootPath: string | undefined,
+    private readonly workspaceState?: vscode.Memento,
   ) {
     // arm-tfs intentionally does NOT register a vscode.SourceControl. All TFS changes are
     // surfaced inside the TFS activity-bar (armTfsHub) tree view, not in VS Code's built-in
@@ -109,6 +112,26 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
    */
   refreshLabels(): void {
     // intentionally empty
+  }
+
+  isExcludedFromCheckin(resource: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri | string): boolean {
+    const targetPath = typeof resource === 'string' ? resource : resolveResourcePath(resource);
+    if (!targetPath) {
+      return false;
+    }
+
+    const workspaceRoot = this.lastWorkspaceRoot
+      ?? findTfvcWorkspaceRootSync(targetPath)
+      ?? (this.rootPath ? findTfvcWorkspaceRootSync(this.rootPath) : undefined);
+    if (!workspaceRoot || this.excludedCheckinWorkspaceRoot !== workspaceRoot) {
+      return false;
+    }
+
+    return this.excludedCheckinPaths.has(getCheckinSelectionKey(workspaceRoot, targetPath));
+  }
+
+  getIncludedPendingChangeCount(): number {
+    return this.pendingChanges.filter((resource) => !this.isExcludedFromCheckin(resource)).length;
   }
 
   async refresh(): Promise<void> {
@@ -281,10 +304,6 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
   }
 
   async undo(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
-    return this.discardPendingChange(resource);
-  }
-
-  async unstage(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
     const targetPath = resolveResourcePath(resource) ?? getActivePath();
     if (!targetPath) {
       void vscode.window.showWarningMessage(t('warning.noFile.undo'));
@@ -297,11 +316,81 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
       return;
     }
 
+    const item = resource instanceof ArmTfsResourceState
+      ? resource.item
+      : await this.resolveStatusItemForPath(targetPath, workspaceRoot);
+    if (!item || (item.state !== 'pending' && !item.state.toLowerCase().includes('conflict'))) {
+      void vscode.window.showInformationMessage(t('changesView.undo.none'));
+      return;
+    }
+
     await this.runTextCommand(
-      t('changesView.unstage.title'),
+      t('changesView.undo.title'),
       () => this.client.undo([targetPath], true, { cwdOverride: getCommandCwd(workspaceRoot, targetPath) }),
       true,
     );
+  }
+
+  async unstage(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
+    return this.excludeFromCheckin(resource);
+  }
+
+  async excludeFromCheckin(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
+    const targetPath = resolveResourcePath(resource) ?? getActivePath();
+    if (!targetPath) {
+      void vscode.window.showWarningMessage(t('warning.noFile.undo'));
+      return;
+    }
+
+    const workspaceRoot = await findTfvcWorkspaceRoot(targetPath ?? this.rootPath);
+    if (!workspaceRoot) {
+      void vscode.window.showWarningMessage(t('warning.noWorkspace.file'));
+      return;
+    }
+
+    await this.ensureExcludedCheckinStateLoaded(workspaceRoot);
+    const item = resource instanceof ArmTfsResourceState
+      ? resource.item
+      : await this.resolveStatusItemForPath(targetPath, workspaceRoot);
+    if (!item || (item.state !== 'pending' && !item.state.toLowerCase().includes('conflict'))) {
+      void vscode.window.showInformationMessage(t('changesView.exclude.none'));
+      return;
+    }
+
+    const key = getCheckinSelectionKey(workspaceRoot, targetPath);
+    if (this.excludedCheckinPaths.has(key)) {
+      return;
+    }
+
+    this.excludedCheckinPaths.add(key);
+    await this.persistExcludedCheckinState(workspaceRoot);
+    this.onDidChangeChangesEmitter.fire();
+    vscode.window.setStatusBarMessage(t('status.completed', { title: t('changesView.exclude.title') }), 2500);
+  }
+
+  async stageCheckin(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
+    const targetPath = resolveResourcePath(resource) ?? getActivePath();
+    if (!targetPath) {
+      void vscode.window.showWarningMessage(t('warning.noFile.undo'));
+      return;
+    }
+
+    const workspaceRoot = await findTfvcWorkspaceRoot(targetPath ?? this.rootPath);
+    if (!workspaceRoot) {
+      void vscode.window.showWarningMessage(t('warning.noWorkspace.file'));
+      return;
+    }
+
+    await this.ensureExcludedCheckinStateLoaded(workspaceRoot);
+    const key = getCheckinSelectionKey(workspaceRoot, targetPath);
+    if (!this.excludedCheckinPaths.has(key)) {
+      return;
+    }
+
+    this.excludedCheckinPaths.delete(key);
+    await this.persistExcludedCheckinState(workspaceRoot);
+    this.onDidChangeChangesEmitter.fire();
+    vscode.window.setStatusBarMessage(t('status.completed', { title: t('changesView.include.title') }), 2500);
   }
 
   async undoPendingAdds(): Promise<void> {
@@ -330,10 +419,31 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
   }
 
   async discardPendingChange(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
+    return this.revertLocalChange(resource);
+  }
+
+  async revertLocalChange(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
     const targetPath = resolveResourcePath(resource) ?? getActivePath();
     if (!targetPath) {
       void vscode.window.showWarningMessage(t('warning.noFile.undo'));
       return;
+    }
+
+    const workspaceRoot = await findTfvcWorkspaceRoot(targetPath ?? this.rootPath);
+    if (!workspaceRoot) {
+      void vscode.window.showWarningMessage(t('warning.noWorkspace.file'));
+      return;
+    }
+
+    const item = resource instanceof ArmTfsResourceState
+      ? resource.item
+      : await this.resolveStatusItemForPath(targetPath, workspaceRoot);
+    if (!item) {
+      const serverPath = await this.resolveServerPathForLocalFile(targetPath, workspaceRoot);
+      if (!serverPath) {
+        void vscode.window.showInformationMessage(t('changesView.discard.untracked'));
+        return;
+      }
     }
 
     const choice = await vscode.window.showWarningMessage(
@@ -345,17 +455,15 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
       return;
     }
 
-    const workspaceRoot = await findTfvcWorkspaceRoot(targetPath ?? this.rootPath);
-    if (!workspaceRoot) {
-      void vscode.window.showWarningMessage(t('warning.noWorkspace.file'));
-      return;
-    }
+    const cwdOverride = getCommandCwd(workspaceRoot, targetPath);
 
-    await this.runTextCommand(
-      t('changesView.discard.title'),
-      () => this.client.undo([targetPath], false, { cwdOverride: getCommandCwd(workspaceRoot, targetPath) }),
-      true,
-    );
+    await this.runTextCommand(t('changesView.discard.title'), async () => {
+      if (item?.state === 'pending' || item?.state.toLowerCase().includes('conflict')) {
+        return this.client.undo([targetPath], false, { cwdOverride });
+      }
+
+      return this.client.get(targetPath, { force: true, recursive: false }, { cwdOverride });
+    }, true);
   }
 
   async checkin(comment?: string): Promise<void> {
@@ -374,8 +482,21 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
       return;
     }
 
-    const targetPath = workspaceRoot;
-    await this.runTextCommand('arm-tfs checkin', () => this.client.checkin(finalComment, [targetPath], false, false, { cwdOverride: workspaceRoot }), true);
+    await this.ensureExcludedCheckinStateLoaded(workspaceRoot);
+
+    const pendingPaths = this.pendingChanges
+      .map((resource) => resource.resourceUri.fsPath)
+      .filter((resourcePath) => !this.excludedCheckinPaths.has(getCheckinSelectionKey(workspaceRoot, resourcePath)));
+    if (!this.pendingChanges.length) {
+      void vscode.window.showInformationMessage(t('changesView.checkin.none'));
+      return;
+    }
+    if (!pendingPaths.length) {
+      void vscode.window.showInformationMessage(t('changesView.checkin.noneIncluded'));
+      return;
+    }
+
+    await this.runTextCommand('arm-tfs checkin', () => this.client.checkin(finalComment, pendingPaths, false, false, { cwdOverride: workspaceRoot }), true);
   }
 
   async openDiff(resource?: ArmTfsResourceState | ArmTfsUntrackedResourceState | vscode.Uri): Promise<void> {
@@ -449,6 +570,21 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
       return resolveLocalPathToServerPath(localPath, workspaceRoot, status.workspace.mappings);
     } catch (error) {
       this.output.appendLine(`arm-tfs resolve server path ${localPath}: ${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    }
+  }
+
+  private async resolveStatusItemForPath(localPath: string, workspaceRoot: string): Promise<StatusItem | undefined> {
+    const cached = this.resourcesByPath.get(normalizeLocalPath(localPath))?.item;
+    if (cached) {
+      return cached;
+    }
+
+    try {
+      const status = await this.client.status(localPath, true, { cwdOverride: getCommandCwd(workspaceRoot, localPath) });
+      return status.items.find((item) => normalizeLocalPath(item.localPath) === normalizeLocalPath(localPath));
+    } catch (error) {
+      this.output.appendLine(`arm-tfs resolve status ${localPath}: ${error instanceof Error ? error.message : String(error)}`);
       return undefined;
     }
   }
@@ -527,6 +663,9 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
       }
       const untrackedStates = untracked.map((filePath) => new ArmTfsUntrackedResourceState(filePath));
 
+      await this.ensureExcludedCheckinStateLoaded(workspaceRoot);
+      await this.pruneExcludedCheckinState(workspaceRoot, pending);
+
       this.pendingChanges = pending;
       this.localChanges = localChanges;
       this.conflicts = conflicts;
@@ -598,6 +737,39 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
    */
   invalidateTrackedCache(): void {
     this.knownPathsCache = undefined;
+  }
+
+  private async ensureExcludedCheckinStateLoaded(workspaceRoot: string): Promise<void> {
+    if (this.excludedCheckinWorkspaceRoot === workspaceRoot) {
+      return;
+    }
+
+    const stored = this.workspaceState?.get<string[]>(getExcludedCheckinStateKey(workspaceRoot), []) ?? [];
+    this.excludedCheckinPaths = new Set(stored.map(normalizeRelativePathKey));
+    this.excludedCheckinWorkspaceRoot = workspaceRoot;
+  }
+
+  private async persistExcludedCheckinState(workspaceRoot: string): Promise<void> {
+    this.excludedCheckinWorkspaceRoot = workspaceRoot;
+    if (!this.workspaceState) {
+      return;
+    }
+
+    await this.workspaceState.update(
+      getExcludedCheckinStateKey(workspaceRoot),
+      [...this.excludedCheckinPaths].sort((left, right) => left.localeCompare(right)),
+    );
+  }
+
+  private async pruneExcludedCheckinState(workspaceRoot: string, pending: ArmTfsResourceState[]): Promise<void> {
+    const pendingKeys = new Set(pending.map((resource) => getCheckinSelectionKey(workspaceRoot, resource.resourceUri.fsPath)));
+    const next = new Set([...this.excludedCheckinPaths].filter((key) => pendingKeys.has(key)));
+    if (next.size === this.excludedCheckinPaths.size) {
+      return;
+    }
+
+    this.excludedCheckinPaths = next;
+    await this.persistExcludedCheckinState(workspaceRoot);
   }
 
   private clearResources(): void {
@@ -1156,6 +1328,15 @@ function getWorkspaceRelativePathKey(workspaceRoot: string, localPath: string): 
     return undefined;
   }
   return normalizeRelativePathKey(path.relative(normalizedRoot, normalizedLocal));
+}
+
+function getCheckinSelectionKey(workspaceRoot: string, localPath: string): string {
+  return getWorkspaceRelativePathKey(workspaceRoot, localPath)
+    ?? normalizeLocalPath(localPath).replace(/\\/g, '/').toLowerCase();
+}
+
+function getExcludedCheckinStateKey(workspaceRoot: string): string {
+  return `armTfs.excludedCheckin:${createHash('sha256').update(normalizeLocalPath(workspaceRoot)).digest('hex')}`;
 }
 
 function normalizeRelativePathKey(relativePath: string): string {

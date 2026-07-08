@@ -62,8 +62,24 @@ public static class UndoCommand
                 }
                 else if (change.ChangeType == ChangeType.Add && !noRestore)
                 {
-                    // For adds, just remove from pending — don't delete the local file
-                    Console.WriteLine($"  [UNDO ADD] {change.LocalPath}  (local file kept)");
+                    // Added files do not exist on the server yet, so "restore server version"
+                    // means removing the local add and clearing its pending state.
+                    try
+                    {
+                        if (File.Exists(change.LocalPath))
+                        {
+                            File.Delete(change.LocalPath);
+                            Console.WriteLine($"  [DELETED] {change.LocalPath}");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"  [MISSING] {change.LocalPath}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"  [ERROR] Could not delete {change.LocalPath}: {ex.Message}");
+                    }
                 }
 
                 ws.RemovePendingChange(change.LocalPath);
