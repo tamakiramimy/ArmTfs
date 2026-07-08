@@ -674,8 +674,11 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
 
   // ─── 重命名/移动服务器文件 ─────────────────────────────────────────────
   register('armTfs.renameServerItem', async (input) => {
-    const oldPath = readStringOption(input, 'oldPath')
+    const rawOldPath = readStringOption(input, 'oldPath')
+      ?? readStringOption(input, 'path')
       ?? await promptPath(t('extension.prompt.renameOldPath'), getActivePath() ?? '$/');
+    if (!rawOldPath) { return; }
+    const oldPath = await resolveServerTargetPath(client, rawOldPath);
     if (!oldPath) { return; }
     const newPath = await promptPath(t('extension.prompt.renameNewPath'), oldPath);
     if (!newPath) { return; }
@@ -705,8 +708,11 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
 
   // ─── 还原已删除文件 ────────────────────────────────────────────────────
   register('armTfs.undeleteServerItem', async (input) => {
-    const serverPath = readStringOption(input, 'path')
-      ?? await promptPath(t('extension.prompt.undeletePath'), '$/');
+    const rawTargetPath = readStringOption(input, 'path')
+      ?? await promptPath(t('extension.prompt.undeletePath'), getActivePath() ?? '$/');
+    const serverPath = rawTargetPath
+      ? await resolveServerTargetPath(client, rawTargetPath)
+      : undefined;
     if (!serverPath) { return; }
     const comment = await promptPath(t('extension.prompt.undeleteComment'), '') ?? '';
     return runAndShowText(t('extension.operation.undeleteServerItem'), output, () =>
@@ -1302,8 +1308,27 @@ async function maybeRunGuiSmoke(
       );
     }
     output.appendLine('arm-tfs GUI smoke scenario executed.');
+    persistGuiSmokeResult({ ok: true, scenario });
   } catch (error) {
-    output.appendLine(`arm-tfs GUI smoke failed: ${error instanceof Error ? error.message : `${error}`}`);
+    const message = error instanceof Error ? error.message : `${error}`;
+    output.appendLine(`arm-tfs GUI smoke failed: ${message}`);
+    persistGuiSmokeResult({ ok: false, error: message });
+  }
+}
+
+function persistGuiSmokeResult(payload: Record<string, unknown>): void {
+  const targetPath = process.env.ARM_TFS_GUI_SMOKE_RESULT_FILE || '/tmp/arm-tfs-gui-smoke-result.json';
+  if (!targetPath) {
+    return;
+  }
+
+  try {
+    writeFileSync(targetPath, `${JSON.stringify({
+      ...payload,
+      recordedAt: new Date().toISOString(),
+    }, null, 2)}\n`, 'utf8');
+  } catch {
+    // Ignore smoke-result persistence failures; the smoke run itself may still be valid.
   }
 }
 

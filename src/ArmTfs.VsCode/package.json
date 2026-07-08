@@ -12,7 +12,11 @@
   ],
   "main": "./out/extension.js",
   "activationEvents": [
+    "workspaceContains:.tf/workspace.json",
     "workspaceContains:**/.tf/workspace.json",
+    "workspaceContains:$tf",
+    "workspaceContains:**/$tf/**",
+    "onView:armTfs.changes",
     "onView:armTfs.serverExplorer",
     "onView:armTfs.connections",
     "onView:armTfs.branches",
@@ -726,6 +730,11 @@
           "group": "1_compare@2"
         },
         {
+          "command": "armTfs.runGet",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded|untracked)/",
+          "group": "1_compare@3"
+        },
+        {
           "command": "armTfs.changes.checkout",
           "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(localChanges|untracked)/",
           "group": "2_stage@1"
@@ -774,6 +783,16 @@
           "command": "armTfs.deleteServerItem",
           "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded)/",
           "group": "4_danger@4"
+        },
+        {
+          "command": "armTfs.renameServerItem",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded)/",
+          "group": "4_danger@4.5"
+        },
+        {
+          "command": "armTfs.undeleteServerItem",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded)/",
+          "group": "4_danger@4.75"
         },
         {
           "command": "armTfs.lockServerItem",
@@ -1127,111 +1146,156 @@
       ],
       "explorer/context": [
         {
-          "command": "armTfs.checkout",
+          "command": "armTfs.runGet",
           "when": "resourceScheme == file",
           "group": "8_armtfs@1"
         },
         {
-          "command": "armTfs.add",
+          "command": "armTfs.checkout",
           "when": "resourceScheme == file",
           "group": "8_armtfs@2"
         },
         {
-          "command": "armTfs.undo",
+          "command": "armTfs.add",
           "when": "resourceScheme == file",
           "group": "8_armtfs@3"
         },
         {
-          "command": "armTfs.unstage",
+          "command": "armTfs.undo",
           "when": "resourceScheme == file",
           "group": "8_armtfs@4"
         },
         {
-          "command": "armTfs.stageCheckin",
+          "command": "armTfs.unstage",
           "when": "resourceScheme == file",
           "group": "8_armtfs@5"
         },
         {
-          "command": "armTfs.revertLocal",
+          "command": "armTfs.stageCheckin",
           "when": "resourceScheme == file",
           "group": "8_armtfs@6"
         },
         {
-          "command": "armTfs.checkin",
+          "command": "armTfs.revertLocal",
           "when": "resourceScheme == file",
           "group": "8_armtfs@7"
         },
         {
-          "command": "armTfs.showDiff",
+          "command": "armTfs.checkin",
           "when": "resourceScheme == file",
           "group": "8_armtfs@8"
         },
         {
-          "command": "armTfs.showHistory",
+          "command": "armTfs.showDiff",
           "when": "resourceScheme == file",
           "group": "8_armtfs@9"
         },
         {
-          "command": "armTfs.deleteServerItem",
+          "command": "armTfs.showHistory",
           "when": "resourceScheme == file",
           "group": "8_armtfs@10"
         },
         {
-          "command": "armTfs.lockServerItem",
+          "command": "armTfs.deleteServerItem",
           "when": "resourceScheme == file",
           "group": "8_armtfs@11"
         },
         {
-          "command": "armTfs.unlockServerItem",
+          "command": "armTfs.renameServerItem",
           "when": "resourceScheme == file",
           "group": "8_armtfs@12"
+        },
+        {
+          "command": "armTfs.undeleteServerItem",
+          "when": "resourceScheme == file",
+          "group": "8_armtfs@12.5"
+        },
+        {
+          "command": "armTfs.lockServerItem",
+          "when": "resourceScheme == file",
+          "group": "8_armtfs@13"
+        },
+        {
+          "command": "armTfs.unlockServerItem",
+          "when": "resourceScheme == file",
+          "group": "8_armtfs@14"
         }
       ],
       "editor/title/context": [
         {
-          "command": "armTfs.checkout",
+          "command": "armTfs.runGet",
           "when": "resourceScheme == file",
           "group": "navigation@20"
         },
         {
-          "command": "armTfs.add",
+          "command": "armTfs.checkout",
           "when": "resourceScheme == file",
           "group": "navigation@21"
         },
         {
-          "command": "armTfs.undo",
+          "command": "armTfs.add",
           "when": "resourceScheme == file",
           "group": "navigation@22"
         },
         {
-          "command": "armTfs.unstage",
+          "command": "armTfs.undo",
           "when": "resourceScheme == file",
           "group": "navigation@23"
         },
         {
-          "command": "armTfs.stageCheckin",
+          "command": "armTfs.unstage",
           "when": "resourceScheme == file",
           "group": "navigation@24"
         },
         {
-          "command": "armTfs.revertLocal",
+          "command": "armTfs.stageCheckin",
           "when": "resourceScheme == file",
           "group": "navigation@25"
         },
         {
-          "command": "armTfs.checkin",
+          "command": "armTfs.revertLocal",
           "when": "resourceScheme == file",
           "group": "navigation@26"
         },
         {
-          "command": "armTfs.showDiff",
+          "command": "armTfs.checkin",
           "when": "resourceScheme == file",
           "group": "navigation@27"
         },
         {
-          "command": "armTfs.showHistory",
+          "command": "armTfs.showDiff",
           "when": "resourceScheme == file",
           "group": "navigation@28"
+        },
+        {
+          "command": "armTfs.showHistory",
+          "when": "resourceScheme == file",
+          "group": "navigation@29"
+        },
+        {
+          "command": "armTfs.deleteServerItem",
+          "when": "resourceScheme == file",
+          "group": "navigation@30"
+        },
+        {
+          "command": "armTfs.renameServerItem",
+          "when": "resourceScheme == file",
+          "group": "navigation@31"
+        },
+        {
+          "command": "armTfs.undeleteServerItem",
+          "when": "resourceScheme == file",
+          "group": "navigation@31.5"
+        },
+        {
+          "command": "armTfs.lockServerItem",
+          "when": "resourceScheme == file",
+          "group": "navigation@32"
+        },
+        {
+          "command": "armTfs.unlockServerItem",
+          "when": "resourceScheme == file",
+          "group": "navigation@33"
         }
       ]
     },
