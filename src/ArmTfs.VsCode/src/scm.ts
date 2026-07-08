@@ -446,12 +446,15 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
       }
     }
 
-    const choice = await vscode.window.showWarningMessage(
-      t('changesView.discard.confirm', { file: path.basename(targetPath) }),
-      { modal: true, detail: t('changesView.discard.detail', { path: targetPath }) },
-      t('changesView.discard.action'),
-    );
-    if (choice !== t('changesView.discard.action')) {
+    const revertAction = t('changesView.discard.action');
+    const choice = shouldAutoConfirmDialogs()
+      ? revertAction
+      : await vscode.window.showWarningMessage(
+        t('changesView.discard.confirm', { file: path.basename(targetPath) }),
+        { modal: true, detail: t('changesView.discard.detail', { path: targetPath }) },
+        revertAction,
+      );
+    if (choice !== revertAction) {
       return;
     }
 
@@ -473,11 +476,15 @@ export class ArmTfsScmController implements vscode.Disposable, vscode.FileDecora
       return;
     }
 
-    const finalComment = (comment ?? await vscode.window.showInputBox({
-      prompt: t('extension.prompt.checkinComment'),
-      ignoreFocusOut: true,
-      validateInput: (value) => value.trim() ? undefined : t('warning.checkin.comment'),
-    }))?.trim();
+    const finalComment = (
+      comment
+      ?? process.env.ARM_TFS_TEST_CHECKIN_COMMENT
+      ?? await vscode.window.showInputBox({
+        prompt: t('extension.prompt.checkinComment'),
+        ignoreFocusOut: true,
+        validateInput: (value) => value.trim() ? undefined : t('warning.checkin.comment'),
+      })
+    )?.trim();
     if (!finalComment) {
       return;
     }
@@ -1345,6 +1352,10 @@ function normalizeRelativePathKey(relativePath: string): string {
     .replace(/^\/+/, '')
     .replace(/\/+$/, '')
     .toLowerCase();
+}
+
+function shouldAutoConfirmDialogs(): boolean {
+  return process.env.ARM_TFS_TEST_AUTO_CONFIRM === '1';
 }
 
 /**

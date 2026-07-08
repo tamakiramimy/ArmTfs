@@ -18,6 +18,7 @@ import { openServerVersionDiff } from './versionedFiles';
 
 export interface ArmTfsExtensionApi {
   client: ArmTfsCliClient;
+  scm: ArmTfsScmController;
 }
 
 export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
@@ -838,7 +839,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     await refreshUi();
   });
 
-  return { client };
+  return { client, scm };
 }
 
 export function deactivate(): void {}
