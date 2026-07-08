@@ -602,6 +602,7 @@ public class TfvcSoapClientTests
         const string returnedDisplayOwner = "display-owner";
         var nonCreateSoapBodies = new List<string>();
         string uploadBody = string.Empty;
+        string pendChangesBody = string.Empty;
 
         var soap = BuildSoapWithFakeHandler(async req =>
         {
@@ -636,6 +637,7 @@ public class TfvcSoapClientTests
 
             if (action.Contains("/PendChanges\"", StringComparison.Ordinal))
             {
+                pendChangesBody = body;
                 return CreateXmlResponse("""
                     <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
                       <soap:Body>
@@ -696,6 +698,14 @@ public class TfvcSoapClientTests
             Assert.Contains($"<tns:ownerName>{originalOwner}</tns:ownerName>", body);
             Assert.DoesNotContain(returnedDisplayOwner, body);
         });
+        var pendingItemStart = pendChangesBody.IndexOf("<tns:item item=\"", StringComparison.Ordinal);
+        Assert.True(pendingItemStart >= 0, "PendChanges request should include a pending item path.");
+        var pendingItemValueStart = pendingItemStart + "<tns:item item=\"".Length;
+        var pendingItemValueEnd = pendChangesBody.IndexOf('"', pendingItemValueStart);
+        Assert.True(pendingItemValueEnd > pendingItemValueStart, "PendChanges request should include a non-empty pending item path.");
+        var pendingItemPath = pendChangesBody[pendingItemValueStart..pendingItemValueEnd];
+        Assert.DoesNotContain("$/P/a.txt\r\n", uploadBody, StringComparison.Ordinal);
+        Assert.Contains(pendingItemPath, uploadBody, StringComparison.Ordinal);
         Assert.Contains(originalOwner, uploadBody);
         Assert.DoesNotContain(returnedDisplayOwner, uploadBody);
     }
