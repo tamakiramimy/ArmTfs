@@ -726,7 +726,7 @@
         },
         {
           "command": "armTfs.showHistory",
-          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded)/",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded|untracked)/",
           "group": "1_compare@2"
         },
         {
@@ -736,22 +736,22 @@
         },
         {
           "command": "armTfs.changes.checkout",
-          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(localChanges|untracked)/",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded|untracked)/",
           "group": "2_stage@1"
         },
         {
           "command": "armTfs.changes.add",
-          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(localChanges|untracked)/",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded|untracked)/",
           "group": "2_stage@2"
         },
         {
           "command": "armTfs.changes.unstage",
-          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|conflicts)/",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded|untracked)/",
           "group": "2_stage@1"
         },
         {
           "command": "armTfs.changes.stageCheckin",
-          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pendingExcluded|conflictsExcluded)/",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded|untracked)/",
           "group": "2_stage@1"
         },
         {
@@ -761,7 +761,7 @@
         },
         {
           "command": "armTfs.changes.ignore",
-          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|untracked)/",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded|untracked)/",
           "group": "3_manage@1"
         },
         {
@@ -771,7 +771,7 @@
         },
         {
           "command": "armTfs.changes.undo",
-          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|conflicts|conflictsExcluded)/",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded|untracked)/",
           "group": "4_danger@2"
         },
         {
@@ -781,27 +781,27 @@
         },
         {
           "command": "armTfs.deleteServerItem",
-          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded)/",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded|untracked)/",
           "group": "4_danger@4"
         },
         {
           "command": "armTfs.renameServerItem",
-          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded)/",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded|untracked)/",
           "group": "4_danger@4.5"
         },
         {
           "command": "armTfs.undeleteServerItem",
-          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded)/",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded|untracked)/",
           "group": "4_danger@4.75"
         },
         {
           "command": "armTfs.lockServerItem",
-          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded)/",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded|untracked)/",
           "group": "4_danger@5"
         },
         {
           "command": "armTfs.unlockServerItem",
-          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded)/",
+          "when": "view == armTfs.changes && viewItem =~ /armTfsChangeFile\\.(pending|pendingExcluded|localChanges|conflicts|conflictsExcluded|untracked)/",
           "group": "4_danger@6"
         },
         {
