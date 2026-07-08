@@ -427,14 +427,12 @@ export class ArmTfsSidebarController implements vscode.Disposable {
 
       // Find the active branch node and asynchronously update its merge/pending badge.
       const activePath = this.activeBranchPath;
-      this.output.appendLine(`[branch-badge] activeBranchPath=${activePath ?? '(none)'}, branch count=${flattenBranchNodes(roots).length}`);
       if (activePath) {
         const allNodes = flattenBranchNodes(roots);
         const activeNode = allNodes.find(
           (node) => normalizeServerPath(node.branch.path) === normalizeServerPath(activePath),
         );
         this.activeBranchNode = activeNode;
-        this.output.appendLine(`[branch-badge] activeNode found: ${activeNode?.branch.path ?? '(none)'}`);
         if (activeNode) {
           void this.refreshActiveBranchStatus(activeNode);
         }
@@ -468,14 +466,17 @@ export class ArmTfsSidebarController implements vscode.Disposable {
   /** Fetch merge candidates from the configured merge source → activeBranch, then update the badge. */
   private async refreshActiveBranchStatus(node: BranchNode, pendingCountOverride?: number): Promise<void> {
     const targetPath = node.branch.path;
-    this.output.appendLine(`[branch-badge] active branch: ${targetPath}`);
+    const workspaceServerPath = this.getCurrentWorkspaceMappingPath();
+    const isWorkspaceBranch = workspaceServerPath !== undefined
+      && normalizeServerPath(workspaceServerPath) === normalizeServerPath(targetPath);
 
     // ── ⬇N: behind count ────────────────────────────────────────────────────
     // Compare local max changeset (from .tf/versions/) with server latest history.
+    // This is only meaningful for the branch mapped by the current TFVC workspace.
     let behindCount = 0;
     const localRoot = this.resolvedWorkspaceRoot
       ?? (this.rootPath ? findTfvcWorkspaceRootSync(this.rootPath) ?? undefined : undefined);
-    if (localRoot) {
+    if (localRoot && isWorkspaceBranch) {
       try {
         const versionsDir = path.join(localRoot, '.tf', 'versions');
         const fs = await import('node:fs/promises');
@@ -490,18 +491,16 @@ export class ArmTfsSidebarController implements vscode.Disposable {
             }
           } catch { /* skip */ }
         }
-        this.output.appendLine(`[branch-badge] localMax changeset: ${localMax}`);
         if (localMax > 0) {
           const history = await this.client.history(targetPath, 50, undefined, { cwdOverride: localRoot });
           behindCount = history.items.filter(cs => cs.changesetId > localMax).length;
-          this.output.appendLine(`[branch-badge] behind count: ${behindCount}`);
         }
-      } catch (err) {
-        this.output.appendLine(`[branch-badge] behind count error: ${getErrorMessage(err)}`);
+      } catch {
+        behindCount = 0;
       }
     }
 
-    const pendingCount = pendingCountOverride ?? this.lastPendingCount;
+    const pendingCount = isWorkspaceBranch ? (pendingCountOverride ?? this.lastPendingCount) : 0;
     node.setStatus(pendingCount, behindCount);
     this.branchProvider.refreshNode(node);
   }

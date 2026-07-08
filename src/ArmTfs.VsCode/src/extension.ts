@@ -134,7 +134,6 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     await sidebar.initialize();
     await syncTfvcContextFromActivePath();
     uiInitialized = true;
-    await maybeRunGuiSmoke(client, historyBrowser, output);
   })();
 
   context.subscriptions.push(
@@ -1264,73 +1263,6 @@ async function resolveServerTargetPath(
 
 function pathSeparator(): string {
   return path.sep;
-}
-
-interface GuiSmokeScenario {
-  historyPath?: string;
-  initialChangesetId?: number;
-  diff?: {
-    fromPath: string;
-    toPath?: string;
-    fromVersion: number;
-    toVersion: number;
-    title?: string;
-  };
-}
-
-async function maybeRunGuiSmoke(
-  client: ArmTfsCliClient,
-  historyBrowser: ArmTfsHistoryBrowser,
-  output: vscode.OutputChannel,
-): Promise<void> {
-  const raw = process.env.ARM_TFS_GUI_SMOKE
-    ?? (existsSync('/tmp/arm-tfs-gui-smoke.json') ? readFileSync('/tmp/arm-tfs-gui-smoke.json', 'utf8') : undefined);
-  if (!raw) {
-    return;
-  }
-
-  try {
-    const scenario = JSON.parse(raw) as GuiSmokeScenario;
-    if (scenario.historyPath) {
-      await historyBrowser.open(scenario.historyPath, scenario.initialChangesetId);
-    }
-    if (scenario.diff) {
-      await openServerVersionDiff(
-        client,
-        {
-          serverPath: scenario.diff.fromPath,
-          version: scenario.diff.fromVersion,
-        },
-        {
-          serverPath: scenario.diff.toPath ?? scenario.diff.fromPath,
-          version: scenario.diff.toVersion,
-        },
-        scenario.diff.title,
-      );
-    }
-    output.appendLine('arm-tfs GUI smoke scenario executed.');
-    persistGuiSmokeResult({ ok: true, scenario });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : `${error}`;
-    output.appendLine(`arm-tfs GUI smoke failed: ${message}`);
-    persistGuiSmokeResult({ ok: false, error: message });
-  }
-}
-
-function persistGuiSmokeResult(payload: Record<string, unknown>): void {
-  const targetPath = process.env.ARM_TFS_GUI_SMOKE_RESULT_FILE || '/tmp/arm-tfs-gui-smoke-result.json';
-  if (!targetPath) {
-    return;
-  }
-
-  try {
-    writeFileSync(targetPath, `${JSON.stringify({
-      ...payload,
-      recordedAt: new Date().toISOString(),
-    }, null, 2)}\n`, 'utf8');
-  } catch {
-    // Ignore smoke-result persistence failures; the smoke run itself may still be valid.
-  }
 }
 
 interface LocaleSyncResult {
