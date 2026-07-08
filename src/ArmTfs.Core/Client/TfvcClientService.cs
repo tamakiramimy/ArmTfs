@@ -660,7 +660,6 @@ public sealed class TfvcClientService
         try
         {
             var ws = await soap.CreateWorkspaceAsync(workspaceName, owner, computer, "arm-tfs lock", folders, ct).ConfigureAwait(false);
-            if (!string.IsNullOrWhiteSpace(ws.Owner)) owner = ws.Owner;
             created = ws;
 
             var lockLevel = lockIt ? "CheckOut" : "None";
@@ -709,7 +708,6 @@ public sealed class TfvcClientService
         try
         {
             var ws = await soap.CreateWorkspaceAsync(workspaceName, owner, computer, "arm-tfs shelve", folders, ct).ConfigureAwait(false);
-            if (!string.IsNullOrWhiteSpace(ws.Owner)) owner = ws.Owner;
             created = ws;
 
             // Pend the changes in this temporary workspace
@@ -1674,12 +1672,8 @@ public sealed class TfvcClientService
             // CreateWorkspace with owner = authenticated user GUID. Reuse this owner for every
             // subsequent call so the workspace lookup (by name+owner) matches and the caller has
             // Use permission. Prefer the server-recorded owner from the response when available.
-            var createdWorkspace = await soap.CreateWorkspaceAsync(
+            await soap.CreateWorkspaceAsync(
                 workspaceName, owner, computer, "arm-tfs SOAP merge", workingFolders, ct).ConfigureAwait(false);
-            if (!string.IsNullOrWhiteSpace(createdWorkspace.Owner))
-            {
-                owner = createdWorkspace.Owner;
-            }
             createdWs = new SoapWorkspaceCreated(workspaceName, owner);
 
             var pendResult = await soap.PendMergeAsync(
@@ -2104,10 +2098,8 @@ public sealed class TfvcClientService
 
         try
         {
-            var createdWorkspace = await soap.CreateWorkspaceAsync(
+            await soap.CreateWorkspaceAsync(
                 workspaceName, owner, computer, "arm-tfs SOAP range merge", workingFolders, ct).ConfigureAwait(false);
-            if (!string.IsNullOrWhiteSpace(createdWorkspace.Owner))
-                owner = createdWorkspace.Owner;
             createdWs = new SoapWorkspaceCreated(workspaceName, owner);
 
             var pendResult = await soap.PendMergeAsync(
@@ -2393,10 +2385,8 @@ public sealed class TfvcClientService
 
         try
         {
-            var created = await soap.CreateWorkspaceAsync(
+            await soap.CreateWorkspaceAsync(
                 workspaceName, owner, computer, "arm-tfs conflict preview", workingFolders, ct).ConfigureAwait(false);
-            if (!string.IsNullOrWhiteSpace(created.Owner))
-                owner = created.Owner;
             createdWs = new SoapWorkspaceCreated(workspaceName, owner);
 
             var pend = await soap.PendMergeAsync(

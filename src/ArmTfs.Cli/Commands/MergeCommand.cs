@@ -106,7 +106,7 @@ public static class MergeCommand
         var resolutionFileOpt = new Option<FileInfo?>("--resolution-file") { Description = "JSON file with per-file merge resolutions" };
         var formatOpt = new Option<string>("--format", () => "table") { Description = "Output format: table | json" };
         var modeOpt = new Option<string>("--mode", () => "soap") { Description = "Merge protocol: soap (default, real merge history via Repository.asmx). Only soap is supported." };
-        var soapOwnerOpt = new Option<string?>("--soap-owner") { Description = "Owner identity (DOMAIN\\\\user or user@domain) for the temporary SOAP workspace. Defaults to configured username, then auto-inferred from the authenticated user's existing workspaces." };
+        var soapOwnerOpt = new Option<string?>("--soap-owner") { Description = "Owner identity for the temporary SOAP workspace. Omit to auto-resolve the authenticated user's TFVC owner GUID." };
 
         sourceOpt.IsRequired = true;
         targetOpt.IsRequired = true;
@@ -135,7 +135,7 @@ public static class MergeCommand
             var resolutionFile = ctx.ParseResult.GetValueForOption(resolutionFileOpt);
             var format = ctx.ParseResult.GetValueForOption(formatOpt) ?? "table";
             var mode = ctx.ParseResult.GetValueForOption(modeOpt) ?? "soap";
-            var soapOwner = ctx.ParseResult.GetValueForOption(soapOwnerOpt) ?? config.Username;
+            var soapOwner = ctx.ParseResult.GetValueForOption(soapOwnerOpt);
 
             var ws = WorkspaceManager.FindWorkspace(Directory.GetCurrentDirectory());
             using var conn = new TfsConnection(config);

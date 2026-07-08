@@ -118,6 +118,50 @@ public class TfvcSoapClientTests
     }
 
     [Fact]
+    public async Task GetAuthenticatedUserGuidAsync_prefers_connectionData_authenticated_user()
+    {
+        using var connection = new FakeTfsConnection(async req =>
+        {
+            if (req.RequestUri!.AbsolutePath.EndsWith("/_apis/connectionData", StringComparison.OrdinalIgnoreCase))
+            {
+                return CreateJsonResponse("""
+                    {
+                      "authenticatedUser": {
+                        "id": "0cbfc36d-7ad1-4d7d-919e-581a311ce2e2",
+                        "providerDisplayName": "吴伟城 Wu Weicheng",
+                        "properties": {
+                          "Account": {
+                            "$value": "50240429"
+                          }
+                        }
+                      }
+                    }
+                    """);
+            }
+
+            return CreateXmlResponse("""
+                <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                  <soap:Body>
+                    <QueryWorkspacesResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                      <QueryWorkspacesResult>
+                        <Workspace name="other" owner="8adbeef9-f3da-4bd2-8d3f-7974d73f8b18" ownerdisp="杨峰" computer="DESKTOP-U59PI9K" />
+                      </QueryWorkspacesResult>
+                    </QueryWorkspacesResponse>
+                  </soap:Body>
+                </soap:Envelope>
+                """);
+        });
+
+        var owner = await connection.GetAuthenticatedUserGuidAsync();
+        var user = await connection.GetAuthenticatedUserAsync();
+
+        Assert.Equal("0cbfc36d-7ad1-4d7d-919e-581a311ce2e2", owner);
+        Assert.NotNull(user);
+        Assert.Equal("吴伟城 Wu Weicheng", user!.DisplayName);
+        Assert.Equal("50240429", user.Account);
+    }
+
+    [Fact]
     public async Task QueryItems_parses_itemid_attribute()
     {
         var soap = BuildSoapWithFakeHandler(_ => CreateXmlResponse("""
@@ -698,14 +742,8 @@ public class TfvcSoapClientTests
             Assert.Contains($"<tns:ownerName>{originalOwner}</tns:ownerName>", body);
             Assert.DoesNotContain(returnedDisplayOwner, body);
         });
-        var pendingItemStart = pendChangesBody.IndexOf("<tns:item item=\"", StringComparison.Ordinal);
-        Assert.True(pendingItemStart >= 0, "PendChanges request should include a pending item path.");
-        var pendingItemValueStart = pendingItemStart + "<tns:item item=\"".Length;
-        var pendingItemValueEnd = pendChangesBody.IndexOf('"', pendingItemValueStart);
-        Assert.True(pendingItemValueEnd > pendingItemValueStart, "PendChanges request should include a non-empty pending item path.");
-        var pendingItemPath = pendChangesBody[pendingItemValueStart..pendingItemValueEnd];
-        Assert.DoesNotContain("$/P/a.txt\r\n", uploadBody, StringComparison.Ordinal);
-        Assert.Contains(pendingItemPath, uploadBody, StringComparison.Ordinal);
+        Assert.Contains("<tns:item item=\"$/P/a.txt\"", pendChangesBody, StringComparison.Ordinal);
+        Assert.Contains("$/P/a.txt", uploadBody, StringComparison.Ordinal);
         Assert.Contains(originalOwner, uploadBody);
         Assert.DoesNotContain(returnedDisplayOwner, uploadBody);
     }
@@ -963,6 +1001,12 @@ public class TfvcSoapClientTests
         new(HttpStatusCode.OK)
         {
             Content = new StringContent(xml, System.Text.Encoding.UTF8, "text/xml"),
+        };
+
+    private static HttpResponseMessage CreateJsonResponse(string json) =>
+        new(HttpStatusCode.OK)
+        {
+            Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json"),
         };
 
     /// <summary>

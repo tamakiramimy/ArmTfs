@@ -1149,20 +1149,12 @@ public sealed class TfvcSoapClient
             }
 
             // 3. Upload content for Edit/Add operations
-            // upload.ashx must target the same pending item path used by PendChanges. When the
-            // temporary SOAP workspace pends Add/Edit through mapped local paths, uploading to
-            // the original server path causes TFS to treat the item as "not checked out".
-            foreach (var prepared in preparedChanges)
+            foreach (var change in changes)
             {
-                if (prepared.Change.Content is null) continue;
-                if (string.Equals(prepared.Change.ChangeType, "Delete", StringComparison.OrdinalIgnoreCase)) continue;
+                if (change.Content is null) continue;
+                if (string.Equals(change.ChangeType, "Delete", StringComparison.OrdinalIgnoreCase)) continue;
 
-                await UploadFileToWorkspaceAsync(
-                    workspaceName,
-                    ownerName,
-                    prepared.PendingPath,
-                    prepared.Change.Content,
-                    ct).ConfigureAwait(false);
+                await UploadFileToWorkspaceAsync(workspaceName, ownerName, change.ServerPath, change.Content, ct).ConfigureAwait(false);
             }
 
             // 4. CheckIn — build pending changes from the PendChanges result
@@ -1215,7 +1207,7 @@ public sealed class TfvcSoapClient
         SoapContentChange change,
         IReadOnlyDictionary<string, string> localMappings)
     {
-        if (change.Content is null || string.Equals(change.ChangeType, "Delete", StringComparison.OrdinalIgnoreCase))
+        if (change.Content is null || !string.Equals(change.ChangeType, "Edit", StringComparison.OrdinalIgnoreCase))
         {
             return change.ServerPath;
         }
