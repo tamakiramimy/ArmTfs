@@ -55,7 +55,7 @@ public sealed class TfvcSoapClient
   </soap:Body>
 </soap:Envelope>";
 
-        using var httpClient = _connection.CreateHttpClient();
+        var httpClient = _connection.CreateHttpClient();
         using var request = new HttpRequestMessage(HttpMethod.Post, EndpointUrl);
         request.Content = new StringContent(envelope, Encoding.UTF8, "text/xml");
         request.Content.Headers.ContentType = new MediaTypeHeaderValue("text/xml") { CharSet = "utf-8" };
@@ -1028,7 +1028,7 @@ public sealed class TfvcSoapClient
         var uploadUrl = _connection.ServerUrl.TrimEnd('/') + "/VersionControl/v1.0/upload.ashx";
         const string boundary = "----------------314159265358979323846";
 
-        using var httpClient = _connection.CreateHttpClient();
+        var httpClient = _connection.CreateHttpClient();
 
         var contentHash = Convert.ToBase64String(MD5.HashData(content));
         // TFS expects a range field even for single-shot uploads, with a trailing CRLF.
@@ -1600,7 +1600,7 @@ public sealed class TfvcSoapClient
         var baseUrl = _connection.ServerUrl.TrimEnd('/');
         var downloadUrl = $"{baseUrl}/VersionControl/v1.0/item.ashx?{item.DownloadUrl}";
 
-        using var httpClient = _connection.CreateHttpClient();
+        var httpClient = _connection.CreateHttpClient();
         using var response = await httpClient.GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
 

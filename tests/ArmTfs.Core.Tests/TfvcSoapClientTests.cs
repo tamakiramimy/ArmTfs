@@ -162,6 +162,24 @@ public class TfvcSoapClientTests
     }
 
     [Fact]
+    public void CreateHttpClient_reuses_single_instance_and_disables_default_timeout_timer()
+    {
+        using var connection = new TfsConnection(new TfsConfig
+        {
+            ServerUrl = "https://fake.example.com/Collection",
+            PersonalAccessToken = "fake-pat",
+        });
+
+        var first = connection.CreateHttpClient();
+        var second = connection.CreateHttpClient();
+
+        Assert.Same(first, second);
+        Assert.Equal(Timeout.InfiniteTimeSpan, first.Timeout);
+        Assert.Equal(HttpVersion.Version11, first.DefaultRequestVersion);
+        Assert.Equal(HttpVersionPolicy.RequestVersionOrLower, first.DefaultVersionPolicy);
+    }
+
+    [Fact]
     public async Task QueryItems_parses_itemid_attribute()
     {
         var soap = BuildSoapWithFakeHandler(_ => CreateXmlResponse("""

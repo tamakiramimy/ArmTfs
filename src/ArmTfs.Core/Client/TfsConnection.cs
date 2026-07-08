@@ -1,3 +1,4 @@
+using System.Net;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using ArmTfs.Core.Config;
@@ -20,7 +21,9 @@ namespace ArmTfs.Core.Client;
 public class TfsConnection : IDisposable
 {
     private readonly TfsConfig _config;
+    private readonly object _httpClientGate = new();
     private AuthenticatedTfsUser? _authenticatedUser;
+    private HttpClient? _httpClient;
 
     /// <summary>初始化连接对象。不会立即建立网络连接。</summary>
     /// <param name="config">已加载并应用环境变量覆盖的配置对象</param>
@@ -104,7 +107,7 @@ public class TfsConnection : IDisposable
     {
         var requestUri = ServerUrl.TrimEnd('/') + "/_apis/connectionData?connectOptions=1&lastChangeId=-1&lastChangeId64=-1";
 
-        using var client = CreateHttpClient();
+        var client = CreateHttpClient();
         using var response = await client.GetAsync(requestUri, ct).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
             return null;
@@ -252,24 +255,44 @@ public class TfsConnection : IDisposable
     /// </summary>
     public virtual HttpClient CreateHttpClient()
     {
-        var handler = new HttpClientHandler
+        if (_httpClient is not null)
+            return _httpClient;
+
+        lock (_httpClientGate)
         {
-            AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate,
-        };
-        var client = new HttpClient(handler);
-        if (!string.IsNullOrEmpty(_config.PersonalAccessToken))
-        {
-            var token = Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes($":{_config.PersonalAccessToken}"));
-            client.DefaultRequestHeaders.Authorization =
-                new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", token);
+            if (_httpClient is not null)
+                return _httpClient;
+
+            var handler = new HttpClientHandler
+            {
+                AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate,
+            };
+            var client = new HttpClient(handler)
+            {
+                // We always pass explicit CancellationToken values from the command layer.
+                // Disabling HttpClient's implicit timeout avoids spawning short-lived timer-queue
+                // work for every SOAP process, which has been intermittently crashing on macOS
+                // under rapid branch/history refresh pressure.
+                Timeout = Timeout.InfiniteTimeSpan,
+                DefaultRequestVersion = HttpVersion.Version11,
+                DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrLower,
+            };
+            if (!string.IsNullOrEmpty(_config.PersonalAccessToken))
+            {
+                var token = Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes($":{_config.PersonalAccessToken}"));
+                client.DefaultRequestHeaders.Authorization =
+                    new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", token);
+            }
+            else if (!string.IsNullOrEmpty(_config.Username))
+            {
+                var token = Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes($"{_config.Username}:{_config.Password}"));
+                client.DefaultRequestHeaders.Authorization =
+                    new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", token);
+            }
+
+            _httpClient = client;
+            return _httpClient;
         }
-        else if (!string.IsNullOrEmpty(_config.Username))
-        {
-            var token = Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes($"{_config.Username}:{_config.Password}"));
-            client.DefaultRequestHeaders.Authorization =
-                new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", token);
-        }
-        return client;
     }
 
     public void Dispose() { }
