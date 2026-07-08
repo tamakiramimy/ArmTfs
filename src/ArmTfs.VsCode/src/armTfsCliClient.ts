@@ -53,6 +53,7 @@ export class ArmTfsCliError extends Error {
 
 export class ArmTfsCliClient {
   private connectionEnvironmentProvider?: () => Promise<ArmTfsConnectionEnvironment | undefined>;
+  private executionChain: Promise<void> = Promise.resolve();
 
   constructor(private readonly output: vscode.OutputChannel) {}
 
@@ -537,41 +538,49 @@ export class ArmTfsCliClient {
   }
 
   private async execute(commandArgs: string[], options?: ArmTfsRunOptions): Promise<{ stdout: string; stderr: string }> {
-    const invocation = await this.resolveInvocation(commandArgs, options?.cwdOverride);
-    this.output.appendLine(`> ${this.formatInvocation(invocation)}`);
-    const connection = await this.connectionEnvironmentProvider?.();
-    const env = connection
-      ? {
-          ...process.env,
-          ARM_TFS_URL: connection.serverUrl,
-          ARM_TFS_PAT: connection.pat,
-          ARM_TFS_DISPLAY_NAME: connection.displayName ?? '',
+    return this.enqueueExecution(async () => {
+      const invocation = await this.resolveInvocation(commandArgs, options?.cwdOverride);
+      this.output.appendLine(`> ${this.formatInvocation(invocation)}`);
+      const connection = await this.connectionEnvironmentProvider?.();
+      const env = connection
+        ? {
+            ...process.env,
+            ARM_TFS_URL: connection.serverUrl,
+            ARM_TFS_PAT: connection.pat,
+            ARM_TFS_DISPLAY_NAME: connection.displayName ?? '',
+          }
+        : process.env;
+
+      try {
+        const { stdout, stderr } = await execFileAsync(invocation.command, invocation.args, {
+          cwd: invocation.cwd,
+          env,
+          maxBuffer: 10 * 1024 * 1024,
+        });
+
+        if (stderr.trim()) {
+          this.output.appendLine(stderr.trim());
         }
-      : process.env;
 
-    try {
-      const { stdout, stderr } = await execFileAsync(invocation.command, invocation.args, {
-        cwd: invocation.cwd,
-        env,
-        maxBuffer: 10 * 1024 * 1024,
-      });
+        return { stdout, stderr };
+      } catch (error) {
+        if (error instanceof ArmTfsCliError) {
+          throw error;
+        }
 
-      if (stderr.trim()) {
-        this.output.appendLine(stderr.trim());
+        const stdout = typeof error === 'object' && error !== null && 'stdout' in error ? String((error as { stdout?: string }).stdout ?? '') : '';
+        const stderr = typeof error === 'object' && error !== null && 'stderr' in error ? String((error as { stderr?: string }).stderr ?? '') : '';
+        const message = error instanceof Error ? error.message : 'Failed to execute arm-tfs.';
+
+        throw new ArmTfsCliError(message, invocation, stdout, stderr);
       }
+    });
+  }
 
-      return { stdout, stderr };
-    } catch (error) {
-      if (error instanceof ArmTfsCliError) {
-        throw error;
-      }
-
-      const stdout = typeof error === 'object' && error !== null && 'stdout' in error ? String((error as { stdout?: string }).stdout ?? '') : '';
-      const stderr = typeof error === 'object' && error !== null && 'stderr' in error ? String((error as { stderr?: string }).stderr ?? '') : '';
-      const message = error instanceof Error ? error.message : 'Failed to execute arm-tfs.';
-
-      throw new ArmTfsCliError(message, invocation, stdout, stderr);
-    }
+  private enqueueExecution<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.executionChain.catch(() => undefined).then(task);
+    this.executionChain = run.then(() => undefined, () => undefined);
+    return run;
   }
 
   private async resolveInvocation(commandArgs: string[], cwdOverride?: string): Promise<ArmTfsInvocation> {
