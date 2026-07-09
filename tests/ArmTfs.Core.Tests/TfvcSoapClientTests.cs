@@ -522,7 +522,7 @@ public class TfvcSoapClientTests
         Assert.Contains("<LocalVersionUpdate xsi:type=\"LocalVersionUpdate\"", capturedBody);
         Assert.Contains("tlocal=\"C:\\temp\\a.txt\"", capturedBody);
         Assert.Contains("lver=\"42\"", capturedBody);
-        Assert.DoesNotContain("sitem=", capturedBody);
+        Assert.Contains("sitem=\"$/P/a.txt\"", capturedBody);
         Assert.Contains("itemid=\"123\"", capturedBody);
         Assert.DoesNotContain("maxClientPathLength", capturedBody);
     }
@@ -532,12 +532,15 @@ public class TfvcSoapClientTests
     {
         var actions = new List<string>();
         string updateLocalVersionBody = string.Empty;
+        string uploadBody = string.Empty;
+        string pendChangesBody = string.Empty;
 
         var soap = BuildSoapWithFakeHandler(async req =>
         {
             if (req.RequestUri!.AbsolutePath.EndsWith("/upload.ashx", StringComparison.OrdinalIgnoreCase))
             {
                 actions.Add("Upload");
+                uploadBody = await req.Content!.ReadAsStringAsync();
                 return new HttpResponseMessage(HttpStatusCode.OK);
             }
 
@@ -594,6 +597,7 @@ public class TfvcSoapClientTests
             if (action.Contains("/PendChanges\"", StringComparison.Ordinal))
             {
                 actions.Add("PendChanges");
+                pendChangesBody = body;
                 return CreateXmlResponse("""
                     <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
                       <soap:Body>
@@ -655,6 +659,11 @@ public class TfvcSoapClientTests
         Assert.Contains("itemid=\"123\"", updateLocalVersionBody);
         Assert.Contains("lver=\"42\"", updateLocalVersionBody);
         Assert.Contains("tlocal=", updateLocalVersionBody);
+        Assert.Contains("<tns:vspec xsi:type=\"tns:LatestVersionSpec\" />", pendChangesBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("ChangesetVersionSpec", pendChangesBody, StringComparison.Ordinal);
+        Assert.Contains("<tns:supportedFeatures>1923</tns:supportedFeatures>", pendChangesBody, StringComparison.Ordinal);
+        Assert.Contains("$/P/a.txt", uploadBody, StringComparison.Ordinal);
+        Assert.Contains("a.txt", uploadBody, StringComparison.Ordinal);
     }
 
     [Fact]

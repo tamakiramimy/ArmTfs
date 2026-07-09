@@ -944,7 +944,7 @@ public sealed class TfvcSoapClient
                 throw new ArgumentException($"Local version update for '{update.ServerPath}' is missing a valid item id.", nameof(updates));
             }
 
-            updatesXml.AppendLine($@"        <LocalVersionUpdate xsi:type=""LocalVersionUpdate"" tlocal=""{Esc(update.LocalPath)}"" lver=""{update.LocalVersion}"" itemid=""{update.ItemId}"" />");
+            updatesXml.AppendLine($@"        <LocalVersionUpdate xsi:type=""LocalVersionUpdate"" tlocal=""{Esc(update.LocalPath)}"" lver=""{update.LocalVersion}"" sitem=""{Esc(update.ServerPath)}"" itemid=""{update.ItemId}"" />");
         }
 
         var body = $@"    <UpdateLocalVersion xmlns=""{Ns}"">
@@ -986,13 +986,17 @@ public sealed class TfvcSoapClient
         </tns:ChangeRequest>");
         }
 
+        // Match the official TFVC clients: advertise the full supported-features bitset so the
+        // server enables local-version aware checkout/checkin behavior for temporary workspaces.
+        const int supportedFeaturesAll = 1923;
+
         var body = $@"    <tns:PendChanges>
       <tns:workspaceName>{Esc(workspaceName)}</tns:workspaceName>
       <tns:ownerName>{Esc(ownerName)}</tns:ownerName>
       <tns:changes>
 {changesXml}      </tns:changes>
       <tns:pendChangesOptions>0</tns:pendChangesOptions>
-      <tns:supportedFeatures>0</tns:supportedFeatures>
+      <tns:supportedFeatures>{supportedFeaturesAll}</tns:supportedFeatures>
     </tns:PendChanges>";
 
         var doc = await InvokeAsync("PendChanges", body, ct).ConfigureAwait(false);
@@ -1135,7 +1139,7 @@ public sealed class TfvcSoapClient
             {
                 RequestType = p.Change.ChangeType,
                 ServerPath = p.PendingPath,
-                BaseVersion = p.Change.BaseVersion,
+                BaseVersion = null,
                 Encoding = p.Change.Content is not null ? GetPendingEncoding(p.Change.Content) : null,
                 ItemType = "File",
                 TargetServerPath = p.Change.TargetServerPath,
@@ -1149,8 +1153,9 @@ public sealed class TfvcSoapClient
             }
 
             // 3. Upload content for Edit/Add operations
-            foreach (var change in changes)
+            foreach (var prepared in preparedChanges)
             {
+                var change = prepared.Change;
                 if (change.Content is null) continue;
                 if (string.Equals(change.ChangeType, "Delete", StringComparison.OrdinalIgnoreCase)) continue;
 
@@ -1159,10 +1164,12 @@ public sealed class TfvcSoapClient
 
             // 4. CheckIn — build pending changes from the PendChanges result
             var pendingChanges = new List<SoapPendingChange>();
-            foreach (var change in changes)
+            foreach (var prepared in preparedChanges)
             {
+                var change = prepared.Change;
                 var matchOp = pendOps.FirstOrDefault(op =>
-                    string.Equals(op.ServerItem, change.ServerPath, StringComparison.OrdinalIgnoreCase));
+                    string.Equals(op.ServerItem, change.ServerPath, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(op.ServerItem, prepared.PendingPath, StringComparison.OrdinalIgnoreCase));
                 pendingChanges.Add(new SoapPendingChange
                 {
                     ItemId = matchOp?.ItemId ?? 0,

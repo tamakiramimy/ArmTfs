@@ -306,7 +306,7 @@ export class ArmTfsCliClient {
     sourcePath: string,
     targetPath: string,
     changesetId: number,
-    options?: { comment?: string; dryRun?: boolean; resolutionFile?: string },
+    options?: { comment?: string; dryRun?: boolean; resolutionFile?: string; mode?: string },
     runOptions?: ArmTfsRunOptions,
   ): Promise<string> {
     const args = [
@@ -328,6 +328,9 @@ export class ArmTfsCliClient {
     if (options?.resolutionFile) {
       args.push('--resolution-file', options.resolutionFile);
     }
+    if (options?.mode) {
+      args.push('--mode', options.mode);
+    }
 
     return this.executeText(args, runOptions);
   }
@@ -336,7 +339,7 @@ export class ArmTfsCliClient {
     sourcePath: string,
     targetPath: string,
     changesetId: number,
-    options?: { comment?: string; dryRun?: boolean; resolutionFile?: string },
+    options?: { comment?: string; dryRun?: boolean; resolutionFile?: string; mode?: string },
     runOptions?: ArmTfsRunOptions,
   ): Promise<MergeExecuteResponse> {
     const args = [
@@ -359,6 +362,9 @@ export class ArmTfsCliClient {
     }
     if (options?.resolutionFile) {
       args.push('--resolution-file', options.resolutionFile);
+    }
+    if (options?.mode) {
+      args.push('--mode', options.mode);
     }
 
     return this.executeJson<MergeExecuteResponse>(args, runOptions);

@@ -3,6 +3,9 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using ArmTfs.Core.Config;
 using ArmTfs.Core.Models.Soap;
+using Microsoft.TeamFoundation.SourceControl.WebApi;
+using Microsoft.VisualStudio.Services.Common;
+using Microsoft.VisualStudio.Services.WebApi;
 
 namespace ArmTfs.Core.Client;
 
@@ -22,8 +25,11 @@ public class TfsConnection : IDisposable
 {
     private readonly TfsConfig _config;
     private readonly object _httpClientGate = new();
+    private readonly object _restClientGate = new();
     private AuthenticatedTfsUser? _authenticatedUser;
     private HttpClient? _httpClient;
+    private VssConnection? _restConnection;
+    private TfvcHttpClient? _tfvcClient;
 
     /// <summary>初始化连接对象。不会立即建立网络连接。</summary>
     /// <param name="config">已加载并应用环境变量覆盖的配置对象</param>
@@ -295,7 +301,48 @@ public class TfsConnection : IDisposable
         }
     }
 
-    public void Dispose() { }
+    public TfvcHttpClient GetTfvcClient()
+    {
+        if (_tfvcClient is not null)
+            return _tfvcClient;
+
+        lock (_restClientGate)
+        {
+            if (_tfvcClient is not null)
+                return _tfvcClient;
+
+            _restConnection ??= CreateRestConnection();
+            _tfvcClient = _restConnection.GetClient<TfvcHttpClient>();
+            return _tfvcClient;
+        }
+    }
+
+    private VssConnection CreateRestConnection()
+    {
+        var serverUri = new Uri(ServerUrl);
+        VssCredentials credentials;
+
+        if (!string.IsNullOrEmpty(_config.PersonalAccessToken))
+        {
+            credentials = new VssBasicCredential(string.Empty, _config.PersonalAccessToken);
+        }
+        else if (!string.IsNullOrEmpty(_config.Username))
+        {
+            credentials = new VssBasicCredential(_config.Username, _config.Password ?? string.Empty);
+        }
+        else
+        {
+            throw new InvalidOperationException(
+                "No credentials configured. Run 'arm-tfs configure --pat <token>' or 'arm-tfs configure --username <user> --password <pass>'.");
+        }
+
+        return new VssConnection(serverUri, credentials);
+    }
+
+    public void Dispose()
+    {
+        _restConnection?.Dispose();
+    }
 
     public sealed record AuthenticatedTfsUser(string Id, string? DisplayName, string? Account);
 }

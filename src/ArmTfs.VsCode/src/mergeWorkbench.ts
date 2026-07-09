@@ -313,6 +313,7 @@ export class ArmTfsMergeWorkbench {
     }
 
     const resolutionItemsByChangeset = this.buildResolutionItems(selected);
+    const selectedByExecutionOrder = [...selected].sort((a, b) => a.changesetId - b.changesetId);
 
     const defaultComment = `Merge ${selected.map((item) => `cs${item.changesetId}`).join(', ')} from ${path.posix.basename(this.state.sourcePath)} to ${path.posix.basename(this.state.targetPath)}`;
     const comment = await vscode.window.showInputBox({
@@ -325,53 +326,161 @@ export class ArmTfsMergeWorkbench {
     }
 
     // Always use atomic range merge (one PendMerge + one CheckIn = one changeset)
-    const ids = selected.map((c) => c.changesetId);
+    const ids = selectedByExecutionOrder.map((c) => c.changesetId);
     const from = Math.min(...ids);
     const to = Math.max(...ids);
+    const hasSingleManualResolution = selected.length === 1
+      && (resolutionItemsByChangeset.get(from) ?? []).some((item) => item.choice === 'manual');
+    const hasAnyManualResolution = selectedByExecutionOrder.some(
+      (candidate) => (resolutionItemsByChangeset.get(candidate.changesetId) ?? []).some((item) => item.choice === 'manual'),
+    );
+    const isContiguousSelection = this.isContiguousSelection(selectedByExecutionOrder);
+    const shouldExecuteSequentially = !hasSingleManualResolution
+      && selectedByExecutionOrder.length > 1
+      && (hasAnyManualResolution || !isContiguousSelection);
+    const sequentialReason = hasAnyManualResolution
+      ? 'manual conflict resolution requires one changeset at a time'
+      : 'selected changesets are not a contiguous range';
 
     // Build resolution file if there are resolved conflicts
     const allResolutionItems = this.buildAllResolutionItems();
     let resolutionFile: string | undefined;
-    if (allResolutionItems.length > 0) {
+    if (!shouldExecuteSequentially && allResolutionItems.length > 0) {
       resolutionFile = await writeResolutionFile(allResolutionItems);
     }
 
     try {
-      const response = await vscode.window.withProgress(
+      const execution = await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: `arm-tfs merge ${selected.length === 1 ? `cs${from}` : `range cs${from}~cs${to}`}`,
+          title: shouldExecuteSequentially
+            ? `arm-tfs merge sequential ${selectedByExecutionOrder.map((c) => `cs${c.changesetId}`).join(', ')}`
+            : `arm-tfs merge ${selected.length === 1 ? `cs${from}` : `range cs${from}~cs${to}`}`,
         },
         async (progress) => {
+          if (shouldExecuteSequentially) {
+            const responses: MergeExecuteResponse[] = [];
+            for (const [index, candidate] of selectedByExecutionOrder.entries()) {
+              const changesetId = candidate.changesetId;
+              const resolutionItems = resolutionItemsByChangeset.get(changesetId) ?? [];
+              const perChangesetResolutionFile = resolutionItems.length > 0
+                ? await writeResolutionFile(resolutionItems)
+                : undefined;
+              const hasManualResolution = resolutionItems.some((item) => item.choice === 'manual');
+              progress.report({
+                message: `sequential ${index + 1}/${selectedByExecutionOrder.length}: cs${changesetId}${hasManualResolution ? ' (manual)' : ''}`,
+              });
+
+              const response = hasManualResolution
+                ? await this.client.mergeExecuteJson(
+                    this.state.sourcePath,
+                    this.state.targetPath,
+                    changesetId,
+                    {
+                      comment: this.buildSequentialComment(comment, changesetId),
+                      resolutionFile: perChangesetResolutionFile,
+                      mode: 'manual',
+                    },
+                  )
+                : await this.client.mergeExecuteJson(
+                    this.state.sourcePath,
+                    this.state.targetPath,
+                    changesetId,
+                    {
+                      comment: this.buildSequentialComment(comment, changesetId),
+                      resolutionFile: perChangesetResolutionFile,
+                    },
+                  );
+              responses.push(response);
+
+              const conflictChanges = response.result.changes.filter((c) => c.status.toLowerCase() === 'conflict');
+              if (conflictChanges.length > 0) {
+                return {
+                  mode: 'sequential' as const,
+                  responses,
+                  stoppedOnConflict: true,
+                  stoppedChangesetId: changesetId,
+                };
+              }
+            }
+
+            return {
+              mode: 'sequential' as const,
+              responses,
+              stoppedOnConflict: false,
+            };
+          }
+
+          if (hasSingleManualResolution) {
+            progress.report({ message: 'server merge (manual single-changeset fallback)' });
+            const response = await this.client.mergeExecuteJson(
+              this.state.sourcePath,
+              this.state.targetPath,
+              from,
+              { comment: comment.trim() || undefined, resolutionFile, mode: 'manual' },
+            );
+            return {
+              mode: 'single-manual' as const,
+              responses: [response],
+              stoppedOnConflict: false,
+            };
+          }
+
           progress.report({ message: 'server merge (atomic)' });
-          return this.client.mergeExecuteRangeJson(
+          const response = await this.client.mergeExecuteRangeJson(
             this.state.sourcePath,
             this.state.targetPath,
             from,
             to,
             { comment: comment.trim() || undefined, resolutionFile },
           );
+          return {
+            mode: 'atomic' as const,
+            responses: [response],
+            stoppedOnConflict: false,
+          };
         },
       );
 
-      this.output.appendLine('> arm-tfs merge execute range');
-      this.output.appendLine(summarizeMergeResponse(response));
-      this.output.appendLine('');
+      if (shouldExecuteSequentially) {
+        this.output.appendLine(`> arm-tfs merge execute sequential (${sequentialReason})`);
+      }
+      for (const response of execution.responses) {
+        const hasManualResolution = response.result.changes.some((change) => change.resolution === 'manual');
+        this.output.appendLine(hasManualResolution
+          ? '> arm-tfs merge execute single --mode manual'
+          : execution.mode === 'atomic'
+            ? '> arm-tfs merge execute range'
+            : '> arm-tfs merge execute single');
+        this.output.appendLine(summarizeMergeResponse(response));
+        this.output.appendLine('');
+      }
 
-      const conflictChanges = response.result.changes.filter((c) => c.status.toLowerCase() === 'conflict');
+      const conflictResponse = execution.responses.find((response) =>
+        response.result.changes.some((c) => c.status.toLowerCase() === 'conflict'));
+      const conflictChanges = conflictResponse?.result.changes.filter((c) => c.status.toLowerCase() === 'conflict') ?? [];
       if (conflictChanges.length > 0) {
         this.mergeRangeConflicts(conflictChanges);
         this.render();
+        await this.refreshAfterExecute();
         void vscode.window.showWarningMessage(
-          `合并中止：服务器检测到 ${conflictChanges.length} 个冲突，已列入冲突列表。请解决后重试。`,
+          execution.mode === 'sequential' && execution.stoppedChangesetId
+            ? `批量合并在 cs${execution.stoppedChangesetId} 停止：服务器检测到 ${conflictChanges.length} 个冲突，已列入冲突列表。请解决后重试。`
+            : `合并中止：服务器检测到 ${conflictChanges.length} 个冲突，已列入冲突列表。请解决后重试。`,
         );
-      } else if (response.result.createdChangesetId !== null && response.result.createdChangesetId !== undefined) {
+      } else {
+        const createdChangesetIds = execution.responses
+          .map((response) => response.result.createdChangesetId)
+          .filter((value): value is number => value !== null && value !== undefined);
+        if (createdChangesetIds.length > 0) {
         await this.refreshAfterExecute();
         void vscode.window.showInformationMessage(
-          t('merge.execute.success', {
-            count: selected.length,
-            created: `cs${response.result.createdChangesetId}`,
-          }),
+          execution.mode === 'sequential'
+            ? `已按逐个 Changeset 方式完成 ${selected.length} 个选择，创建 ${createdChangesetIds.map((id) => `cs${id}`).join(', ')}。`
+            : t('merge.execute.success', {
+                count: selected.length,
+                created: `cs${createdChangesetIds[0]}`,
+              }),
         );
         this.panel.dispose();
       } else {
@@ -382,9 +491,42 @@ export class ArmTfsMergeWorkbench {
           }),
         );
       }
+      }
     } catch (error) {
       this.showError('arm-tfs merge execute', error);
     }
+  }
+
+  private isContiguousSelection(selected: MergeWorkbenchCandidate[]): boolean {
+    if (selected.length <= 1) {
+      return true;
+    }
+
+    const indexByChangesetId = new Map(
+      this.state.candidates.map((candidate, index) => [candidate.changesetId, index]),
+    );
+    const selectedIndices = selected
+      .map((candidate) => indexByChangesetId.get(candidate.changesetId))
+      .filter((index): index is number => index !== undefined)
+      .sort((a, b) => a - b);
+
+    if (selectedIndices.length !== selected.length) {
+      return false;
+    }
+
+    const first = selectedIndices[0];
+    const last = selectedIndices[selectedIndices.length - 1];
+    return (last - first + 1) === selectedIndices.length;
+  }
+
+  private buildSequentialComment(batchComment: string, changesetId: number): string {
+    const trimmed = batchComment.trim();
+    const base = `Merge cs${changesetId} from ${path.posix.basename(this.state.sourcePath)} to ${path.posix.basename(this.state.targetPath)}`;
+    if (!trimmed) {
+      return base;
+    }
+
+    return `${base} ${trimmed}`;
   }
 
   /** 把执行结果里的冲突回填到候选的 changes 上，让冲突列表显示出来供用户解决。 */

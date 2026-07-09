@@ -1487,7 +1487,7 @@ public sealed class TfvcClientService
             };
         }
 
-        warnings.Add("Changes were applied as a direct check-in (take-source) via SOAP. TFVC merge history is not recorded via this path.");
+        warnings.Add("Changes were applied as a direct check-in (take-source) path. TFVC merge history is not recorded via this path.");
 
         // Embed a structured marker so the candidate filter can detect this merge cross-workspace.
         var commentWithMarker = effectiveComment.TrimEnd()
@@ -1496,13 +1496,13 @@ public sealed class TfvcClientService
 
         var createdChangesetId = await CreateChangesetViaSoapAsync(commentWithMarker, soapMergeChanges, ct).ConfigureAwait(false);
 
-        var verifyWarnings = await VerifyMergeChangesetAppliedAsync(
+        var verification = await VerifyMergeChangesetAppliedAsync(
             createdChangesetId,
             tfvcChanges.Select(change => change.Item?.Path).Where(path => !string.IsNullOrEmpty(path)).Cast<string>().ToArray(),
             expectedContentByTarget,
             expectedDeletes,
             ct).ConfigureAwait(false);
-        warnings.AddRange(verifyWarnings);
+        warnings.AddRange(verification.Warnings);
 
         // Record in local merge-history so the candidate list clears immediately,
         // even before the target history scan picks up the comment marker.
@@ -1536,9 +1536,13 @@ public sealed class TfvcClientService
                 TargetChangeType = change.TargetChangeType,
                 TargetExists = change.TargetExists,
                 HasContent = change.HasContent,
-                Status = "created",
+                Status = verification.DeduplicatedPaths.Contains(NormalizeServerPath(change.TargetServerPath))
+                    ? "deduped"
+                    : "created",
                 Resolution = change.Resolution,
-                Note = change.Note,
+                Note = verification.DeduplicatedPaths.Contains(NormalizeServerPath(change.TargetServerPath))
+                    ? AppendMergeNote(change.Note, "Resolved content already matched the target branch, so TFS skipped writing this file into the created changeset.")
+                    : change.Note,
             }).ToList(),
             Warnings = warnings,
         };
@@ -2074,6 +2078,26 @@ public sealed class TfvcClientService
         var effectiveComment = string.IsNullOrWhiteSpace(comment)
             ? $"Merge cs#{fromChangeset}~cs#{toChangeset} from {normalizedSource} to {normalizedTarget}"
             : comment.Trim();
+        var hasManualResolution = (resolutions ?? Array.Empty<MergeExecutionResolution>())
+            .Any(item => NormalizeResolutionChoice(item.Choice) == "manual");
+
+        // Keep multi-changeset manual merges blocked for now. Single-changeset manual resolutions
+        // are handled further below by resolving source/target conflicts in the temporary SOAP
+        // workspace and then uploading the manual merged bytes for just those target files before
+        // CheckIn. That path preserves the atomic range merge flow and avoids falling back to the
+        // older direct-content checkin branch.
+        if (!dryRun && hasManualResolution)
+        {
+            if (fromChangeset != toChangeset)
+            {
+                throw new InvalidOperationException(
+                    "Manual conflict resolution in atomic range merge is currently supported only for a single source changeset. "
+                    + "Please merge one changeset at a time when using manual conflict resolution.");
+            }
+
+            // Continue through the SOAP range-merge path for single changesets so mixed
+            // source/target/manual resolutions stay in one temporary workspace.
+        }
 
         var soap = new Soap.TfvcSoapClient(_connection);
         var owner = soapOwner;
@@ -2108,6 +2132,7 @@ public sealed class TfvcClientService
                 fromChangeset, toChangeset,
                 ct).ConfigureAwait(false);
 
+            var ops = pendResult.Operations.ToList();
             var warnings = new List<string>();
             var plannedChanges = pendResult.Operations.Select(op => new MergeExecutionChange
             {
@@ -2133,6 +2158,7 @@ public sealed class TfvcClientService
                     // Try to resolve conflicts using provided resolutions
                     var resolutionBySource = BuildResolutionBySource(resolutions);
                     var resolutionByTarget = BuildResolutionByTarget(resolutions);
+                    var resolvedOps = new List<Models.Soap.SoapMergeOperation>();
                     var unresolvedConflicts = new List<Models.Soap.SoapMergeConflict>();
 
                     foreach (var conflict in pendResult.Conflicts)
@@ -2156,13 +2182,27 @@ public sealed class TfvcClientService
                             }
 
                             // Use AcceptTheirs first (makes CheckIn succeed), then apply manual content after
-                            await soap.ResolveConflictAsync(
+                            var manualResolveResult = await soap.ResolveConflictAsync(
                                 createdWs.Name, createdWs.Owner, manualConflictId, "AcceptTheirs", ct: ct).ConfigureAwait(false);
+                            resolvedOps.AddRange(manualResolveResult.Operations.Select(op =>
+                                NormalizeResolvedOperation(op, conflict, toChangeset)));
 
                             if (!string.IsNullOrEmpty(resolution.ContentBase64))
                             {
                                 manualContentFiles.Add((conflict.TargetServerItem, Convert.FromBase64String(resolution.ContentBase64)));
                             }
+                            resolvedConflictChanges.Add(new MergeExecutionChange
+                            {
+                                SourceServerPath = conflict.SourceServerItem,
+                                TargetServerPath = conflict.TargetServerItem,
+                                SourceChangesetId = toChangeset,
+                                SourceChangeType = conflict.BaseChangeType,
+                                TargetChangeType = conflict.ConflictType,
+                                Status = "resolvedManual",
+                                Resolution = "manual",
+                                TargetExists = true,
+                                Note = "SOAP Resolve accepted the source version, then arm-tfs overwrote the pending content with the manual merge result.",
+                            });
                             continue;
                         }
 
@@ -2177,6 +2217,8 @@ public sealed class TfvcClientService
                         var soapResolution = MapToSoapResolution(choice);
                         var resolveResult = await soap.ResolveConflictAsync(
                             createdWs.Name, createdWs.Owner, conflictId, soapResolution, ct: ct).ConfigureAwait(false);
+                        resolvedOps.AddRange(resolveResult.Operations.Select(op =>
+                            NormalizeResolvedOperation(op, conflict, toChangeset)));
 
                         resolvedConflictChanges.Add(new MergeExecutionChange
                         {
@@ -2234,6 +2276,11 @@ public sealed class TfvcClientService
                             }));
                         }
                     }
+
+                    if (!hasUnresolvedConflicts)
+                    {
+                        ops.AddRange(resolvedOps);
+                    }
                 }
                 else
                 {
@@ -2255,10 +2302,12 @@ public sealed class TfvcClientService
                 }
             }
 
-            if (dryRun || hasUnresolvedConflicts || pendResult.Operations.Count == 0)
+            if (dryRun || hasUnresolvedConflicts || ops.Count == 0)
             {
-                if (pendResult.Operations.Count == 0 && pendResult.Conflicts.Count == 0)
+                if (ops.Count == 0 && pendResult.Conflicts.Count == 0)
                     warnings.Add("Server returned no merge operations for the requested range. It may already be merged.");
+                else if (ops.Count == 0 && resolvedConflictChanges.Count > 0)
+                    warnings.Add("SOAP Resolve completed, but the server returned no merge operations to commit. The chosen resolutions may not require a changeset.");
 
                 return new MergeExecutionResult
                 {
@@ -2271,12 +2320,32 @@ public sealed class TfvcClientService
                     DryRun = dryRun,
                     CreatedChangesetId = null,
                     BaseInfo = mergeBase,
-                    Changes = plannedChanges,
+                    Changes = plannedChanges.Concat(resolvedConflictChanges).ToList(),
                     Warnings = warnings,
                 };
             }
 
-            var pendingChanges = pendResult.Operations.Select(op => new Models.Soap.SoapPendingChange
+            var committedOps = DeduplicateSoapMergeOperations(ops);
+            if (committedOps.Count == 0)
+            {
+                warnings.Add("All merge operations were resolved to 'target'; nothing to commit.");
+                return new MergeExecutionResult
+                {
+                    SourcePath = normalizedSource,
+                    TargetPath = normalizedTarget,
+                    SourceChangesetId = toChangeset,
+                    SourceFromChangesetId = fromChangeset,
+                    SourceToChangesetId = toChangeset,
+                    Comment = effectiveComment,
+                    DryRun = false,
+                    CreatedChangesetId = null,
+                    BaseInfo = mergeBase,
+                    Changes = resolvedConflictChanges,
+                    Warnings = warnings,
+                };
+            }
+
+            var pendingChanges = committedOps.Select(op => new Models.Soap.SoapPendingChange
             {
                 ItemId = op.ItemId,
                 ServerItem = op.TargetServerItem,
@@ -2285,6 +2354,16 @@ public sealed class TfvcClientService
                 VersionFrom = op.VersionFrom ?? fromChangeset,
                 VersionTo = op.VersionTo ?? toChangeset,
             }).ToList();
+
+            foreach (var (manualTargetPath, content) in manualContentFiles)
+            {
+                await soap.UploadFileToWorkspaceAsync(
+                    workspaceName,
+                    owner,
+                    manualTargetPath,
+                    content,
+                    ct).ConfigureAwait(false);
+            }
 
             var newChangesetId = await soap.CheckInAsync(
                 workspaceName, owner,
@@ -2420,7 +2499,7 @@ public sealed class TfvcClientService
         }
     }
 
-    private async Task<IReadOnlyList<string>> VerifyMergeChangesetAppliedAsync(
+    private async Task<MergeVerificationOutcome> VerifyMergeChangesetAppliedAsync(
         int createdChangesetId,
         IReadOnlyCollection<string> expectedTargetPaths,
         IReadOnlyDictionary<string, byte[]> expectedContentByTarget,
@@ -2428,6 +2507,7 @@ public sealed class TfvcClientService
         CancellationToken ct)
     {
         var verifyWarnings = new List<string>();
+        var deduplicatedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var createdDetail = await GetChangesetAsync(createdChangesetId, ct).ConfigureAwait(false);
         var changedPaths = (createdDetail.Changes ?? Array.Empty<TfvcChange>())
             .Select(change => change.Item?.Path)
@@ -2454,7 +2534,8 @@ public sealed class TfvcClientService
                     var actual = await DownloadFileContentAsync(missingPath, null, ct).ConfigureAwait(false);
                     if (!ContentEquals(actual, expectedContent))
                         trulyMissing.Add(missingPath);
-                    // else: target already has exact content — dedup is fine, skip
+                    else
+                        deduplicatedPaths.Add(missingPath);
                 }
                 catch
                 {
@@ -2473,6 +2554,12 @@ public sealed class TfvcClientService
 
         if (trulyMissing.Count > 0)
             throw new InvalidOperationException($"Merge verification failed: created changeset cs#{createdChangesetId} did not contain expected target path(s): {string.Join(", ", trulyMissing)}.");
+
+        if (deduplicatedPaths.Count > 0)
+        {
+            verifyWarnings.Add(
+                $"TFS skipped {deduplicatedPaths.Count} file(s) as no-op because the resolved content already matched the target branch: {string.Join(", ", deduplicatedPaths.OrderBy(path => path, StringComparer.OrdinalIgnoreCase))}.");
+        }
 
         // For files that ARE in the created changeset, the merge landed. TFS may normalize content
         // on check-in (BOM / encoding / line-ending conversion), so a byte-level mismatch here is
@@ -2502,7 +2589,19 @@ public sealed class TfvcClientService
                 throw new InvalidOperationException($"Merge verification failed: target file '{targetPath}' still exists after delete merge cs#{createdChangesetId}.");
         }
 
-        return verifyWarnings;
+        return new MergeVerificationOutcome(verifyWarnings, deduplicatedPaths);
+    }
+
+    private sealed record MergeVerificationOutcome(
+        IReadOnlyList<string> Warnings,
+        IReadOnlySet<string> DeduplicatedPaths);
+
+    private static string AppendMergeNote(string? originalNote, string extraNote)
+    {
+        if (string.IsNullOrWhiteSpace(originalNote))
+            return extraNote;
+
+        return $"{originalNote} {extraNote}";
     }
 
     private async Task<TfvcBranch?> TryResolveBranchAsync(string path, CancellationToken ct)
@@ -3097,8 +3196,8 @@ public sealed class TfvcClientService
     }
 
     /// <summary>
-    /// 通过 SOAP Repository.asmx 协议创建 changeset。
-    /// 流程：CreateWorkspace → PendChanges → Upload → CheckIn → DeleteWorkspace。
+    /// 优先通过 SOAP Repository.asmx 协议创建 changeset。
+    /// 当旧服务器上的 Edit/upload.ashx 路径不兼容时，自动回退到 REST CreateChangeset。
     /// </summary>
     private async Task<int> CreateChangesetViaSoapAsync(
         string comment,
@@ -3128,6 +3227,57 @@ public sealed class TfvcClientService
             // retry once with that SOAP-provided owner instead of failing the user-facing checkin.
             return await soap.CheckInWithContentAsync(comment, authenticatedOwner, soapChanges, ct).ConfigureAwait(false);
         }
+        catch (SoapFaultException ex) when (ShouldFallbackToRestForDirectChangeset(ex))
+        {
+            return await CreateChangesetViaRestAsync(comment, changes, ct).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<int> CreateChangesetViaRestAsync(
+        string comment,
+        IReadOnlyList<(string serverPath, string changeType, byte[]? content, int? baseVersion)> changes,
+        CancellationToken ct)
+    {
+        var client = _connection.GetTfvcClient();
+        var tfvcChanges = changes.Select(change =>
+            BuildTfvcChange(
+                change.serverPath,
+                ParseDirectSoapChangeType(change.changeType),
+                change.content,
+                change.baseVersion))
+            .ToList();
+
+        var changeset = new TfvcChangeset
+        {
+            Comment = comment,
+            Changes = tfvcChanges,
+        };
+
+        var result = await client.CreateChangesetAsync(changeset, cancellationToken: ct).ConfigureAwait(false);
+        return result.ChangesetId;
+    }
+
+    private static VersionControlChangeType ParseDirectSoapChangeType(string changeType) =>
+        changeType switch
+        {
+            "Add" => VersionControlChangeType.Add,
+            "Edit" => VersionControlChangeType.Edit,
+            "Delete" => VersionControlChangeType.Delete,
+            "Rename" => VersionControlChangeType.Rename,
+            "Undelete" => VersionControlChangeType.Undelete,
+            "Branch" => VersionControlChangeType.Branch,
+            _ => VersionControlChangeType.None,
+        };
+
+    private static bool ShouldFallbackToRestForDirectChangeset(SoapFaultException ex)
+    {
+        if (string.Equals(ex.Method, "UploadFile", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return ex.FaultMessage.Contains("ItemNotCheckedOutException", StringComparison.OrdinalIgnoreCase)
+            || ex.FaultMessage.Contains("未签出", StringComparison.OrdinalIgnoreCase)
+            || ex.FaultMessage.Contains("TeamProjectNotFoundException", StringComparison.OrdinalIgnoreCase)
+            || ex.FaultMessage.Contains("团队项目不存在", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
