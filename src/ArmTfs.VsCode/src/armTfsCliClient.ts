@@ -306,7 +306,7 @@ export class ArmTfsCliClient {
     sourcePath: string,
     targetPath: string,
     changesetId: number,
-    options?: { comment?: string; dryRun?: boolean; resolutionFile?: string; mode?: string },
+    options?: { comment?: string; dryRun?: boolean; resolutionFile?: string; mode?: string; force?: boolean },
     runOptions?: ArmTfsRunOptions,
   ): Promise<string> {
     const args = [
@@ -328,6 +328,9 @@ export class ArmTfsCliClient {
     if (options?.resolutionFile) {
       args.push('--resolution-file', options.resolutionFile);
     }
+    if (options?.force) {
+      args.push('--force');
+    }
     if (options?.mode) {
       args.push('--mode', options.mode);
     }
@@ -339,7 +342,7 @@ export class ArmTfsCliClient {
     sourcePath: string,
     targetPath: string,
     changesetId: number,
-    options?: { comment?: string; dryRun?: boolean; resolutionFile?: string; mode?: string },
+    options?: { comment?: string; dryRun?: boolean; resolutionFile?: string; mode?: string; force?: boolean },
     runOptions?: ArmTfsRunOptions,
   ): Promise<MergeExecuteResponse> {
     const args = [
@@ -363,6 +366,9 @@ export class ArmTfsCliClient {
     if (options?.resolutionFile) {
       args.push('--resolution-file', options.resolutionFile);
     }
+    if (options?.force) {
+      args.push('--force');
+    }
     if (options?.mode) {
       args.push('--mode', options.mode);
     }
@@ -375,7 +381,7 @@ export class ArmTfsCliClient {
     targetPath: string,
     fromChangesetId: number,
     toChangesetId: number,
-    options?: { comment?: string; dryRun?: boolean; resolutionFile?: string },
+    options?: { comment?: string; dryRun?: boolean; resolutionFile?: string; force?: boolean },
     runOptions?: ArmTfsRunOptions,
   ): Promise<MergeExecuteResponse> {
     const args = [
@@ -400,6 +406,45 @@ export class ArmTfsCliClient {
     }
     if (options?.resolutionFile) {
       args.push('--resolution-file', options.resolutionFile);
+    }
+    if (options?.force) {
+      args.push('--force');
+    }
+
+    return this.executeJson<MergeExecuteResponse>(args, runOptions);
+  }
+
+  mergeExecuteBatchJson(
+    sourcePath: string,
+    targetPath: string,
+    changesetIds: number[],
+    options?: { comment?: string; dryRun?: boolean; resolutionFile?: string; force?: boolean },
+    runOptions?: ArmTfsRunOptions,
+  ): Promise<MergeExecuteResponse> {
+    const args = [
+      'merge',
+      'execute',
+      '--source',
+      sourcePath,
+      '--target',
+      targetPath,
+      '--format',
+      'json',
+    ];
+    for (const changesetId of changesetIds) {
+      args.push('--changeset', String(changesetId));
+    }
+    if (options?.comment) {
+      args.push('--comment', options.comment);
+    }
+    if (options?.dryRun) {
+      args.push('--dry-run');
+    }
+    if (options?.resolutionFile) {
+      args.push('--resolution-file', options.resolutionFile);
+    }
+    if (options?.force) {
+      args.push('--force');
     }
 
     return this.executeJson<MergeExecuteResponse>(args, runOptions);

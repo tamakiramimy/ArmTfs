@@ -1053,6 +1053,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
           await this.refreshScm();
           await this.refreshAll();
         },
+        { force: true },
       );
     } catch (error) {
       this.showError('arm-tfs force merge', error);
@@ -1156,6 +1157,7 @@ export class ArmTfsSidebarController implements vscode.Disposable {
           await this.refreshScm();
           await this.refreshAll();
         },
+        { force: false },
       );
     } catch (error) {
       this.showError('arm-tfs merge', error);

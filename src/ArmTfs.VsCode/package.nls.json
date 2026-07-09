@@ -35,6 +35,7 @@
   "command.showLabel": "arm-tfs: Show Label",
   "command.showMergeBase": "arm-tfs: Show Merge Base",
   "command.showMergeCandidates": "arm-tfs: Show Merge Candidates",
+  "command.debugMergePreviewState": "arm-tfs: Debug Merge Preview State",
   "command.refreshScm": "arm-tfs: Refresh SCM",
   "command.changesRefresh": "arm-tfs: Refresh Changes",
   "command.changesCheckin": "arm-tfs: Checkin All",

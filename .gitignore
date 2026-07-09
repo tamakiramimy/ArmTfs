@@ -19,6 +19,7 @@ src/ArmTfs.VsCode/.vscodeignore
 src/ArmTfs.VsCode/arm-tfs-vscode*
 
 # AI tool caches & local memory
+.codegraph/
 .codebuddy/
 .kiro/specs/tfvc-merge-workspace-fixes/design.md
 .kiro/specs/tfvc-merge-workspace-fixes/tasks.md

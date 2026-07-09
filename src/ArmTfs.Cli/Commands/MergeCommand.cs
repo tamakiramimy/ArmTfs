@@ -98,12 +98,13 @@ public static class MergeCommand
         var cmd = new Command("execute", "Execute or preview a TFVC merge from source to target.");
         var sourceOpt = new Option<string>("--source") { Description = "Source branch or folder path ($/...)" };
         var targetOpt = new Option<string>("--target") { Description = "Target branch or folder path ($/...)" };
-        var changesetOpt = new Option<int?>("--changeset") { Description = "Single source changeset ID to merge" };
+        var changesetOpt = new Option<int[]>("--changeset") { Description = "Source changeset ID(s) to merge. Repeat the option to preserve an exact non-contiguous selection." };
         var fromOpt = new Option<int?>("--from") { Description = "First source changeset in a SOAP range merge plan (inclusive)" };
         var toOpt = new Option<int?>("--to") { Description = "Last source changeset in a SOAP range merge plan (inclusive)" };
         var commentOpt = new Option<string?>("--comment") { Description = "Comment for the created merge changeset" };
         var dryRunOpt = new Option<bool>("--dry-run") { Description = "Show the merge plan without creating a TFVC changeset" };
         var resolutionFileOpt = new Option<FileInfo?>("--resolution-file") { Description = "JSON file with per-file merge resolutions" };
+        var forceOpt = new Option<bool>("--force") { Description = "Ignore existing TFVC merge history and re-merge the selected source changeset(s)." };
         var formatOpt = new Option<string>("--format", () => "table") { Description = "Output format: table | json" };
         var modeOpt = new Option<string>("--mode", () => "soap") { Description = "Merge protocol: soap (default, real merge history via Repository.asmx). Only soap is supported." };
         var soapOwnerOpt = new Option<string?>("--soap-owner") { Description = "Owner identity for the temporary SOAP workspace. Omit to auto-resolve the authenticated user's TFVC owner GUID." };
@@ -119,6 +120,7 @@ public static class MergeCommand
         cmd.AddOption(commentOpt);
         cmd.AddOption(dryRunOpt);
         cmd.AddOption(resolutionFileOpt);
+        cmd.AddOption(forceOpt);
         cmd.AddOption(formatOpt);
         cmd.AddOption(modeOpt);
         cmd.AddOption(soapOwnerOpt);
@@ -127,12 +129,13 @@ public static class MergeCommand
         {
             var source = ctx.ParseResult.GetValueForOption(sourceOpt)!;
             var target = ctx.ParseResult.GetValueForOption(targetOpt)!;
-            var changesetId = ctx.ParseResult.GetValueForOption(changesetOpt);
+            var changesetIds = ctx.ParseResult.GetValueForOption(changesetOpt) ?? Array.Empty<int>();
             var fromChangeset = ctx.ParseResult.GetValueForOption(fromOpt);
             var toChangeset = ctx.ParseResult.GetValueForOption(toOpt);
             var comment = ctx.ParseResult.GetValueForOption(commentOpt);
             var dryRun = ctx.ParseResult.GetValueForOption(dryRunOpt);
             var resolutionFile = ctx.ParseResult.GetValueForOption(resolutionFileOpt);
+            var force = ctx.ParseResult.GetValueForOption(forceOpt);
             var format = ctx.ParseResult.GetValueForOption(formatOpt) ?? "table";
             var mode = ctx.ParseResult.GetValueForOption(modeOpt) ?? "soap";
             var soapOwner = ctx.ParseResult.GetValueForOption(soapOwnerOpt);
@@ -145,10 +148,10 @@ public static class MergeCommand
             {
                 var resolvedSource = ResolveServerPath(source);
                 var resolvedTarget = ResolveServerPath(target);
-                var hasSingle = changesetId.HasValue;
+                var hasChangesets = changesetIds.Length > 0;
                 var hasRange = fromChangeset.HasValue || toChangeset.HasValue;
-                if (hasSingle == hasRange || (hasRange && (!fromChangeset.HasValue || !toChangeset.HasValue)))
-                    throw new InvalidOperationException("Specify either --changeset, or both --from and --to.");
+                if (hasChangesets == hasRange || (hasRange && (!fromChangeset.HasValue || !toChangeset.HasValue)))
+                    throw new InvalidOperationException("Specify either one or more --changeset values, or both --from and --to.");
 
                 MergeExecutionResult result;
                 if (hasRange)
@@ -163,15 +166,21 @@ public static class MergeCommand
                         comment,
                         dryRun,
                         soapOwner: soapOwner,
-                        resolutions: resolutions).ConfigureAwait(false);
+                        resolutions: resolutions,
+                        force: force).ConfigureAwait(false);
                 }
                 else
                 {
                     var resolutions = LoadMergeResolutions(resolutionFile);
-                    result = await svc.MergeChangesetAsync(
-                        resolvedSource, resolvedTarget, changesetId!.Value, comment, dryRun, resolutions,
-                        mergeMode: mode,
-                        soapOwner: soapOwner).ConfigureAwait(false);
+                    result = changesetIds.Length == 1
+                        ? await svc.MergeChangesetAsync(
+                            resolvedSource, resolvedTarget, changesetIds[0], comment, dryRun, resolutions,
+                            mergeMode: mode,
+                            soapOwner: soapOwner,
+                            force: force).ConfigureAwait(false)
+                        : await svc.MergeChangesetsViaSoapAsync(
+                            resolvedSource, resolvedTarget, changesetIds, comment, dryRun, soapOwner, resolutions, force)
+                            .ConfigureAwait(false);
                 }
 
                 if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))

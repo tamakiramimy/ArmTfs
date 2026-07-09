@@ -2,7 +2,7 @@
   "name": "arm-tfs-vscode",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "publisher": "local",
   "engines": {
     "vscode": "^1.90.0"
@@ -12,6 +12,7 @@
   ],
   "main": "./out/extension.js",
   "activationEvents": [
+    "onStartupFinished",
     "workspaceContains:.tf/workspace.json",
     "workspaceContains:**/.tf/workspace.json",
     "workspaceContains:$tf",
@@ -221,6 +222,11 @@
       {
         "command": "armTfs.showMergeCandidates",
         "title": "%command.showMergeCandidates%",
+        "category": "arm-tfs"
+      },
+      {
+        "command": "armTfs.debugMergePreviewState",
+        "title": "%command.debugMergePreviewState%",
         "category": "arm-tfs"
       },
       {

@@ -15,6 +15,7 @@ import { ArmTfsSidebarController, ArmTfsServerExplorerController } from './sideb
 import { computeLocalPathForServerPath, discoverTfvcMappingForPath, findTfvcWorkspaceRoot, getCommandCwd } from './tfvcContext';
 import { getConfigValue, migrateArmTfsSettingsToUserConfig, setConfigValue } from './userConfig';
 import { openServerVersionDiff } from './versionedFiles';
+import { ArmTfsMergeWorkbench } from './mergeWorkbench';
 
 export interface ArmTfsExtensionApi {
   client: ArmTfsCliClient;
@@ -134,6 +135,7 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     await sidebar.initialize();
     await syncTfvcContextFromActivePath();
     uiInitialized = true;
+    void maybeRunStartupMergePreviewDebug(output);
   })();
 
   context.subscriptions.push(
@@ -810,6 +812,71 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
     );
   });
 
+  register('armTfs.debugMergePreviewState', async (input) => {
+    const sourcePath = readStringOption(input, 'sourcePath') ?? '$/C02_QM_P003_质管相关应用/MindrayApp.TeamsPortal-P_V20260515';
+    const targetPath = readStringOption(input, 'targetPath') ?? '$/C02_QM_P003_质管相关应用/MindrayApp.TeamsPortal';
+    const top = readNumberOption(input, 'top') ?? 20;
+    const scan = readNumberOption(input, 'scan') ?? 80;
+    const inspectChangesetId = readNumberOption(input, 'changesetId') ?? 214355;
+
+    const resolved = await client.describeResolvedInvocation();
+    output.appendLine(`[debug-merge-preview] resolved_cli=${resolved}`);
+    appendMergePreviewDebugEvidence(`[debug-merge-preview] resolved_cli=${resolved}`);
+
+    const normalCandidates = await client.mergeCandidates(sourcePath, targetPath, top, scan, false);
+    const normalPayload = JSON.stringify({
+      sourcePath,
+      targetPath,
+      top,
+      scan,
+      count: normalCandidates.items.length,
+      changesets: normalCandidates.items.map((item) => item.changesetId),
+    });
+    output.appendLine(`[debug-merge-preview] normal_candidates=${normalPayload}`);
+    appendMergePreviewDebugEvidence(`[debug-merge-preview] normal_candidates=${normalPayload}`);
+
+    const forceCandidates = await client.mergeCandidates(sourcePath, targetPath, top, scan, true);
+    const forcePayload = JSON.stringify({
+      sourcePath,
+      targetPath,
+      top,
+      scan,
+      count: forceCandidates.items.length,
+      changesets: forceCandidates.items.map((item) => item.changesetId),
+    });
+    output.appendLine(`[debug-merge-preview] force_candidates=${forcePayload}`);
+    appendMergePreviewDebugEvidence(`[debug-merge-preview] force_candidates=${forcePayload}`);
+
+    const forceSinglePreview = await client.mergeExecuteJson(sourcePath, targetPath, inspectChangesetId, {
+      dryRun: true,
+      force: true,
+    });
+    const singlePreviewPayload = JSON.stringify({
+      changesetId: inspectChangesetId,
+      fileCount: forceSinglePreview.result.changes.length,
+      warnings: forceSinglePreview.result.warnings,
+      conflictPaths: forceSinglePreview.result.changes
+        .filter((change) => change.status.toLowerCase() === 'conflict')
+        .map((change) => change.targetServerPath),
+    });
+    output.appendLine(`[debug-merge-preview] force_single_preview=${singlePreviewPayload}`);
+    appendMergePreviewDebugEvidence(`[debug-merge-preview] force_single_preview=${singlePreviewPayload}`);
+
+    if (readBooleanOption(input, 'openWorkbench') === true) {
+      const workbenchCandidates = await client.mergeCandidates(sourcePath, targetPath, top, scan, true);
+      appendMergePreviewDebugEvidence(`[debug-merge-preview] opening_force_workbench count=${workbenchCandidates.items.length}`);
+      await ArmTfsMergeWorkbench.open(
+        client,
+        output,
+        sourcePath,
+        targetPath,
+        workbenchCandidates,
+        async () => undefined,
+        { force: true },
+      );
+    }
+  });
+
   registerResourceCommand('armTfs.refreshScm', async () => {
     await refreshUi();
   });
@@ -842,6 +909,49 @@ export function activate(context: vscode.ExtensionContext): ArmTfsExtensionApi {
 }
 
 export function deactivate(): void {}
+
+async function maybeRunStartupMergePreviewDebug(output: vscode.OutputChannel): Promise<void> {
+  const flag = process.env.ARM_TFS_DEBUG_MERGE_PREVIEW;
+  if (flag !== '1') {
+    return;
+  }
+
+  // Give the extension host a brief moment to finish activation and connection wiring.
+  setTimeout(() => {
+    void vscode.commands.executeCommand('armTfs.debugMergePreviewState', {
+      sourcePath: '$/C02_QM_P003_质管相关应用/MindrayApp.TeamsPortal-P_V20260515',
+      targetPath: '$/C02_QM_P003_质管相关应用/MindrayApp.TeamsPortal',
+      top: 20,
+      scan: 80,
+      changesetId: 214355,
+      openWorkbench: true,
+    }).then(
+      () => appendMergePreviewDebugEvidence('[debug-merge-preview] startup command completed'),
+      (error) => appendMergePreviewDebugEvidence(`[debug-merge-preview] startup command failed: ${error instanceof Error ? error.message : `${error}`}`),
+    );
+  }, 2500);
+}
+
+function appendMergePreviewDebugEvidence(line: string): void {
+  const flag = process.env.ARM_TFS_DEBUG_MERGE_PREVIEW;
+  if (flag !== '1') {
+    return;
+  }
+
+  const customPath = process.env.ARM_TFS_DEBUG_MERGE_PREVIEW_FILE;
+  const filePath = customPath && customPath.trim()
+    ? customPath
+    : path.join(os.tmpdir(), 'arm-tfs-vscode-merge-preview-debug.log');
+
+  try {
+    mkdirSync(path.dirname(filePath), { recursive: true });
+    const existing = existsSync(filePath) ? readFileSync(filePath, 'utf8') : '';
+    const next = `${existing}${new Date().toISOString()} ${line}\n`;
+    writeFileSync(filePath, next, 'utf8');
+  } catch {
+    // Best-effort debug sink only.
+  }
+}
 
 async function runAndShow(title: string, output: vscode.OutputChannel, runner: () => Promise<unknown>): Promise<unknown> {
   try {

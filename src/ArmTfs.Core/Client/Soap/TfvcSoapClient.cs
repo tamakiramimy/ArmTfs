@@ -296,6 +296,7 @@ public sealed class TfvcSoapClient
         string targetPath,
         int? fromChangeset,
         int? toChangeset,
+        bool forceMerge = false,
         CancellationToken ct = default)
     {
         // ChangesetVersionSpec.cs is an ATTRIBUTE (not a child element), per the Repository.asmx WSDL.
@@ -305,6 +306,8 @@ public sealed class TfvcSoapClient
         var toEl = toChangeset.HasValue
             ? $@"<tns:to xsi:type=""tns:ChangesetVersionSpec"" cs=""{toChangeset.Value}"" />"
             : @"<tns:to xsi:type=""tns:LatestVersionSpec"" />";
+
+        var mergeOptions = forceMerge ? "ForceMerge" : "None";
 
         // Per WSDL: source/target are ItemSpec (complexType with item/recurse/did attributes),
         // NOT plain strings. optionsEx (int, minOccurs=1) is required and was previously omitted
@@ -316,7 +319,7 @@ public sealed class TfvcSoapClient
       <tns:target item=""{Esc(targetPath)}"" recurse=""Full"" did=""0"" />
       {fromEl}
       {toEl}
-      <tns:options>None</tns:options>
+      <tns:options>{mergeOptions}</tns:options>
       <tns:lockLevel>Unchanged</tns:lockLevel>
       <tns:optionsEx>0</tns:optionsEx>
     </tns:Merge>";
@@ -360,6 +363,34 @@ public sealed class TfvcSoapClient
         return ParseConflicts(
             doc.Descendants().Where(e => e.Name.LocalName == "Conflict"),
             unresolvedOnly: true);
+    }
+
+    /// <summary>
+    /// 查询某个 workspace 当前所有 pending changes，包含 MergeSources。
+    /// 这样客户端可以把多个离散 pend merge 汇总成一次最终 CheckIn。
+    /// </summary>
+    public async Task<IReadOnlyList<SoapPendingChange>> QueryPendingChangesForWorkspaceAsync(
+        string workspaceName,
+        string ownerName,
+        IReadOnlyList<string>? serverItems = null,
+        CancellationToken ct = default)
+    {
+        var itemSpecsXml = (serverItems is null || serverItems.Count == 0)
+            ? "<tns:itemSpecs />"
+            : "<tns:itemSpecs>" + string.Concat(serverItems.Select(item =>
+                $@"<tns:ItemSpec item=""{Esc(item)}"" recurse=""Full"" did=""0"" />")) + "</tns:itemSpecs>";
+
+        var body = $@"    <tns:QueryPendingChangesForWorkspace>
+      <tns:workspaceName>{Esc(workspaceName)}</tns:workspaceName>
+      <tns:workspaceOwner>{Esc(ownerName)}</tns:workspaceOwner>
+      {itemSpecsXml}
+      <tns:generateDownloadUrls>false</tns:generateDownloadUrls>
+      <tns:pageSize>0</tns:pageSize>
+      <tns:lastChange xsi:nil=""true"" />
+    </tns:QueryPendingChangesForWorkspace>";
+
+        var doc = await InvokeAsync("QueryPendingChangesForWorkspace", body, ct).ConfigureAwait(false);
+        return ParsePendingChanges(doc.Descendants().Where(e => e.Name.LocalName == "PendingChange"));
     }
 
     /// <summary>
@@ -456,6 +487,41 @@ public sealed class TfvcSoapClient
         return result;
     }
 
+    private static IReadOnlyList<SoapPendingChange> ParsePendingChanges(IEnumerable<XElement> pendingChanges)
+    {
+        return pendingChanges.Select(change =>
+        {
+            var mergeSources = change.Elements()
+                .FirstOrDefault(e => e.Name.LocalName == "MergeSources")?
+                .Elements()
+                .Where(e => e.Name.LocalName == "MergeSource")
+                .Select(source => new SoapMergeSourceRange
+                {
+                    ServerItem = AttrAny(source, "s") ?? string.Empty,
+                    VersionFrom = TryParseInt(AttrAny(source, "vf")) ?? 0,
+                    VersionTo = TryParseInt(AttrAny(source, "vt")) ?? 0,
+                    IsRename = string.Equals(AttrAny(source, "r"), "true", StringComparison.OrdinalIgnoreCase),
+                })
+                .Where(source => !string.IsNullOrWhiteSpace(source.ServerItem) && source.VersionTo > 0)
+                .ToList()
+                ?? new List<SoapMergeSourceRange>();
+
+            var primaryMergeSource = mergeSources.FirstOrDefault();
+
+            return new SoapPendingChange
+            {
+                ItemId = TryParseInt(AttrAny(change, "itemid")) ?? 0,
+                ServerItem = AttrAny(change, "item") ?? string.Empty,
+                ChangeType = AttrAny(change, "chg") ?? string.Empty,
+                SourceServerItem = primaryMergeSource?.ServerItem ?? AttrAny(change, "srcitem"),
+                VersionFrom = primaryMergeSource?.VersionFrom ?? TryParseInt(AttrAny(change, "svrfm")),
+                VersionTo = primaryMergeSource?.VersionTo ?? TryParseInt(AttrAny(change, "ver")),
+                VersionBase = TryParseInt(AttrAny(change, "ver")),
+                MergeSources = mergeSources,
+            };
+        }).ToList();
+    }
+
     private static string NormalizeSoapResolution(string resolution)
     {
         if (string.Equals(resolution, "AcceptTheirs", StringComparison.OrdinalIgnoreCase))
@@ -505,10 +571,26 @@ public sealed class TfvcSoapClient
         foreach (var change in changes)
         {
             var mergeSourcesXml = string.Empty;
-            if (!string.IsNullOrEmpty(change.SourceServerItem) && change.VersionTo.HasValue)
+            IReadOnlyList<SoapMergeSourceRange> mergeSources = change.MergeSources.Count > 0
+                ? change.MergeSources
+                : (!string.IsNullOrEmpty(change.SourceServerItem) && change.VersionTo.HasValue
+                    ? new[]
+                    {
+                        new SoapMergeSourceRange
+                        {
+                            ServerItem = change.SourceServerItem,
+                            VersionFrom = change.VersionFrom ?? change.VersionTo.Value,
+                            VersionTo = change.VersionTo.Value,
+                            IsRename = false,
+                        },
+                    }
+                    : Array.Empty<SoapMergeSourceRange>());
+
+            if (mergeSources.Count > 0)
             {
-                var verFrom = change.VersionFrom ?? change.VersionTo.Value;
-                mergeSourcesXml = $@"<tns:MergeSources><tns:MergeSource s=""{Esc(change.SourceServerItem)}"" vf=""{verFrom}"" vt=""{change.VersionTo.Value}"" /></tns:MergeSources>";
+                var mergeSourceXml = string.Concat(mergeSources.Select(source =>
+                    $@"<tns:MergeSource s=""{Esc(source.ServerItem)}"" vf=""{source.VersionFrom}"" vt=""{source.VersionTo}"" r=""{source.IsRename.ToString().ToLowerInvariant()}"" />"));
+                mergeSourcesXml = $@"<tns:MergeSources>{mergeSourceXml}</tns:MergeSources>";
             }
 
             var chg = string.IsNullOrEmpty(change.ChangeType) ? "Merge" : change.ChangeType;

@@ -35,6 +35,7 @@
   "command.showLabel": "arm-tfs: 查看 Label",
   "command.showMergeBase": "arm-tfs: 查看合并基线",
   "command.showMergeCandidates": "arm-tfs: 查看合并候选",
+  "command.debugMergePreviewState": "arm-tfs: 调试合并预览状态",
   "command.refreshScm": "arm-tfs: 刷新源代码管理",
   "command.changesRefresh": "arm-tfs: 刷新变更列表",
   "command.changesCheckin": "arm-tfs: 签入所有变更",

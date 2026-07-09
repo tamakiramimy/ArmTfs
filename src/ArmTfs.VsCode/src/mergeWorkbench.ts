@@ -45,6 +45,12 @@ interface MergeWorkbenchState {
   candidates: MergeWorkbenchCandidate[];
   rangeConflicts: MergePlanChange[];
   selectedChangesetId?: number;
+  previewSelectedChangesetIds: number[];
+  previewChanges: MergePlanChange[];
+  previewWarnings: string[];
+  previewLoading: boolean;
+  previewError?: string;
+  previewConflictSelectedChangesetIds: number[];
 }
 
 interface WebviewMessage {
@@ -69,6 +75,7 @@ export class ArmTfsMergeWorkbench {
     targetPath: string,
     candidateResponse: MergeCandidateResponse,
     refreshAfterExecute: () => Promise<void>,
+    options?: { force?: boolean },
   ): Promise<void> {
     const panel = vscode.window.createWebviewPanel(
       'armTfsMergeWorkbench',
@@ -80,7 +87,7 @@ export class ArmTfsMergeWorkbench {
       },
     );
 
-    const workbench = new ArmTfsMergeWorkbench(client, output, panel, refreshAfterExecute);
+    const workbench = new ArmTfsMergeWorkbench(client, output, panel, refreshAfterExecute, options?.force === true);
     await workbench.initialize(sourcePath, targetPath, candidateResponse);
   }
 
@@ -89,18 +96,25 @@ export class ArmTfsMergeWorkbench {
     targetPath: '$/',
     candidates: [],
     rangeConflicts: [],
+    previewSelectedChangesetIds: [],
+    previewChanges: [],
+    previewWarnings: [],
+    previewLoading: false,
+    previewConflictSelectedChangesetIds: [],
   };
 
   private readonly disposables: vscode.Disposable[] = [];
   private readonly conflictChecked = new Map<string, boolean>();
   private readonly conflictResolutions = new Map<string, 'source' | 'target' | 'manual'>();
   private readonly manualMergeContents = new Map<string, string>();
+  private previewRequestId = 0;
 
   private constructor(
     private readonly client: ArmTfsCliClient,
     private readonly output: vscode.OutputChannel,
     private readonly panel: vscode.WebviewPanel,
     private readonly refreshAfterExecute: () => Promise<void>,
+    private readonly forceMode: boolean,
   ) {
     this.disposables.push(
       this.panel.webview.onDidReceiveMessage((message: WebviewMessage) => {
@@ -136,6 +150,7 @@ export class ArmTfsMergeWorkbench {
             });
             const plan = await this.client.mergeExecuteJson(sourcePath, targetPath, item.changesetId, {
               dryRun: true,
+              force: this.forceMode,
             });
             completed += 1;
             progress.report({
@@ -163,32 +178,19 @@ export class ArmTfsMergeWorkbench {
         candidates: activeCandidates,
         rangeConflicts: [],
         selectedChangesetId: activeCandidates[0]?.changesetId,
+        previewSelectedChangesetIds: activeCandidates.map((candidate) => candidate.changesetId),
+        previewChanges: [],
+        previewWarnings: [],
+        previewLoading: false,
+        previewConflictSelectedChangesetIds: [],
       };
 
-      // SOAP 3-way merge plan for the whole candidate range. The per-changeset REST dry-run above
-      // is useful for mapping changes to candidates, but it can miss conflicts. A single server
-      // PendMerge over the range returns every unresolved conflict up front, so the workbench no
-      // longer discovers new conflict files halfway through executing selected changesets.
-      if (candidates.length > 0) {
-        try {
-          const ids = candidates.map((c) => c.changesetId);
-          const from = Math.min(...ids);
-          const to = Math.max(...ids);
-          const rangePlan = await this.client.mergeExecuteRangeJson(sourcePath, targetPath, from, to, {
-            dryRun: true,
-          });
-          this.mergeRangeConflicts(
-            rangePlan.result.changes.filter((change) => change.status.toLowerCase() === 'conflict'),
-          );
-        } catch (previewError) {
-          // Preview is best-effort; if it fails, fall back to REST-detected conflicts only.
-          this.output.appendLine(`merge range dry-run failed: ${getErrorMessage(previewError)}`);
-        }
-      }
+      this.logPreviewSnapshot('initialized');
 
       for (const conflict of candidates.flatMap(findConflicts)) {
         this.conflictChecked.set(conflict.id, true);
       }
+      await this.refreshSelectedPreview();
       this.render();
     } catch (error) {
       this.showError('arm-tfs merge plan', error);
@@ -204,6 +206,7 @@ export class ArmTfsMergeWorkbench {
           if (candidate && message.checked !== undefined) {
             candidate.checked = message.checked;
           }
+          await this.refreshSelectedPreview();
           this.render();
         }
         break;
@@ -215,6 +218,7 @@ export class ArmTfsMergeWorkbench {
         this.state.candidates.forEach((candidate) => {
           candidate.checked = message.checked ?? true;
         });
+        await this.refreshSelectedPreview();
         this.render();
         break;
       case 'toggleConflict':
@@ -304,7 +308,8 @@ export class ArmTfsMergeWorkbench {
       return;
     }
 
-    const unresolvedConflict = aggregateConflicts(selected).find(
+    const conflictSource = this.state.rangeConflicts.length > 0 ? this.state.rangeConflicts : this.state.previewChanges;
+    const unresolvedConflict = aggregateConflictPathsFromChanges(conflictSource).find(
       (f) => !this.conflictResolutions.has(f.targetServerPath),
     );
     if (unresolvedConflict) {
@@ -312,7 +317,6 @@ export class ArmTfsMergeWorkbench {
       return;
     }
 
-    const resolutionItemsByChangeset = this.buildResolutionItems(selected);
     const selectedByExecutionOrder = [...selected].sort((a, b) => a.changesetId - b.changesetId);
 
     const defaultComment = `Merge ${selected.map((item) => `cs${item.changesetId}`).join(', ')} from ${path.posix.basename(this.state.sourcePath)} to ${path.posix.basename(this.state.targetPath)}`;
@@ -325,27 +329,16 @@ export class ArmTfsMergeWorkbench {
       return;
     }
 
-    // Always use atomic range merge (one PendMerge + one CheckIn = one changeset)
     const ids = selectedByExecutionOrder.map((c) => c.changesetId);
     const from = Math.min(...ids);
-    const to = Math.max(...ids);
+    const previewResolutionItems = this.buildPreviewResolutionItems();
     const hasSingleManualResolution = selected.length === 1
-      && (resolutionItemsByChangeset.get(from) ?? []).some((item) => item.choice === 'manual');
-    const hasAnyManualResolution = selectedByExecutionOrder.some(
-      (candidate) => (resolutionItemsByChangeset.get(candidate.changesetId) ?? []).some((item) => item.choice === 'manual'),
-    );
-    const isContiguousSelection = this.isContiguousSelection(selectedByExecutionOrder);
-    const shouldExecuteSequentially = !hasSingleManualResolution
-      && selectedByExecutionOrder.length > 1
-      && (hasAnyManualResolution || !isContiguousSelection);
-    const sequentialReason = hasAnyManualResolution
-      ? 'manual conflict resolution requires one changeset at a time'
-      : 'selected changesets are not a contiguous range';
+      && previewResolutionItems.some((item) => item.choice === 'manual');
 
     // Build resolution file if there are resolved conflicts
-    const allResolutionItems = this.buildAllResolutionItems();
+    const allResolutionItems = previewResolutionItems;
     let resolutionFile: string | undefined;
-    if (!shouldExecuteSequentially && allResolutionItems.length > 0) {
+    if (allResolutionItems.length > 0) {
       resolutionFile = await writeResolutionFile(allResolutionItems);
     }
 
@@ -353,105 +346,56 @@ export class ArmTfsMergeWorkbench {
       const execution = await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: shouldExecuteSequentially
-            ? `arm-tfs merge sequential ${selectedByExecutionOrder.map((c) => `cs${c.changesetId}`).join(', ')}`
-            : `arm-tfs merge ${selected.length === 1 ? `cs${from}` : `range cs${from}~cs${to}`}`,
+          title: `arm-tfs merge ${selected.length === 1 ? `cs${from}` : selectedByExecutionOrder.map((c) => `cs${c.changesetId}`).join(', ')}`,
         },
         async (progress) => {
-          if (shouldExecuteSequentially) {
-            const responses: MergeExecuteResponse[] = [];
-            for (const [index, candidate] of selectedByExecutionOrder.entries()) {
-              const changesetId = candidate.changesetId;
-              const resolutionItems = resolutionItemsByChangeset.get(changesetId) ?? [];
-              const perChangesetResolutionFile = resolutionItems.length > 0
-                ? await writeResolutionFile(resolutionItems)
-                : undefined;
-              const hasManualResolution = resolutionItems.some((item) => item.choice === 'manual');
-              progress.report({
-                message: `sequential ${index + 1}/${selectedByExecutionOrder.length}: cs${changesetId}${hasManualResolution ? ' (manual)' : ''}`,
-              });
-
-              const response = hasManualResolution
-                ? await this.client.mergeExecuteJson(
-                    this.state.sourcePath,
-                    this.state.targetPath,
-                    changesetId,
-                    {
-                      comment: this.buildSequentialComment(comment, changesetId),
-                      resolutionFile: perChangesetResolutionFile,
-                      mode: 'manual',
-                    },
-                  )
-                : await this.client.mergeExecuteJson(
-                    this.state.sourcePath,
-                    this.state.targetPath,
-                    changesetId,
-                    {
-                      comment: this.buildSequentialComment(comment, changesetId),
-                      resolutionFile: perChangesetResolutionFile,
-                    },
-                  );
-              responses.push(response);
-
-              const conflictChanges = response.result.changes.filter((c) => c.status.toLowerCase() === 'conflict');
-              if (conflictChanges.length > 0) {
-                return {
-                  mode: 'sequential' as const,
-                  responses,
-                  stoppedOnConflict: true,
-                  stoppedChangesetId: changesetId,
-                };
-              }
-            }
-
-            return {
-              mode: 'sequential' as const,
-              responses,
-              stoppedOnConflict: false,
-            };
-          }
-
           if (hasSingleManualResolution) {
             progress.report({ message: 'server merge (manual single-changeset fallback)' });
             const response = await this.client.mergeExecuteJson(
               this.state.sourcePath,
               this.state.targetPath,
               from,
-              { comment: comment.trim() || undefined, resolutionFile, mode: 'manual' },
+              { comment: comment.trim() || undefined, resolutionFile, mode: 'manual', force: this.forceMode },
             );
             return {
               mode: 'single-manual' as const,
               responses: [response],
-              stoppedOnConflict: false,
+              stoppedOnConflict: false as const,
             };
           }
 
-          progress.report({ message: 'server merge (atomic)' });
-          const response = await this.client.mergeExecuteRangeJson(
-            this.state.sourcePath,
-            this.state.targetPath,
-            from,
-            to,
-            { comment: comment.trim() || undefined, resolutionFile },
-          );
+          progress.report({ message: selected.length === 1 ? 'server merge (single)' : 'server merge (atomic batch)' });
+          const response = selected.length === 1
+            ? await this.client.mergeExecuteJson(
+                this.state.sourcePath,
+                this.state.targetPath,
+                from,
+                { comment: comment.trim() || undefined, resolutionFile, force: this.forceMode },
+              )
+            : await this.client.mergeExecuteBatchJson(
+                this.state.sourcePath,
+                this.state.targetPath,
+                selectedByExecutionOrder.map((candidate) => candidate.changesetId),
+                { comment: comment.trim() || undefined, resolutionFile, force: this.forceMode },
+              );
+          const mode: 'single' | 'atomic-batch' = selected.length === 1 ? 'single' : 'atomic-batch';
           return {
-            mode: 'atomic' as const,
+            mode,
             responses: [response],
-            stoppedOnConflict: false,
+            stoppedOnConflict: false as const,
           };
         },
       );
 
-      if (shouldExecuteSequentially) {
-        this.output.appendLine(`> arm-tfs merge execute sequential (${sequentialReason})`);
-      }
       for (const response of execution.responses) {
         const hasManualResolution = response.result.changes.some((change) => change.resolution === 'manual');
         this.output.appendLine(hasManualResolution
           ? '> arm-tfs merge execute single --mode manual'
-          : execution.mode === 'atomic'
-            ? '> arm-tfs merge execute range'
-            : '> arm-tfs merge execute single');
+          : execution.mode === 'atomic-batch'
+            ? '> arm-tfs merge execute batch'
+            : execution.mode === 'single'
+              ? '> arm-tfs merge execute single'
+              : '> arm-tfs merge execute range');
         this.output.appendLine(summarizeMergeResponse(response));
         this.output.appendLine('');
       }
@@ -464,37 +408,170 @@ export class ArmTfsMergeWorkbench {
         this.render();
         await this.refreshAfterExecute();
         void vscode.window.showWarningMessage(
-          execution.mode === 'sequential' && execution.stoppedChangesetId
-            ? `批量合并在 cs${execution.stoppedChangesetId} 停止：服务器检测到 ${conflictChanges.length} 个冲突，已列入冲突列表。请解决后重试。`
-            : `合并中止：服务器检测到 ${conflictChanges.length} 个冲突，已列入冲突列表。请解决后重试。`,
+          `合并中止：服务器检测到 ${conflictChanges.length} 个冲突，已列入冲突列表。请解决后重试。`,
         );
       } else {
         const createdChangesetIds = execution.responses
           .map((response) => response.result.createdChangesetId)
           .filter((value): value is number => value !== null && value !== undefined);
         if (createdChangesetIds.length > 0) {
-        await this.refreshAfterExecute();
-        void vscode.window.showInformationMessage(
-          execution.mode === 'sequential'
-            ? `已按逐个 Changeset 方式完成 ${selected.length} 个选择，创建 ${createdChangesetIds.map((id) => `cs${id}`).join(', ')}。`
-            : t('merge.execute.success', {
-                count: selected.length,
-                created: `cs${createdChangesetIds[0]}`,
-              }),
-        );
-        this.panel.dispose();
-      } else {
-        await this.refreshAfterExecute();
-        void vscode.window.showWarningMessage(
-          t('merge.execute.noChange', {
-            changesets: selected.map((id) => `cs${id.changesetId}`).join(', '),
-          }),
-        );
-      }
+          await this.refreshAfterExecute();
+          void vscode.window.showInformationMessage(
+            t('merge.execute.success', {
+              count: selected.length,
+              created: `cs${createdChangesetIds[0]}`,
+            }),
+          );
+          this.panel.dispose();
+        } else {
+          await this.refreshAfterExecute();
+          void vscode.window.showWarningMessage(
+            t('merge.execute.noChange', {
+              changesets: selected.map((id) => `cs${id.changesetId}`).join(', '),
+            }),
+          );
+        }
       }
     } catch (error) {
       this.showError('arm-tfs merge execute', error);
     }
+  }
+
+  private async refreshSelectedPreview(): Promise<void> {
+    const selected = this.state.candidates
+      .filter((candidate) => candidate.checked)
+      .sort((a, b) => a.changesetId - b.changesetId);
+    const selectedIds = selected
+      .map((candidate) => candidate.changesetId)
+      .sort((a, b) => a - b);
+    const selectionKey = selectedIds.join(',');
+    const currentKey = this.state.previewSelectedChangesetIds.slice().sort((a, b) => a - b).join(',');
+    if (selectionKey === currentKey && (this.state.previewChanges.length > 0 || selected.length === 0 || this.state.previewError)) {
+      return;
+    }
+
+    this.previewRequestId += 1;
+    this.state.previewSelectedChangesetIds = selectedIds;
+    this.state.previewLoading = false;
+    this.state.previewError = undefined;
+    this.state.previewWarnings = [];
+    this.state.previewChanges = [];
+    this.state.rangeConflicts = [];
+    this.state.previewConflictSelectedChangesetIds = [];
+
+    if (selected.length === 0) {
+      this.logPreviewSnapshot('selection-cleared');
+      this.render();
+      return;
+    }
+
+    if (selected.length === 1) {
+      this.state.previewChanges = selected[0].changes.map((change) => ({ ...change }));
+      this.state.previewWarnings = [...selected[0].warnings];
+      this.state.previewConflictSelectedChangesetIds = selectedIds;
+      this.logPreviewSnapshot('single-selection');
+      this.render();
+      return;
+    }
+
+    this.state.previewChanges = aggregatePreviewChanges(selected);
+    this.state.previewWarnings = [
+      '当前视图按勾选 changeset 的最终落点做累计预览；真正提交仍会由服务器做原子校验。',
+    ];
+    this.state.previewConflictSelectedChangesetIds = selectedIds;
+    await this.refreshRangeConflictsForSelection(selected);
+    this.logPreviewSnapshot('multi-selection');
+    this.render();
+  }
+
+  private async refreshRangeConflictsForSelection(selected: readonly MergeWorkbenchCandidate[]): Promise<void> {
+    if (selected.length <= 1) {
+      this.state.rangeConflicts = [];
+      return;
+    }
+
+    const ordered = [...selected].sort((a, b) => a.changesetId - b.changesetId);
+    if (!ordered.length) {
+      this.state.rangeConflicts = [];
+      return;
+    }
+
+    const from = ordered[0].changesetId;
+    const to = ordered[ordered.length - 1].changesetId;
+
+    try {
+      // For multi-selection, prefer the server's real 3-way conflict preview so the workbench
+      // shows the same blocking files the eventual atomic merge will stop on.
+      const response = await this.client.mergePreviewConflictsJson(
+        this.state.sourcePath,
+        this.state.targetPath,
+        from,
+        to,
+      );
+      const conflictIds = new Set(
+        response.conflicts.map((conflict) => normalizeServerPathKey(conflict.targetServerPath)),
+      );
+      const previewChangesByPath = new Map(
+        this.state.previewChanges.map((change) => [normalizeServerPathKey(change.targetServerPath), change]),
+      );
+
+      this.state.rangeConflicts = response.conflicts.map((conflict) => {
+        const existing = previewChangesByPath.get(normalizeServerPathKey(conflict.targetServerPath));
+        return {
+          sourceServerPath: existing?.sourceServerPath ?? conflict.sourceServerPath,
+          targetServerPath: conflict.targetServerPath,
+          sourceChangesetId: existing?.sourceChangesetId ?? to,
+          sourceChangeType: existing?.sourceChangeType ?? 'Merge',
+          targetChangeType: existing?.targetChangeType ?? conflict.conflictType,
+          targetExists: existing?.targetExists ?? true,
+          hasContent: existing?.hasContent ?? false,
+          status: 'conflict',
+          note: 'Server range preview detected a real blocking conflict for the current selection.',
+        };
+      });
+
+      this.state.previewChanges = this.state.previewChanges.map((change) => {
+        const key = normalizeServerPathKey(change.targetServerPath);
+        if (!conflictIds.has(key)) {
+          return change;
+        }
+        return {
+          ...change,
+          status: 'conflict',
+          note: change.note || 'Server range preview detected a real blocking conflict for the current selection.',
+        };
+      });
+    } catch (error) {
+      this.state.previewWarnings = [
+        ...this.state.previewWarnings,
+        `服务器真实冲突预览失败，当前先显示本地累计结果：${getErrorMessage(error)}`,
+      ];
+      this.state.rangeConflicts = [];
+    }
+  }
+
+  private logPreviewSnapshot(reason: string): void {
+    const selectedIds = this.state.previewSelectedChangesetIds.slice().sort((a, b) => a - b);
+    const changes = this.state.previewChanges;
+    const conflictChanges = aggregateConflictPathsFromChanges(changes);
+    const payload = {
+      reason,
+      forceMode: this.forceMode,
+      sourcePath: this.state.sourcePath,
+      targetPath: this.state.targetPath,
+      selectedChangesetIds: selectedIds,
+      previewFileCount: new Set(changes.map((change) => normalizeServerPathKey(change.targetServerPath))).size,
+      previewChangeCount: changes.length,
+      previewConflictCount: conflictChanges.length,
+      previewConflictPaths: conflictChanges.map((change) => ({
+        sourceChangesetIds: change.changesets,
+        targetServerPath: change.targetServerPath,
+        sourceServerPath: change.sourceServerPath,
+      })),
+      previewWarnings: this.state.previewWarnings,
+    };
+    this.output.appendLine(`[merge-workbench] ${JSON.stringify(payload)}`);
+    appendRuntimeMergeDebugEvidence(`[merge-workbench] ${JSON.stringify(payload)}`);
   }
 
   private isContiguousSelection(selected: MergeWorkbenchCandidate[]): boolean {
@@ -517,16 +594,6 @@ export class ArmTfsMergeWorkbench {
     const first = selectedIndices[0];
     const last = selectedIndices[selectedIndices.length - 1];
     return (last - first + 1) === selectedIndices.length;
-  }
-
-  private buildSequentialComment(batchComment: string, changesetId: number): string {
-    const trimmed = batchComment.trim();
-    const base = `Merge cs${changesetId} from ${path.posix.basename(this.state.sourcePath)} to ${path.posix.basename(this.state.targetPath)}`;
-    if (!trimmed) {
-      return base;
-    }
-
-    return `${base} ${trimmed}`;
   }
 
   /** 把执行结果里的冲突回填到候选的 changes 上，让冲突列表显示出来供用户解决。 */
@@ -594,42 +661,33 @@ export class ArmTfsMergeWorkbench {
     return itemsByChangeset;
   }
 
-  private buildAllResolutionItems(): MergeExecutionResolutionFileItem[] {
+  private buildPreviewResolutionItems(): MergeExecutionResolutionFileItem[] {
     const items: MergeExecutionResolutionFileItem[] = [];
     const seen = new Set<string>();
+    for (const change of this.state.previewChanges) {
+      if (change.status.toLowerCase() !== 'conflict') continue;
+      const choice = this.conflictResolutions.get(change.targetServerPath);
+      if (!choice) continue;
 
-    for (const [targetPath, choice] of this.conflictResolutions) {
-      const key = targetPath.replace(/\\/g, '/').toLowerCase();
+      const key = change.targetServerPath.replace(/\\/g, '/').toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
 
-      const change = this.findConflictChangeByTarget(targetPath);
       const item: MergeExecutionResolutionFileItem = {
-        sourceServerPath: change?.sourceServerPath ?? targetPath,
-        targetServerPath: targetPath,
+        sourceServerPath: change.sourceServerPath,
+        targetServerPath: change.targetServerPath,
         choice,
       };
       if (choice === 'manual') {
-        const content = this.manualMergeContents.get(targetPath);
-        if (content !== undefined) {
-          item.contentBase64 = Buffer.from(content, 'utf8').toString('base64');
+        const content = this.manualMergeContents.get(change.targetServerPath);
+        if (content === undefined) {
+          throw new Error(`手动合并结果不存在：${change.sourceServerPath}`);
         }
+        item.contentBase64 = Buffer.from(content, 'utf8').toString('base64');
       }
       items.push(item);
     }
     return items;
-  }
-
-  private findConflictChangeByTarget(targetPath: string): MergePlanChange | undefined {
-    for (const candidate of this.state.candidates) {
-      const change = candidate.changes.find(
-        (ch) => ch.status.toLowerCase() === 'conflict' && ch.targetServerPath === targetPath,
-      );
-      if (change) return change;
-    }
-    return this.state.rangeConflicts.find(
-      (ch) => ch.targetServerPath === targetPath,
-    );
   }
 
   private async openManualMergeForConflict(conflictId: string): Promise<void> {
@@ -683,6 +741,33 @@ export class ArmTfsMergeWorkbench {
   }
 }
 
+function appendRuntimeMergeDebugEvidence(line: string): void {
+  if (process.env.ARM_TFS_DEBUG_MERGE_PREVIEW !== '1') {
+    return;
+  }
+
+  const filePath = process.env.ARM_TFS_DEBUG_MERGE_PREVIEW_FILE?.trim()
+    || path.join(os.tmpdir(), 'arm-tfs-vscode-merge-preview-debug.log');
+
+  try {
+    fs.mkdir(path.dirname(filePath), { recursive: true })
+      .then(async () => {
+        let existing = '';
+        try {
+          existing = await fs.readFile(filePath, 'utf8');
+        } catch {
+          existing = '';
+        }
+        await fs.writeFile(filePath, `${existing}${new Date().toISOString()} ${line}\n`, 'utf8');
+      })
+      .catch(() => {
+        // Best-effort only.
+      });
+  } catch {
+    // Best-effort only.
+  }
+}
+
 function renderLoadingHtml(webview: vscode.Webview): string {
   const nonce = getNonce();
   return renderShell(webview, nonce, '<main class="center">正在加载合并计划...</main>', '');
@@ -701,12 +786,28 @@ function renderWorkbenchHtml(
   manualMergeContents: ReadonlyMap<string, string>,
 ): string {
   const nonce = getNonce();
+  const checkedCandidates = state.candidates.filter((candidate) => candidate.checked);
   const selected = state.candidates.find((candidate) => candidate.changesetId === state.selectedChangesetId) ?? state.candidates[0];
-  const conflictFiles = aggregateConflicts(state.candidates);
+  const previewChanges = state.previewChanges;
+  const previewFileCount = new Set(previewChanges.map((change) => change.targetServerPath)).size;
+  const rangeConflictFiles = aggregateConflictPathsFromChanges(state.rangeConflicts);
+  const conflictFiles = rangeConflictFiles.length > 0
+    ? rangeConflictFiles
+    : aggregateConflictPathsFromChanges(previewChanges);
   const aggregatedConflictPaths = new Set(conflictFiles.map(f => f.targetServerPath.replace(/\\/g, '/').replace(/\/+$/u, '').toLowerCase()));
-  const checkedCount = state.candidates.filter((candidate) => candidate.checked).length;
+  const checkedCount = checkedCandidates.length;
   const hasUnresolvedBlocking = conflictFiles.some((f) => !conflictResolutions.has(f.targetServerPath));
-  const fileCount = aggregateFileCount(state.candidates);
+  const fileCount = previewFileCount;
+  const previewStatus = state.previewLoading
+    ? '<div class="empty">正在按当前勾选集合计算真实预览...</div>'
+    : state.previewError
+      ? `<div class="empty error">${escapeHtml(state.previewError)}</div>`
+      : '';
+  const warningHtml = state.previewWarnings.length
+    ? `<div class="bulk">${state.previewWarnings.map((warning) => `<span class="badge warn">${escapeHtml(warning)}</span>`).join('')}</div>`
+    : '';
+  const previewTitle = checkedCount > 1 ? '累计预览' : '文件变更记录';
+  const conflictTitle = checkedCount > 1 ? '累计冲突' : '冲突列表';
 
   const body = `
     <main>
@@ -730,26 +831,32 @@ function renderWorkbenchHtml(
         </section>
         <section class="pane files" id="filesPane">
           <div class="pane-title">
-            <span>文件变更记录 <span class="count">${fileCount} 个文件 · ${checkedCount} 个变更集合</span></span>
+            <span>${previewTitle} <span class="count">${fileCount} 个文件 · ${checkedCount} 个变更集合</span></span>
             <span class="pane-actions">
               <button id="expandAllFiles" title="展开全部">展开全部</button>
               <button id="collapseAllFiles" title="收缩全部">收缩全部</button>
             </span>
           </div>
+          ${warningHtml}
           <div class="list">
-            ${renderFileTree(state.candidates, state.targetPath)}
+            ${previewStatus || renderPreviewFileTree(previewChanges, state.targetPath)}
           </div>
         </section>
         <section class="pane conflicts">
           <div class="pane-title">
-            <span>冲突列表 <span class="count">${conflictFiles.length} 个冲突文件</span></span>
+            <span>${conflictTitle} <span class="count">${conflictFiles.length} 个冲突文件</span></span>
             <span class="pane-actions">
               <button data-resolution="source" title="所有冲突采用源分支">批量采用源</button>
               <button data-resolution="target" title="所有冲突采用目标分支">批量采用目标</button>
             </span>
           </div>
           <div class="list">
-            ${renderConflictTree(state.candidates, state.targetPath, conflictResolutions, manualMergeContents)}
+            ${previewStatus || renderConflictTreeFromChanges(
+              rangeConflictFiles.length > 0 ? state.rangeConflicts : previewChanges,
+              state.targetPath,
+              conflictResolutions,
+              manualMergeContents,
+            )}
           </div>
         </section>
       </section>
@@ -1145,17 +1252,63 @@ function relativeFilePath(serverPath: string, rootPath: string): string {
 function aggregateFileCount(candidates: MergeWorkbenchCandidate[]): number {
   const paths = new Set<string>();
   for (const c of candidates) {
-    if (!c.checked) continue;
     for (const ch of c.changes) paths.add(ch.targetServerPath);
   }
   return paths.size;
+}
+
+function buildFileTreeFromChanges(changes: readonly MergePlanChange[], targetPath: string): FileTreeNode {
+  const root: FileTreeNode = { name: '', children: new Map(), files: [] };
+  const byPath = new Map<string, AggregatedFile>();
+  for (const ch of changes) {
+    const existing = byPath.get(ch.targetServerPath);
+    if (existing) {
+      if (!existing.changesets.includes(ch.sourceChangesetId)) existing.changesets.push(ch.sourceChangesetId);
+      if (ch.sourceChangesetId >= existing.sourceChangesetId) {
+        existing.sourceServerPath = ch.sourceServerPath;
+        existing.sourceChangeType = ch.sourceChangeType;
+        existing.targetChangeType = ch.targetChangeType;
+        existing.status = ch.status;
+        existing.note = ch.note;
+        existing.sourceChangesetId = ch.sourceChangesetId;
+        existing.targetExists = ch.targetExists;
+      }
+    } else {
+      byPath.set(ch.targetServerPath, {
+        targetServerPath: ch.targetServerPath,
+        sourceServerPath: ch.sourceServerPath,
+        sourceChangeType: ch.sourceChangeType,
+        targetChangeType: ch.targetChangeType,
+        status: ch.status,
+        note: ch.note,
+        sourceChangesetId: ch.sourceChangesetId,
+        targetExists: ch.targetExists,
+        changesets: [ch.sourceChangesetId],
+      });
+    }
+  }
+
+  for (const file of byPath.values()) {
+    const segments = relativeFilePath(file.targetServerPath, targetPath).split('/').filter(Boolean);
+    let node = root;
+    for (let i = 0; i < segments.length - 1; i++) {
+      const seg = segments[i];
+      let child = node.children.get(seg);
+      if (!child) {
+        child = { name: seg, children: new Map(), files: [] };
+        node.children.set(seg, child);
+      }
+      node = child;
+    }
+    node.files.push(file);
+  }
+  return root;
 }
 
 function buildFileTree(candidates: MergeWorkbenchCandidate[], targetPath: string): FileTreeNode {
   const root: FileTreeNode = { name: '', children: new Map(), files: [] };
   const byPath = new Map<string, AggregatedFile>();
   for (const cand of candidates) {
-    if (!cand.checked) continue;
     for (const ch of cand.changes) {
       const existing = byPath.get(ch.targetServerPath);
       if (existing) {
@@ -1202,6 +1355,54 @@ function buildFileTree(candidates: MergeWorkbenchCandidate[], targetPath: string
   return root;
 }
 
+function normalizeServerPathKey(serverPath: string): string {
+  return serverPath.replace(/\\/g, '/').replace(/\/+$/u, '').toLowerCase();
+}
+
+function aggregatePreviewChanges(candidates: readonly MergeWorkbenchCandidate[]): MergePlanChange[] {
+  const ordered = [...candidates].sort((a, b) => a.changesetId - b.changesetId);
+  const byPath = new Map<string, MergePlanChange>();
+  const conflictByPath = new Map<string, MergePlanChange>();
+
+  for (const candidate of ordered) {
+    for (const change of candidate.changes) {
+      const key = normalizeServerPathKey(change.targetServerPath);
+      byPath.set(key, { ...change });
+      if (change.status.toLowerCase() === 'conflict') {
+        conflictByPath.set(key, { ...change });
+      }
+    }
+  }
+
+  // Preserve any conflict that appears in the selected execution chain, even if a later
+  // changeset touches the same target path without a conflict. Otherwise the cumulative
+  // preview can hide real blocking files that still stop the eventual batch execution.
+  for (const [key, conflict] of conflictByPath) {
+    const current = byPath.get(key);
+    if (!current) {
+      byPath.set(key, { ...conflict, status: 'conflict' });
+      continue;
+    }
+    if (current.status.toLowerCase() === 'conflict') {
+      continue;
+    }
+    byPath.set(key, {
+      ...current,
+      status: 'conflict',
+      note: conflict.note || current.note || 'Earlier selected changeset introduces a blocking conflict on this file.',
+      sourceServerPath: conflict.sourceServerPath || current.sourceServerPath,
+      sourceChangesetId: conflict.sourceChangesetId || current.sourceChangesetId,
+      sourceChangeType: conflict.sourceChangeType || current.sourceChangeType,
+      targetChangeType: conflict.targetChangeType || current.targetChangeType,
+    });
+  }
+
+  return [...byPath.values()].sort((left, right) => {
+    const pathCompare = left.targetServerPath.localeCompare(right.targetServerPath, 'zh-CN');
+    return pathCompare !== 0 ? pathCompare : left.sourceChangesetId - right.sourceChangesetId;
+  });
+}
+
 function countFiles(node: FileTreeNode): number {
   let n = node.files.length;
   for (const child of node.children.values()) n += countFiles(child);
@@ -1209,10 +1410,16 @@ function countFiles(node: FileTreeNode): number {
 }
 
 function renderFileTree(candidates: MergeWorkbenchCandidate[], targetPath: string): string {
-  const checked = candidates.filter((c) => c.checked);
-  if (checked.length === 0) return '<div class="empty">勾选变更集合后将显示所有文件变更。</div>';
+  if (candidates.length === 0) return '<div class="empty">勾选变更集合后将显示所有文件变更。</div>';
   const root = buildFileTree(candidates, targetPath);
   if (countFiles(root) === 0) return '<div class="empty">勾选的变更集合没有可执行的文件变更。</div>';
+  return `<div class="tree">${renderTreeNode(root)}</div>`;
+}
+
+function renderPreviewFileTree(changes: readonly MergePlanChange[], targetPath: string): string {
+  if (changes.length === 0) return '<div class="empty">当前勾选集合没有可执行的文件变更。</div>';
+  const root = buildFileTreeFromChanges(changes, targetPath);
+  if (countFiles(root) === 0) return '<div class="empty">当前勾选集合没有可执行的文件变更。</div>';
   return `<div class="tree">${renderTreeNode(root)}</div>`;
 }
 
@@ -1225,11 +1432,9 @@ interface AggregatedConflict {
 /** 聚合所有勾选 changeset 的冲突文件，按目标路径去重（一个文件只出现一次）。 */
 function aggregateConflicts(
   candidates: MergeWorkbenchCandidate[],
-  rangeConflicts: readonly MergePlanChange[] = [],
 ): AggregatedConflict[] {
   const byPath = new Map<string, AggregatedConflict>();
   for (const cand of candidates) {
-    if (!cand.checked) continue;
     for (const ch of cand.changes) {
       if (ch.status.toLowerCase() !== 'conflict') continue;
       const existing = byPath.get(ch.targetServerPath);
@@ -1244,13 +1449,23 @@ function aggregateConflicts(
       }
     }
   }
-  // Include range conflicts that aren't already tracked by candidate changes
-  for (const rc of rangeConflicts) {
-    if (!byPath.has(rc.targetServerPath)) {
-      byPath.set(rc.targetServerPath, {
-        targetServerPath: rc.targetServerPath,
-        sourceServerPath: rc.sourceServerPath,
-        changesets: [],
+  return [...byPath.values()];
+}
+
+function aggregateConflictPathsFromChanges(changes: readonly MergePlanChange[]): AggregatedConflict[] {
+  const byPath = new Map<string, AggregatedConflict>();
+  for (const change of changes) {
+    if (change.status.toLowerCase() !== 'conflict') continue;
+    const existing = byPath.get(change.targetServerPath);
+    if (existing) {
+      if (!existing.changesets.includes(change.sourceChangesetId)) {
+        existing.changesets.push(change.sourceChangesetId);
+      }
+    } else {
+      byPath.set(change.targetServerPath, {
+        targetServerPath: change.targetServerPath,
+        sourceServerPath: change.sourceServerPath,
+        changesets: [change.sourceChangesetId],
       });
     }
   }
@@ -1306,6 +1521,73 @@ function renderConflictTree(
       </div>`;
   };
   return `<div class="tree">${renderTreeNodeWithLeaf(root, renderLeaf)}</div>`;
+}
+
+function renderConflictTreeFromChanges(
+  changes: readonly MergePlanChange[],
+  targetPath: string,
+  conflictResolutions: ReadonlyMap<string, ConflictResolution>,
+  manualMergeContents: ReadonlyMap<string, string>,
+): string {
+  const conflicts = aggregateConflictPathsFromChanges(changes);
+  if (conflicts.length === 0) return '<div class="empty">当前勾选项没有冲突。</div>';
+  const root: FileTreeNode = { name: '', children: new Map(), files: [] };
+  for (const c of conflicts) {
+    const segments = relativeFilePath(c.targetServerPath, targetPath).split('/').filter(Boolean);
+    let node = root;
+    for (let i = 0; i < segments.length - 1; i++) {
+      const seg = segments[i];
+      let child = node.children.get(seg);
+      if (!child) { child = { name: seg, children: new Map(), files: [] }; node.children.set(seg, child); }
+      node = child;
+    }
+    node.files.push({
+      targetServerPath: c.targetServerPath,
+      sourceServerPath: c.sourceServerPath,
+      sourceChangeType: 'Conflict',
+      targetChangeType: 'Conflict',
+      status: 'conflict',
+      sourceChangesetId: c.changesets[0],
+      targetExists: true,
+      changesets: c.changesets,
+    });
+  }
+  const renderLeaf = (file: AggregatedFile): string => {
+    const name = path.posix.basename(file.targetServerPath);
+    const csList = file.changesets.map((cs) => `cs${cs}`).join(', ');
+    const choice = conflictResolutions.get(file.targetServerPath);
+    const hasManual = manualMergeContents.has(file.targetServerPath);
+    return `
+      <div class="tree-file conflict-leaf is-conflict" data-conflict="${escapeAttribute(file.targetServerPath)}" data-choice="${choice ?? ''}">
+        <i class="ci-file"></i><span class="tree-file-name" title="${escapeAttribute(file.targetServerPath)}">${escapeHtml(name)}</span>
+        <span class="tree-file-cs" title="涉及的变更集合">${escapeHtml(csList)}</span>
+        ${hasManual ? '<span class="badge">已有手动结果</span>' : ''}
+        <span class="conflict-actions">
+          <button class="choice-source" data-conflict-choice="source" data-conflict="${escapeAttribute(file.targetServerPath)}">采用源</button>
+          <button class="choice-target" data-conflict-choice="target" data-conflict="${escapeAttribute(file.targetServerPath)}">采用目标</button>
+          <button class="choice-manual" data-conflict-choice="manual" data-conflict="${escapeAttribute(file.targetServerPath)}">手动合并</button>
+        </span>
+      </div>`;
+  };
+  return `<div class="tree">${renderTreeNodeWithLeaf(root, renderLeaf)}</div>`;
+}
+
+function flattenResolutionItems(
+  itemsByChangeset: ReadonlyMap<number, readonly MergeExecutionResolutionFileItem[]>,
+): MergeExecutionResolutionFileItem[] {
+  const items: MergeExecutionResolutionFileItem[] = [];
+  const seen = new Set<string>();
+  for (const changesetItems of itemsByChangeset.values()) {
+    for (const item of changesetItems) {
+      const key = item.targetServerPath.replace(/\\/g, '/').toLowerCase();
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      items.push(item);
+    }
+  }
+  return items;
 }
 
 function renderTreeNodeWithLeaf(node: FileTreeNode, renderLeaf: (f: AggregatedFile) => string): string {

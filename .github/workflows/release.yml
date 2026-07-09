@@ -1,0 +1,77 @@
+name: Build And Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version such as 0.5.3
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: src/ArmTfs.VsCode/package-lock.json
+
+      - name: Install extension dependencies
+        working-directory: src/ArmTfs.VsCode
+        run: npm ci
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION"
+
+      - name: Build release artifacts
+        env:
+          CI: true
+          INSTALL_VSIX: never
+        run: ./build-release.sh "${{ steps.version.outputs.version }}"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm-tfs-${{ steps.version.outputs.version }}
+          path: src/ArmTfs.VsCode/release/*
+          if-no-files-found: error
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ steps.version.outputs.version }}
+          files: |
+            src/ArmTfs.VsCode/release/arm-tfs-*.zip
+            src/ArmTfs.VsCode/release/arm-tfs-vscode-*.vsix
+            src/ArmTfs.VsCode/release/arm-tfs-vscode.vsix
+          generate_release_notes: true
