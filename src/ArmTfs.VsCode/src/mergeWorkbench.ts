@@ -35,6 +35,7 @@ interface MergeConflictView {
 interface MergeExecutionResolutionFileItem {
   sourceServerPath: string;
   targetServerPath: string;
+  sourceChangesetId?: number;
   choice: 'source' | 'target' | 'manual';
   contentBase64?: string;
 }
@@ -63,6 +64,7 @@ interface WebviewMessage {
   sourceServerPath?: string;
   targetServerPath?: string;
   sourceChangesetId?: number;
+  compareMode?: 'target' | 'previous';
   targetExists?: boolean;
   selectedChangesetIds?: number[];
 }
@@ -254,6 +256,7 @@ export class ArmTfsMergeWorkbench {
             message.targetServerPath,
             message.sourceChangesetId,
             message.targetExists ?? true,
+            message.compareMode ?? 'target',
           );
         }
         break;
@@ -268,8 +271,45 @@ export class ArmTfsMergeWorkbench {
     targetServerPath: string,
     sourceChangesetId: number,
     targetExists: boolean,
+    compareMode: 'target' | 'previous',
   ): Promise<void> {
     try {
+      if (compareMode === 'previous') {
+        const history = await this.client.history(sourceServerPath, 100);
+        const previous = history.items
+          .map((item) => item.changesetId)
+          .filter((id) => id < sourceChangesetId)
+          .sort((left, right) => right - left)[0];
+        if (previous === undefined) {
+          await openServerVersionDiffFromEmpty(
+            this.client,
+            {
+              serverPath: sourceServerPath,
+              version: sourceChangesetId,
+              label: `${path.posix.basename(sourceServerPath)} 当前分支 cs${sourceChangesetId}`,
+            },
+            `${path.posix.basename(sourceServerPath)}: 空白基线 -> 当前分支 cs${sourceChangesetId}`,
+          );
+          return;
+        }
+
+        await openServerVersionDiff(
+          this.client,
+          {
+            serverPath: sourceServerPath,
+            version: previous,
+            label: `${path.posix.basename(sourceServerPath)} 当前分支上一版本 cs${previous}`,
+          },
+          {
+            serverPath: sourceServerPath,
+            version: sourceChangesetId,
+            label: `${path.posix.basename(sourceServerPath)} 当前分支 cs${sourceChangesetId}`,
+          },
+          `${path.posix.basename(sourceServerPath)}: 当前分支上一版本 cs${previous} -> cs${sourceChangesetId}`,
+        );
+        return;
+      }
+
       if (!targetExists) {
         await openServerVersionDiffFromEmpty(
           this.client,
@@ -520,7 +560,9 @@ export class ArmTfsMergeWorkbench {
         return {
           sourceServerPath: existing?.sourceServerPath ?? conflict.sourceServerPath,
           targetServerPath: conflict.targetServerPath,
-          sourceChangesetId: existing?.sourceChangesetId ?? to,
+          // For an aggregated multi-changeset selection, "source" means the source branch snapshot
+          // at the end of the selected chain, not the last changeset where this file itself changed.
+          sourceChangesetId: to,
           sourceChangeType: existing?.sourceChangeType ?? 'Merge',
           targetChangeType: existing?.targetChangeType ?? conflict.conflictType,
           targetExists: existing?.targetExists ?? true,
@@ -645,6 +687,7 @@ export class ArmTfsMergeWorkbench {
         const item: MergeExecutionResolutionFileItem = {
           sourceServerPath: change.sourceServerPath,
           targetServerPath: change.targetServerPath,
+          sourceChangesetId: change.sourceChangesetId,
           choice,
         };
         if (choice === 'manual') {
@@ -664,6 +707,9 @@ export class ArmTfsMergeWorkbench {
   private buildPreviewResolutionItems(): MergeExecutionResolutionFileItem[] {
     const items: MergeExecutionResolutionFileItem[] = [];
     const seen = new Set<string>();
+    const rangeConflictByTarget = new Map(
+      this.state.rangeConflicts.map((change) => [normalizeServerPathKey(change.targetServerPath), change]),
+    );
     for (const change of this.state.previewChanges) {
       if (change.status.toLowerCase() !== 'conflict') continue;
       const choice = this.conflictResolutions.get(change.targetServerPath);
@@ -672,10 +718,12 @@ export class ArmTfsMergeWorkbench {
       const key = change.targetServerPath.replace(/\\/g, '/').toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
+      const sourceVersionChange = rangeConflictByTarget.get(normalizeServerPathKey(change.targetServerPath)) ?? change;
 
       const item: MergeExecutionResolutionFileItem = {
-        sourceServerPath: change.sourceServerPath,
+        sourceServerPath: sourceVersionChange.sourceServerPath,
         targetServerPath: change.targetServerPath,
+        sourceChangesetId: sourceVersionChange.sourceChangesetId,
         choice,
       };
       if (choice === 'manual') {
@@ -691,13 +739,11 @@ export class ArmTfsMergeWorkbench {
   }
 
   private async openManualMergeForConflict(conflictId: string): Promise<void> {
-    // conflictId is the conflict file's target server path.
-    const candidate = this.state.candidates.find((item) =>
-      item.changes.some((ch) => ch.status.toLowerCase() === 'conflict' && ch.targetServerPath === conflictId));
-    const change = candidate?.changes.find(
+    const conflictPool = this.state.rangeConflicts.length > 0 ? this.state.rangeConflicts : this.state.previewChanges;
+    const change = conflictPool.find(
       (ch) => ch.status.toLowerCase() === 'conflict' && ch.targetServerPath === conflictId,
     );
-    if (!candidate || !change) {
+    if (!change) {
       return;
     }
 
@@ -881,6 +927,7 @@ function renderWorkbenchHtml(
           sourceServerPath: button.dataset.source,
           targetServerPath: button.dataset.target,
           sourceChangesetId: Number(button.dataset.version),
+          compareMode: button.dataset.compareMode,
           targetExists: button.dataset.targetExists === 'true',
         });
       });
@@ -1427,6 +1474,7 @@ interface AggregatedConflict {
   targetServerPath: string;
   sourceServerPath: string;
   changesets: number[];
+  sourceChangesetId: number;
 }
 
 /** 聚合所有勾选 changeset 的冲突文件，按目标路径去重（一个文件只出现一次）。 */
@@ -1445,7 +1493,13 @@ function aggregateConflicts(
           targetServerPath: ch.targetServerPath,
           sourceServerPath: ch.sourceServerPath,
           changesets: [cand.changesetId],
+          sourceChangesetId: ch.sourceChangesetId,
         });
+      }
+      const current = byPath.get(ch.targetServerPath);
+      if (current && ch.sourceChangesetId >= current.sourceChangesetId) {
+        current.sourceServerPath = ch.sourceServerPath;
+        current.sourceChangesetId = ch.sourceChangesetId;
       }
     }
   }
@@ -1466,7 +1520,13 @@ function aggregateConflictPathsFromChanges(changes: readonly MergePlanChange[]):
         targetServerPath: change.targetServerPath,
         sourceServerPath: change.sourceServerPath,
         changesets: [change.sourceChangesetId],
+        sourceChangesetId: change.sourceChangesetId,
       });
+    }
+    const current = byPath.get(change.targetServerPath);
+    if (current && change.sourceChangesetId >= current.sourceChangesetId) {
+      current.sourceServerPath = change.sourceServerPath;
+      current.sourceChangesetId = change.sourceChangesetId;
     }
   }
   return [...byPath.values()];
@@ -1498,7 +1558,7 @@ function renderConflictTree(
       sourceChangeType: 'Conflict',
       targetChangeType: 'Conflict',
       status: 'conflict',
-      sourceChangesetId: c.changesets[0],
+      sourceChangesetId: c.sourceChangesetId,
       targetExists: true,
       changesets: c.changesets,
     });
@@ -1547,7 +1607,7 @@ function renderConflictTreeFromChanges(
       sourceChangeType: 'Conflict',
       targetChangeType: 'Conflict',
       status: 'conflict',
-      sourceChangesetId: c.changesets[0],
+      sourceChangesetId: c.sourceChangesetId,
       targetExists: true,
       changesets: c.changesets,
     });
@@ -1630,7 +1690,8 @@ function renderTreeNode(node: FileTreeNode): string {
         <span class="badge">${escapeHtml(file.sourceChangeType)}→${escapeHtml(file.targetChangeType)}</span>
         ${isConflict ? '<span class="badge warn">冲突</span>' : ''}
         <span class="tree-file-cs" title="涉及的变更集合">${escapeHtml(csList)}</span>
-        <button data-diff data-source="${escapeAttribute(file.sourceServerPath)}" data-target="${escapeAttribute(file.targetServerPath)}" data-version="${file.sourceChangesetId}" data-target-exists="${file.targetExists ? 'true' : 'false'}" title="打开左右文件对比">对比</button>
+        <button data-diff data-compare-mode="target" data-source="${escapeAttribute(file.sourceServerPath)}" data-target="${escapeAttribute(file.targetServerPath)}" data-version="${file.sourceChangesetId}" data-target-exists="${file.targetExists ? 'true' : 'false'}" title="跟目标分支最新版本对比">跟目标对比</button>
+        <button data-diff data-compare-mode="previous" data-source="${escapeAttribute(file.sourceServerPath)}" data-target="${escapeAttribute(file.targetServerPath)}" data-version="${file.sourceChangesetId}" data-target-exists="${file.targetExists ? 'true' : 'false'}" title="跟当前分支上一个版本对比">跟上一个版本对比</button>
       </div>`);
   }
   return items.join('');

@@ -80,6 +80,7 @@ public sealed class MergeExecutionResolution
 {
     public string SourceServerPath { get; init; } = string.Empty;
     public string TargetServerPath { get; init; } = string.Empty;
+    public int? SourceChangesetId { get; init; }
     public string Choice { get; init; } = "source";
     public string? ContentBase64 { get; init; }
 }

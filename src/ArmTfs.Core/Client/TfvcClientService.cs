@@ -1733,8 +1733,7 @@ public sealed class TfvcClientService
             + Models.MergeCommentMarker.Build(normalizedSource, sourceChangesetId, normalizedTarget);
 
         var soap = new Soap.TfvcSoapClient(_connection);
-        var resolutionBySource = BuildResolutionBySource(resolutions);
-        var resolutionByTarget = BuildResolutionByTarget(resolutions);
+        var resolutionLookup = BuildResolutionLookup(resolutions);
         var warnings = new List<string>();
 
         // Resolve the workspace owner = the authenticated user's identity GUID. TFS CreateWorkspace
@@ -1759,7 +1758,7 @@ public sealed class TfvcClientService
         // falls back to manual content copy because Repository.asmx Resolve requires a real workspace file.
         var detail = await GetChangesetAsync(sourceChangesetId, ct).ConfigureAwait(false);
         var conflictAssessments = await AssessMergeConflictsAsync(
-            detail, normalizedSource, normalizedTarget, mergeBase, resolutionBySource, ct).ConfigureAwait(false);
+            detail, normalizedSource, normalizedTarget, mergeBase, resolutionLookup.BySource, ct).ConfigureAwait(false);
 
         var unresolvedConflicts = conflictAssessments.Values
             .Where(a => a.IsConflict)
@@ -1797,7 +1796,7 @@ public sealed class TfvcClientService
         // Resolve(AcceptMerge) expects a real local workspace file that already contains the merged
         // content. This tool currently uses a temporary server workspace, so manual content still
         // falls back to the manual content copy path (mergeMode=manual, SOAP write without native merge semantics).
-        if (resolutionBySource.Values.Any(r => NormalizeResolutionChoice(r.Choice) == "manual"))
+        if (resolutionLookup.BySource.Values.Any(r => NormalizeResolutionChoice(r.Choice) == "manual"))
         {
             warnings.Add("SOAP merge fell back to manual content copy for manual conflict resolution; TFVC merge history is not recorded for this changeset. Source/target resolutions are handled via SOAP Resolve.");
             var manualResult = await MergeChangesetAsync(
@@ -1860,7 +1859,7 @@ public sealed class TfvcClientService
                 var resolvedOps = new List<Models.Soap.SoapMergeOperation>();
                 foreach (var conflict in pendResult.Conflicts)
                 {
-                    var resolution = FindResolutionForSoapConflict(conflict, resolutionBySource, resolutionByTarget);
+                    var resolution = FindResolutionForSoapConflict(conflict, resolutionLookup, sourceChangesetId);
                     var choice = NormalizeResolutionChoice(resolution?.Choice);
                     if (choice is null)
                     {
@@ -1879,6 +1878,20 @@ public sealed class TfvcClientService
                     var soapResolution = MapToSoapResolution(choice);
                     var resolveResult = await soap.ResolveConflictAsync(
                         workspaceName, owner, conflictId, soapResolution, ct: ct).ConfigureAwait(false);
+                    if (choice == "source")
+                    {
+                        var resolvedSourceSnapshotChangesetId = resolution?.SourceChangesetId ?? sourceChangesetId;
+                        await ReplaceConflictContentWithSourceAsync(
+                            soap,
+                            workspaceName,
+                            owner,
+                            conflict,
+                            resolvedSourceSnapshotChangesetId,
+                            normalizedTarget,
+                            targetLocalRoot,
+                            resolveResult.Operations,
+                            ct).ConfigureAwait(false);
+                    }
                     resolvedOps.AddRange(resolveResult.Operations.Select(op =>
                         NormalizeResolvedOperation(op, conflict, sourceChangesetId)));
                     resolvedConflictChanges.Add(new MergeExecutionChange
@@ -2034,7 +2047,7 @@ public sealed class TfvcClientService
                 TargetExists = true,
                 HasContent = false,
                 Status = "created",
-                Resolution = ResolveOperationResolution(op, resolutionBySource),
+                Resolution = ResolveOperationResolution(op, resolutionLookup.BySource),
                 Note = "SOAP merge — server-recorded merge history",
             }).ToList();
             foreach (var resolvedConflictChange in resolvedConflictChanges)
@@ -2094,6 +2107,11 @@ public sealed class TfvcClientService
 
     private sealed record SoapWorkspaceCreated(string Name, string Owner);
 
+    private sealed record ResolutionLookup(
+        IReadOnlyDictionary<string, MergeExecutionResolution> BySource,
+        IReadOnlyDictionary<string, MergeExecutionResolution> ByTarget,
+        IReadOnlyDictionary<string, MergeExecutionResolution> ByTargetAndChangeset);
+
     private static Dictionary<string, MergeExecutionResolution> BuildResolutionByTarget(
         IReadOnlyList<MergeExecutionResolution>? resolutions)
     {
@@ -2102,6 +2120,28 @@ public sealed class TfvcClientService
             .GroupBy(item => NormalizeServerPath(item.TargetServerPath), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.Last(), StringComparer.OrdinalIgnoreCase);
     }
+
+    private static Dictionary<string, MergeExecutionResolution> BuildResolutionByTargetAndChangeset(
+        IReadOnlyList<MergeExecutionResolution>? resolutions)
+    {
+        return (resolutions ?? Array.Empty<MergeExecutionResolution>())
+            .Where(item => !string.IsNullOrWhiteSpace(item.TargetServerPath) && item.SourceChangesetId.HasValue)
+            .GroupBy(
+                item => BuildTargetResolutionKey(item.TargetServerPath, item.SourceChangesetId.Value),
+                StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Last(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static ResolutionLookup BuildResolutionLookup(IReadOnlyList<MergeExecutionResolution>? resolutions)
+    {
+        return new ResolutionLookup(
+            BySource: BuildResolutionBySource(resolutions),
+            ByTarget: BuildResolutionByTarget(resolutions),
+            ByTargetAndChangeset: BuildResolutionByTargetAndChangeset(resolutions));
+    }
+
+    private static string BuildTargetResolutionKey(string targetServerPath, int sourceChangesetId) =>
+        $"{NormalizeServerPath(targetServerPath)}|{sourceChangesetId}";
 
     private static MergeExecutionResolution? FindResolutionForSoapConflict(
         Models.Soap.SoapMergeConflict conflict,
@@ -2121,6 +2161,22 @@ public sealed class TfvcClientService
         }
 
         return null;
+    }
+
+    private static MergeExecutionResolution? FindResolutionForSoapConflict(
+        Models.Soap.SoapMergeConflict conflict,
+        ResolutionLookup lookup,
+        int sourceChangesetId)
+    {
+        if (!string.IsNullOrWhiteSpace(conflict.TargetServerItem)
+            && lookup.ByTargetAndChangeset.TryGetValue(
+                BuildTargetResolutionKey(conflict.TargetServerItem, sourceChangesetId),
+                out var byTargetAndChangeset))
+        {
+            return byTargetAndChangeset;
+        }
+
+        return FindResolutionForSoapConflict(conflict, lookup.BySource, lookup.ByTarget);
     }
 
     private async Task<int> ResolveSoapConflictIdAsync(
@@ -2145,6 +2201,62 @@ public sealed class TfvcClientService
 
         var match = conflicts.FirstOrDefault(candidate => SameSoapConflict(candidate, conflict));
         return match?.ConflictId ?? 0;
+    }
+
+    private async Task ReplaceConflictContentWithSourceAsync(
+        Soap.TfvcSoapClient soap,
+        string workspaceName,
+        string owner,
+        Models.Soap.SoapMergeConflict conflict,
+        int sourceChangesetId,
+        string normalizedTarget,
+        string targetLocalRoot,
+        IReadOnlyList<Models.Soap.SoapMergeOperation> operations,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(conflict.SourceServerItem)
+            || string.IsNullOrWhiteSpace(conflict.TargetServerItem))
+        {
+            return;
+        }
+
+        var sourceContent = await DownloadFileContentAsync(
+            conflict.SourceServerItem,
+            sourceChangesetId,
+            ct).ConfigureAwait(false);
+        var targetLocalPath = MapWorkspaceServerPathToLocalPath(
+            conflict.TargetServerItem,
+            normalizedTarget,
+            targetLocalRoot);
+        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(targetLocalPath)!);
+        await File.WriteAllBytesAsync(targetLocalPath, sourceContent, ct).ConfigureAwait(false);
+
+        var pendingOp = operations.LastOrDefault(op =>
+            string.Equals(op.TargetServerItem, conflict.TargetServerItem, StringComparison.OrdinalIgnoreCase));
+        if (pendingOp is not null && pendingOp.ItemId > 0)
+        {
+            await soap.UpdateLocalVersionAsync(
+                workspaceName,
+                owner,
+                new[]
+                {
+                    new Models.Soap.SoapLocalVersionUpdate
+                    {
+                        ServerPath = conflict.TargetServerItem,
+                        LocalPath = targetLocalPath,
+                        LocalVersion = pendingOp.VersionTo ?? sourceChangesetId,
+                        ItemId = pendingOp.ItemId,
+                    },
+                },
+                ct).ConfigureAwait(false);
+        }
+
+        await soap.UploadFileToWorkspaceAsync(
+            workspaceName,
+            owner,
+            conflict.TargetServerItem,
+            sourceContent,
+            ct).ConfigureAwait(false);
     }
 
     private static bool SameSoapConflict(
@@ -2356,14 +2468,13 @@ public sealed class TfvcClientService
                 if (!dryRun && resolutions is not null && resolutions.Count > 0)
                 {
                     // Try to resolve conflicts using provided resolutions
-                    var resolutionBySource = BuildResolutionBySource(resolutions);
-                    var resolutionByTarget = BuildResolutionByTarget(resolutions);
+                    var resolutionLookup = BuildResolutionLookup(resolutions);
                     var resolvedOps = new List<Models.Soap.SoapMergeOperation>();
                     var unresolvedConflicts = new List<Models.Soap.SoapMergeConflict>();
 
                     foreach (var conflict in pendResult.Conflicts)
                     {
-                        var resolution = FindResolutionForSoapConflict(conflict, resolutionBySource, resolutionByTarget);
+                        var resolution = FindResolutionForSoapConflict(conflict, resolutionLookup, toChangeset);
                         var choice = NormalizeResolutionChoice(resolution?.Choice);
                         if (choice is null)
                         {
@@ -2456,6 +2567,20 @@ public sealed class TfvcClientService
                         var soapResolution = MapToSoapResolution(choice);
                         var resolveResult = await soap.ResolveConflictAsync(
                             createdWs.Name, createdWs.Owner, conflictId, soapResolution, ct: ct).ConfigureAwait(false);
+                        if (choice == "source")
+                        {
+                            var resolvedSourceSnapshotChangesetId = resolution?.SourceChangesetId ?? toChangeset;
+                            await ReplaceConflictContentWithSourceAsync(
+                                soap,
+                                createdWs.Name,
+                                createdWs.Owner,
+                                conflict,
+                                resolvedSourceSnapshotChangesetId,
+                                normalizedTarget,
+                                targetLocalRoot,
+                                resolveResult.Operations,
+                                ct).ConfigureAwait(false);
+                        }
                         resolvedOps.AddRange(resolveResult.Operations.Select(op =>
                             NormalizeResolvedOperation(op, conflict, toChangeset)));
 
@@ -2714,8 +2839,7 @@ public sealed class TfvcClientService
                 + "Pass --soap-owner explicitly, or ensure the PAT is valid.");
         }
 
-        var resolutionBySource = BuildResolutionBySource(resolutions);
-        var resolutionByTarget = BuildResolutionByTarget(resolutions);
+        var resolutionLookup = BuildResolutionLookup(resolutions);
             var warnings = new List<string>();
             var plannedChanges = new List<MergeExecutionChange>();
             var resolvedConflictChanges = new List<MergeExecutionChange>();
@@ -2817,7 +2941,7 @@ public sealed class TfvcClientService
                         TrackExecutionOperation(
                             operation,
                             sourceChangesetId,
-                            ResolveOperationResolution(operation, resolutionBySource),
+                            ResolveOperationResolution(operation, resolutionLookup.BySource),
                             "SOAP batch merge — server-recorded merge history");
                     }
                     continue;
@@ -2846,7 +2970,7 @@ public sealed class TfvcClientService
                     var resolvedOps = new List<Models.Soap.SoapMergeOperation>();
                     foreach (var conflict in pendResult.Conflicts)
                     {
-                    var resolution = FindResolutionForSoapConflict(conflict, resolutionBySource, resolutionByTarget);
+                    var resolution = FindResolutionForSoapConflict(conflict, resolutionLookup, sourceChangesetId);
                     var choice = NormalizeResolutionChoice(resolution?.Choice);
                     if (choice is null)
                     {
@@ -2949,6 +3073,20 @@ public sealed class TfvcClientService
                         conflictId,
                         MapToSoapResolution(choice),
                         ct: ct).ConfigureAwait(false);
+                    if (choice == "source")
+                    {
+                        var resolvedSourceSnapshotChangesetId = resolution?.SourceChangesetId ?? sourceChangesetId;
+                        await ReplaceConflictContentWithSourceAsync(
+                            soap,
+                            createdWs.Name,
+                            createdWs.Owner,
+                            conflict,
+                            resolvedSourceSnapshotChangesetId,
+                            normalizedTarget,
+                            targetLocalRoot,
+                            resolveResult.Operations,
+                            ct).ConfigureAwait(false);
+                    }
                     resolvedOps.AddRange(resolveResult.Operations.Select(op =>
                         NormalizeResolvedOperation(op, conflict, sourceChangesetId)));
                     foreach (var operation in resolveResult.Operations)
@@ -3113,8 +3251,8 @@ public sealed class TfvcClientService
                 HasContent = false,
                 Status = "created",
                 Resolution = executionByTarget.TryGetValue(NormalizeServerPath(change.ServerItem), out accumulator)
-                    ? accumulator.Resolution ?? ResolvePendingChangeResolution(change, resolutionBySource)
-                    : ResolvePendingChangeResolution(change, resolutionBySource),
+                    ? accumulator.Resolution ?? ResolvePendingChangeResolution(change, resolutionLookup.BySource)
+                    : ResolvePendingChangeResolution(change, resolutionLookup.BySource),
                 Note = executionByTarget.TryGetValue(NormalizeServerPath(change.ServerItem), out accumulator)
                     ? accumulator.Note ?? "SOAP batch merge — server-recorded merge history"
                     : "SOAP batch merge — server-recorded merge history",
