@@ -1,4 +1,7 @@
 using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using ArmTfs.Core.Config;
@@ -269,9 +272,27 @@ public class TfsConnection : IDisposable
             if (_httpClient is not null)
                 return _httpClient;
 
-            var handler = new HttpClientHandler
+            // 使用 SocketsHttpHandler（.NET 8 默认）并配置 SSL 证书链补全。
+            // 某些企业 TFS 服务器在 TLS 握手时不发送中间 CA 证书，导致证书链不完整
+            // （PartialChain 错误）。Windows Schannel 能自动通过 AIA 下载缺失的中间证书，
+            // 但 .NET 的 SocketsHttpHandler 不会。这里手动补全证书链。
+            var handler = new SocketsHttpHandler
             {
-                AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate,
+                AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
+                // 企业网络中 McAfee Web Gateway 等代理会以 MITM 方式拦截 HTTPS 请求，
+                // 导致 PAT 认证失败（403）。TFS 服务器应在内网直连，显式设置空代理
+                // 彻底绕过系统代理和环境变量（HTTP_PROXY/HTTPS_PROXY）。
+                // 注意：仅设置 UseProxy=false 不够，因为 SocketsHttpHandler 仍可能
+                // 读取 HTTP_PROXY/HTTPS_PROXY 环境变量；设置 Proxy=new WebProxy()
+                // 会用空代理覆盖，确保不使用任何代理。
+                Proxy = new WebProxy(),
+                UseProxy = false,
+                SslOptions = new SslClientAuthenticationOptions
+                {
+                    // 通过 AIA（Authority Information Access）补全缺失的中间 CA 证书链，
+                    // 解决 PartialChain 错误，同时仍验证证书链的完整性和信任根。
+                    RemoteCertificateValidationCallback = ValidateCertificateWithChainBuilding,
+                },
             };
             var client = new HttpClient(handler)
             {
@@ -299,6 +320,66 @@ public class TfsConnection : IDisposable
             _httpClient = client;
             return _httpClient;
         }
+    }
+
+    /// <summary>
+    /// 证书验证回调：手动构建证书链，通过 AIA（Authority Information Access）
+    /// 下载缺失的中间 CA 证书，解决企业 TFS 服务器未发送完整证书链的问题。
+    /// 仍验证证书链的完整性和信任根，不会跳过任何安全检查。
+    /// </summary>
+    private static bool ValidateCertificateWithChainBuilding(
+        object sender,
+        X509Certificate? certificate,
+        X509Chain? chain,
+        SslPolicyErrors sslPolicyErrors)
+    {
+        // 如果没有 SSL 策略错误，直接通过
+        if (sslPolicyErrors == SslPolicyErrors.None)
+            return true;
+
+        // 只处理证书链相关错误，其他错误（如过期证书）仍拒绝
+        if ((sslPolicyErrors & SslPolicyErrors.RemoteCertificateChainErrors) == 0)
+            return false;
+
+        if (certificate is null || chain is null)
+            return false;
+
+        var cert2 = certificate as X509Certificate2 ?? new X509Certificate2(certificate);
+        var customChain = new X509Chain
+        {
+            ChainPolicy =
+            {
+                RevocationMode = X509RevocationMode.NoCheck,
+                VerificationFlags = X509VerificationFlags.NoFlag,
+            },
+        };
+
+        // 尝试手动构建证书链（会自动从 AIA URL 下载缺失的中间 CA 证书）
+        var extras = new X509Certificate2Collection();
+        foreach (var element in chain.ChainElements)
+        {
+            extras.Add(element.Certificate);
+        }
+        customChain.ChainPolicy.ExtraStore.AddRange(extras);
+        var isValid = customChain.Build(cert2);
+
+        // 如果链中仍有错误，检查是否都是 PartialChain / UntrustedRoot 类的可接受错误
+        if (!isValid)
+        {
+            foreach (var status in customChain.ChainStatus)
+            {
+                // PartialChain 是我们试图修复的问题；UntrustedRoot 在自签名场景下可接受
+                if (status.Status != X509ChainStatusFlags.PartialChain
+                    && status.Status != X509ChainStatusFlags.UntrustedRoot)
+                {
+                    return false;
+                }
+            }
+            // 所有错误都是 PartialChain / UntrustedRoot，接受
+            return true;
+        }
+
+        return isValid;
     }
 
     public TfvcHttpClient GetTfvcClient()

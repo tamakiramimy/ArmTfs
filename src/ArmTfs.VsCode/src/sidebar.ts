@@ -1751,27 +1751,40 @@ function translatePlatformSharedPath(targetPath: string): string {
   }
 
   const normalized = targetPath.replace(/\\/g, '/');
-  const home = getPlatformSharedHomeDirectory();
-  if (!home) {
-    return targetPath;
-  }
 
+  // Win UNC or drive-stripped form: //Mac/Home/<user>/... or /Mac/Home/<user>/...
   for (const prefix of ['//Mac/Home/', '/Mac/Home/']) {
     if (normalized.toLowerCase().startsWith(prefix.toLowerCase())) {
-      return path.join(home, normalized.slice(prefix.length));
+      const rest = normalized.slice(prefix.length);
+      return process.platform === 'darwin'
+        ? path.join('/Users', rest)
+        : path.join('C:\\Mac\\Home', ...rest.split('/'));
     }
   }
 
-  const withoutDrive = /^[A-Za-z]:\//.test(normalized) ? normalized.slice(3) : normalized;
-  const drivePrefix = 'Mac/Home/';
-  if (withoutDrive.toLowerCase().startsWith(drivePrefix.toLowerCase())) {
-    return path.join(home, withoutDrive.slice(drivePrefix.length));
+  // Win drive-letter form: C:/Mac/Home/<user>/...  (any drive letter)
+  const driveMatch = normalized.match(/^[A-Za-z]:\/(.*)$/);
+  if (driveMatch) {
+    const withoutDrive = driveMatch[1];
+    if (withoutDrive.toLowerCase().startsWith('mac/home/')) {
+      const rest = withoutDrive.slice('mac/home/'.length);
+      return process.platform === 'darwin'
+        ? path.join('/Users', rest)
+        : path.join('C:\\Mac\\Home', ...rest.split('/'));
+    }
+  }
+
+  // macOS path written from the macOS side, opened on Windows: /Users/<user>/... → C:\Mac\Home\<user>\...
+  if (process.platform === 'win32' && normalized.toLowerCase().startsWith('/users/')) {
+    const rest = normalized.slice('/Users/'.length);
+    return path.join('C:\\Mac\\Home', ...rest.split('/'));
   }
 
   return targetPath;
 }
 
 function getPlatformSharedHomeDirectory(): string | undefined {
+  // Kept for backward compatibility. Internally translatePlatformSharedPath no longer relies on it.
   if (process.platform === 'darwin') {
     return process.env.HOME;
   }

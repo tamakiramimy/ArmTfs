@@ -447,16 +447,21 @@ public sealed class WorkspaceManager
     private int GetLocalMappingPreference(WorkspaceMapping mapping)
     {
         var score = 0;
-        var mappedPath = NormalizeLocalPath(mapping.LocalPath);
+        // 跨平台：先把映射本地路径翻译到当前平台（macOS /Users ↔ Windows C:\Mac\Home），
+        // 否则 macOS 端写入的 /Users/foo/... 在 Windows 上会被 IsWindowsDrivePath 误判，
+        // 导致 +100 平台加分失效，进而选错映射。
+        var mappedPath = NormalizeLocalPath(TranslatePlatformSharedPath(mapping.LocalPath));
         if (IsSameOrChildPath(_rootPath, mappedPath))
             score += 10_000;
 
         if (Directory.Exists(mappedPath) || File.Exists(mappedPath))
             score += 1_000;
 
-        if (OperatingSystem.IsWindows() == IsWindowsDrivePath(mapping.LocalPath))
+        // 检测映射路径是否与当前平台的"原生"路径形式一致（Windows 上应为 X:\，Unix 上应为 /...）
+        var nativePath = TranslatePlatformSharedPath(mapping.LocalPath);
+        if (OperatingSystem.IsWindows() == IsWindowsDrivePath(nativePath))
             score += 100;
-        if ((OperatingSystem.IsMacOS() || OperatingSystem.IsLinux()) && Path.IsPathRooted(mapping.LocalPath) && !IsWindowsDrivePath(mapping.LocalPath))
+        if ((OperatingSystem.IsMacOS() || OperatingSystem.IsLinux()) && Path.IsPathRooted(nativePath) && !IsWindowsDrivePath(nativePath))
             score += 100;
 
         return score;
@@ -499,6 +504,10 @@ public sealed class WorkspaceManager
         if (withoutDrive.StartsWith("Mac/Home/", StringComparison.OrdinalIgnoreCase))
             return Path.Combine(sharedHome, withoutDrive["Mac/Home/".Length..]);
 
+        // macOS path written from the macOS side, opened on Windows: /Users/<user>/... → C:\Mac\Home\<user>\...
+        if (OperatingSystem.IsWindows() && normalized.StartsWith("/Users/", StringComparison.OrdinalIgnoreCase))
+            return Path.Combine(sharedHome, normalized["/Users/".Length..]);
+
         return path;
     }
 
@@ -509,6 +518,10 @@ public sealed class WorkspaceManager
 
         if (OperatingSystem.IsWindows())
         {
+            // On Windows ARM (including Parallels shared-volume setups), the macOS home
+            // directory is exposed at C:\Mac\Home. We only return it when the directory
+            // actually exists so we never translate to a non-existent path on a pure
+            // Windows host without Parallels.
             const string windowsSharedHome = @"C:\Mac\Home";
             if (Directory.Exists(windowsSharedHome))
                 return windowsSharedHome;

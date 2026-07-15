@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { chmodSync, existsSync } from 'node:fs';
 import * as path from 'node:path';
 import { promisify } from 'node:util';
 import * as vscode from 'vscode';
@@ -697,6 +697,7 @@ export class ArmTfsCliClient {
 
       for (const executablePath of executableCandidates) {
         if (existsSync(executablePath)) {
+          ensureExecutableBit(executablePath);
           return {
             command: executablePath,
             args: commandArgs,
@@ -762,6 +763,11 @@ function normalizeConfiguredArgs(value: string[] | string): string[] {
 }
 
 function splitCommandLine(value: string): string[] {
+  // On Windows, backslash is the path separator and must NOT be treated as an
+  // escape character — otherwise paths like "C:\Users\foo\bar" get mangled into
+  // "C:Usersfoobar" by the escape-eating loop. We only honor backslash escapes
+  // inside double quotes on non-Windows platforms (POSIX shell convention).
+  const isWindows = process.platform === 'win32';
   const parts: string[] = [];
   let current = '';
   let quote: '"' | '\'' | undefined;
@@ -774,7 +780,10 @@ function splitCommandLine(value: string): string[] {
       continue;
     }
 
-    if (char === '\\') {
+    // Only treat backslash as an escape character when inside a double-quoted
+    // string on a non-Windows platform. On Windows, backslashes are path
+    // separators and must be preserved literally at all times.
+    if (char === '\\' && !isWindows && quote === '"') {
       escaping = true;
       continue;
     }
@@ -830,6 +839,7 @@ function resolvePackagedReleaseInvocation(command: string, args: string[], cwd?:
   for (const folder of getPackagedRidFolderCandidates()) {
     const executablePath = path.join(releaseRoot, folder, executableName);
     if (existsSync(executablePath)) {
+      ensureExecutableBit(executablePath);
       return {
         command: executablePath,
         args: remainingArgs,
@@ -874,4 +884,20 @@ function getPackagedRidFolderCandidates(): string[] {
   return process.arch === 'arm64'
     ? ['linux-arm64', 'linux-x64']
     : ['linux-x64', 'linux-arm64'];
+}
+
+/**
+ * Windows 构建产物（dotnet publish）复制到 macOS/Linux 共享卷后会丢失 Unix 执行位（+x），
+ * 导致 `spawn EACCES`。这里在首次使用时补上 0o755。
+ * Windows 上可执行文件扩展名为 .exe，不需要 chmod。
+ */
+function ensureExecutableBit(executablePath: string): void {
+  if (process.platform === 'win32') {
+    return;
+  }
+  try {
+    chmodSync(executablePath, 0o755);
+  } catch {
+    // chmod 失败（如只读卷）时忽略，让后续 spawn 报出真实错误
+  }
 }

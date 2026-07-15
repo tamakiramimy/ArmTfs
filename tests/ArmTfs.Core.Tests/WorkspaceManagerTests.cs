@@ -316,6 +316,139 @@ public class WorkspaceManagerTests : IDisposable
         Assert.NotEmpty(h1);
     }
 
+    // ─── 跨平台路径处理 ──────────────────────────────────────────────────────
+
+    [Fact]
+    public void NormalizeLocalPath_HandlesMixedSeparators()
+    {
+        // 路径混合使用 / 和 \ 分隔符时应能正确解析（Windows 上 GetFullPath 会规范化）
+        var mixed = _tempDir.Replace(Path.DirectorySeparatorChar, '/') + "/sub/file.cs";
+        var normalized = Path.GetFullPath(mixed);
+        Assert.Equal(Path.Combine(_tempDir, "sub", "file.cs"), normalized);
+    }
+
+    [Fact]
+    public void LocalToServerPath_HandlesBackwardSlashesInMapping()
+    {
+        // 工作区映射中的本地路径若包含反斜杠，在 macOS 上应仍能匹配由 Windows 端写入的路径
+        var mappingLocal = _tempDir.Replace('/', Path.DirectorySeparatorChar);
+        var meta = new WorkspaceMetadata
+        {
+            Name = "WS", ServerCollectionUrl = "https://tfs.example.com/tfs/DefaultCollection",
+            Mappings = new List<WorkspaceMapping>
+            {
+                new() { ServerPath = "$/Project/Main", LocalPath = mappingLocal }
+            }
+        };
+        _ws.SaveMetadata(meta);
+
+        var localFile = Path.Combine(_tempDir, "src", "MyFile.cs");
+        var serverPath = _ws.LocalToServerPath(localFile, meta);
+
+        Assert.Equal("$/Project/Main/src/MyFile.cs", serverPath);
+    }
+
+    [Fact]
+    public void ServerToLocalPath_ProducesPlatformNativeSeparators()
+    {
+        var meta = new WorkspaceMetadata
+        {
+            Name = "WS", ServerCollectionUrl = "https://tfs.example.com/tfs/DefaultCollection",
+            Mappings = new List<WorkspaceMapping>
+            {
+                new() { ServerPath = "$/Project/Main", LocalPath = _tempDir }
+            }
+        };
+
+        var localPath = _ws.ServerToLocalPath("$/Project/Main/src/MyFile.cs", meta);
+        var expected = Path.Combine(_tempDir, "src", "MyFile.cs");
+
+        Assert.Equal(expected, localPath);
+        // 不论平台，本地路径必须使用当前平台的分隔符
+        Assert.DoesNotContain(localPath!.Replace(_tempDir, ""), "/");
+    }
+
+    [Fact]
+    public void GetTrackedVersion_FindsByServerPath_WhenLocalPathUsesDifferentSeparator()
+    {
+        // 模拟跨平台场景：版本追踪文件由 Windows 端写入（使用 \），由 macOS 端读取（使用 /）
+        var meta = CreateTestWorkspace();
+        var currentLocalFile = Path.Combine(_tempDir, "src", "tracked.cs");
+        Directory.CreateDirectory(Path.GetDirectoryName(currentLocalFile)!);
+        File.WriteAllText(currentLocalFile, "// hello");
+
+        // 使用与当前平台相反的分隔符写入版本文件
+        var altSeparator = Path.DirectorySeparatorChar == '\\' ? '/' : '\\';
+        var altLocalPath = _tempDir.Replace(Path.DirectorySeparatorChar, altSeparator)
+                            + altSeparator + "src" + altSeparator + "tracked.cs";
+
+        _ws.SaveTrackedVersion(new TrackedFileVersion
+        {
+            ServerPath = "$/P/src/tracked.cs",
+            LocalPath = altLocalPath,
+            ChangesetId = 99,
+            ContentHash = "deadbeef",
+        });
+
+        var loaded = _ws.GetTrackedVersion(currentLocalFile);
+
+        Assert.NotNull(loaded);
+        Assert.Equal(99, loaded!.ChangesetId);
+        Assert.Equal(currentLocalFile, loaded.LocalPath);
+    }
+
+    [Theory]
+    [InlineData("$/Project/Main", "$/Project/Main/src/file.cs", "src/file.cs")]
+    [InlineData("$/Project/Main", "$/Project/Main", "")]
+    [InlineData("$/Project/Main/", "$/Project/Main/src/file.cs", "src/file.cs")]
+    public void LocalToServerPath_HandlesTrailingSlashInMapping(string serverPath, string fullServerPath, string expectedRelative)
+    {
+        var meta = new WorkspaceMetadata
+        {
+            Name = "WS", ServerCollectionUrl = "https://tfs.example.com/tfs/DefaultCollection",
+            Mappings = new List<WorkspaceMapping>
+            {
+                new() { ServerPath = serverPath, LocalPath = _tempDir }
+            }
+        };
+        _ws.SaveMetadata(meta);
+
+        var localFile = string.IsNullOrEmpty(expectedRelative)
+            ? _tempDir
+            : Path.Combine(_tempDir, expectedRelative.Replace('/', Path.DirectorySeparatorChar));
+        var result = _ws.LocalToServerPath(localFile, meta);
+
+        Assert.Equal(fullServerPath, result);
+    }
+
+    [Fact]
+    public void IsWindowsDrivePath_DetectsBothSeparators()
+    {
+        // Drive-letter paths should be detected regardless of separator
+        Assert.True(IsWindowsDrivePathProxy(@"C:\Users\foo"));
+        Assert.True(IsWindowsDrivePathProxy(@"C:/Users/foo"));
+        Assert.True(IsWindowsDrivePathProxy(@"D:\ArmTFS"));
+        Assert.False(IsWindowsDrivePathProxy(@"/Users/foo"));
+        Assert.False(IsWindowsDrivePathProxy(@"relative\path"));
+    }
+
+    [Fact]
+    public void FindWorkspace_WorksAcrossMixedSeparators()
+    {
+        // 创建工作区后，用混合分隔符的子路径查找应仍能找到
+        var meta = new WorkspaceMetadata
+        {
+            Name = "WS", ServerCollectionUrl = "https://tfs.example.com/tfs/DefaultCollection",
+        };
+        _ws.SaveMetadata(meta);
+
+        var mixedSubDir = (_tempDir.Replace(Path.DirectorySeparatorChar, '/') + "/sub/deep").Replace('/', Path.DirectorySeparatorChar);
+        Directory.CreateDirectory(mixedSubDir);
+
+        var found = WorkspaceManager.FindWorkspace(mixedSubDir);
+        Assert.NotNull(found);
+    }
+
     // ─── helpers ──────────────────────────────────────────────────────────────
 
     private WorkspaceMetadata CreateTestWorkspace()
@@ -330,5 +463,17 @@ public class WorkspaceManagerTests : IDisposable
         };
         _ws.SaveMetadata(meta);
         return meta;
+    }
+
+    /// <summary>
+    /// 代理调用 WorkspaceManager 的私有 IsWindowsDrivePath 方法。通过反射访问以便测试。
+    /// 该方法用于检测 Windows 驱动器号路径（如 C:\ 或 D:/），无论路径分隔符是什么。
+    /// </summary>
+    private static bool IsWindowsDrivePathProxy(string path)
+    {
+        var method = typeof(WorkspaceManager).GetMethod("IsWindowsDrivePath",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(method);
+        return (bool)method!.Invoke(null, new object[] { path })!;
     }
 }
