@@ -433,7 +433,14 @@ public sealed class WorkspaceManager
 
     private static string NormalizeLocalPath(string path)
     {
-        var fullPath = Path.GetFullPath(TranslatePlatformSharedPath(path));
+        // workspace.json may have been written on the other platform.  Path.GetFullPath
+        // does not treat the other platform's separator as a separator (for example,
+        // `\\private\\tmp\\repo` is a single filename on macOS), so normalize separators
+        // before resolving the path or building the version-cache key.
+        var platformPath = TranslatePlatformSharedPath(path)
+            .Replace('\\', Path.DirectorySeparatorChar)
+            .Replace('/', Path.DirectorySeparatorChar);
+        var fullPath = Path.GetFullPath(platformPath);
 
         if (OperatingSystem.IsMacOS() && fullPath.StartsWith("/private/tmp", StringComparison.Ordinal))
         {
@@ -490,7 +497,7 @@ public sealed class WorkspaceManager
         var normalized = path.Replace('\\', '/');
         var sharedHome = GetPlatformSharedHomeDirectory();
         if (sharedHome is null)
-            return path;
+            return normalized;
 
         foreach (var prefix in new[] { "//Mac/Home/", "/Mac/Home/" })
         {

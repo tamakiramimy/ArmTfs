@@ -202,6 +202,35 @@ public class TfvcSoapClientTests
     }
 
     [Fact]
+    public async Task QueryChangesForChangeset_requests_all_changes_without_lastItem_cursor()
+    {
+        string capturedBody = string.Empty;
+        var soap = BuildSoapWithFakeHandler(async req =>
+        {
+            capturedBody = await req.Content!.ReadAsStringAsync();
+            return CreateXmlResponse("""
+                <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+                  <soap:Body>
+                    <QueryChangesForChangesetResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                      <QueryChangesForChangesetResult>
+                        <Change type="Edit"><Item item="$/P/a.txt" type="File" cs="42" /></Change>
+                      </QueryChangesForChangesetResult>
+                    </QueryChangesForChangesetResponse>
+                  </soap:Body>
+                </soap:Envelope>
+                """);
+        });
+
+        var changes = await soap.QueryChangesForChangesetAsync(42);
+
+        Assert.Contains("<tns:pageSize>0</tns:pageSize>", capturedBody);
+        Assert.DoesNotContain("lastItem", capturedBody);
+        var change = Assert.Single(changes);
+        Assert.Equal("$/P/a.txt", change.ServerPath);
+        Assert.Equal(42, change.ItemChangesetVersion);
+    }
+
+    [Fact]
     public async Task CreateBranch_returns_changeset_id_from_response()
     {
         var soap = BuildSoapWithFakeHandler(_ => CreateXmlResponse("""
@@ -317,6 +346,29 @@ public class TfvcSoapClientTests
         Assert.Equal("Merge|Edit", ops[0].ChangeType);
         Assert.Equal(100, ops[0].VersionTo);
         Assert.Empty(result.Conflicts);
+    }
+
+    [Fact]
+    public async Task PendMerge_reconstructs_root_source_path_and_prefers_merge_changeset_version()
+    {
+        var soap = BuildSoapWithFakeHandler(_ => CreateXmlResponse("""
+            <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+              <soap:Body>
+                <MergeResponse xmlns="http://schemas.microsoft.com/TeamFoundation/2005/06/VersionControl/ClientServices/03">
+                  <MergeResult>
+                    <GetOperation itemid="555" sitem="/" titem="$/P/Tgt/Controllers/a.cs" chg="Edit Merge" sver="185609" mvfrom="214538" mvto="214538" />
+                  </MergeResult>
+                </MergeResponse>
+              </soap:Body>
+            </soap:Envelope>
+            """));
+
+        var result = await soap.PendMergeAsync("ws", "alice", "$/P/Src", "$/P/Tgt", 214538, 214538);
+
+        var operation = Assert.Single(result.Operations);
+        Assert.Equal("$/P/Src/Controllers/a.cs", operation.SourceServerItem);
+        Assert.Equal("$/P/Tgt/Controllers/a.cs", operation.TargetServerItem);
+        Assert.Equal(214538, operation.VersionTo);
     }
 
     [Fact]

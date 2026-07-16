@@ -1097,7 +1097,6 @@ public sealed class TfvcClientService
     {
         var baseInfo = await ResolveMergeBaseAsync(sourcePath, targetPath, ct).ConfigureAwait(false);
         var sourceHistory = await GetChangesetsAsync(sourcePath, top: scan, ct: ct).ConfigureAwait(false);
-        var sourceDetailCache = new Dictionary<int, TfvcChangeset>();
         IReadOnlyList<TfvcChangesetRef> targetHistory = Array.Empty<TfvcChangesetRef>();
 
         var commentTrackedIds = new HashSet<int>();
@@ -1106,53 +1105,6 @@ public sealed class TfvcClientService
         // This allows re-merging after a rollback
         if (!ignoreMergeHistory)
         {
-            // Use SOAP range merge dry-run to determine which source changesets
-            // actually need merging. Only changesets that produce file changes are candidates.
-            if (sourceHistory.Count > 0)
-            {
-                try
-                {
-                    var firstCs = sourceHistory.Last().ChangesetId;  // oldest
-                    var lastCs = sourceHistory.First().ChangesetId;  // newest
-                    var rangePlan = await MergeChangesetRangeViaSoapAsync(
-                        sourcePath, targetPath, firstCs, lastCs,
-                        dryRun: true, ct: ct).ConfigureAwait(false);
-                    if (rangePlan.Changes.Count == 0)
-                    {
-                        // Everything in the scanned range is already merged
-                        return new MergeCandidateQueryResult
-                        {
-                            BaseInfo = baseInfo,
-                            SourceHistoryScanned = sourceHistory.Count,
-                            TargetHistoryScanned = 0,
-                            SourceUniqueFloorChangesetId = GetSourceUniqueFloor(baseInfo),
-                            MergedRanges = Array.Empty<MergeSourceRange>(),
-                            Candidates = Array.Empty<MergeCandidateInfo>(),
-                        };
-                    }
-
-                    // Extract the source changeset IDs that actually need merging
-                    var neededSourceChangesets = new HashSet<int>(
-                        rangePlan.Changes
-                            .Select(c => c.SourceChangesetId)
-                            .Where(id => id > 0));
-
-                    // Filter source history to only include changesets in the needed set
-                    // or changesets NEWER than the max needed (they might have inter-dependencies)
-                    if (neededSourceChangesets.Count > 0)
-                    {
-                        var maxNeeded = neededSourceChangesets.Max();
-                        sourceHistory = sourceHistory
-                            .Where(cs => neededSourceChangesets.Contains(cs.ChangesetId) || cs.ChangesetId >= maxNeeded)
-                            .ToList();
-                    }
-                }
-                catch
-                {
-                    // Dry-run failed — fall through and show full candidate list
-                }
-            }
-
             // Lightweight comment-marker detection from target history
             targetHistory = await GetChangesetsAsync(targetPath, top: scan, ct: ct).ConfigureAwait(false);
             foreach (var targetChangeset in targetHistory)
@@ -1179,14 +1131,6 @@ public sealed class TfvcClientService
         var rollbackFloor = TryFindTargetRollbackBaselineChangesetId(targetHistory, targetPath);
         if (rollbackFloor.HasValue)
             uniqueFloor = !uniqueFloor.HasValue ? rollbackFloor : Math.Max(uniqueFloor.Value, rollbackFloor.Value);
-        // Reduce noisy force candidates to files whose current source tip still differs from the
-        // target tip. Older superseded changesets for the same file then naturally drop out.
-        var currentDiffPaths = await GetCurrentDifferingSourcePathsAsync(
-            sourcePath,
-            targetPath,
-            sourceHistory,
-            sourceDetailCache,
-            ct).ConfigureAwait(false);
         var candidates = new List<MergeCandidateInfo>();
         foreach (var changeset in sourceHistory)
         {
@@ -1202,9 +1146,7 @@ public sealed class TfvcClientService
                     continue;
             }
 
-            // Filter: this source changeset is itself a merge FROM the target branch
-            // (a "trunk → branch" merge recorded by arm-tfs). Its content originates from
-            // the target, so merging it back is redundant. Detect via its own comment marker.
+            // A marker is an inexpensive shortcut for arm-tfs-created reverse merges.
             var ownMarker = MergeCommentMarker.Parse(changeset.Comment);
             if (ownMarker is not null
                 && IsSameOrDescendantPath(targetPath, ownMarker.SourcePath)
@@ -1213,27 +1155,20 @@ public sealed class TfvcClientService
                 continue;
             }
 
-            var detail = await GetCachedChangesetAsync(changeset.ChangesetId, sourceDetailCache, ct).ConfigureAwait(false);
-            if (IsChangesetOriginatingFromTarget(detail, sourcePath, targetPath))
-                continue;
-
-            if (currentDiffPaths.Count > 0
-                && !TouchesAnyCurrentDiffPath(detail, sourcePath, currentDiffPaths))
+            if (!ignoreMergeHistory)
             {
-                continue;
-            }
-
-            // Branch metadata is not consistently available on every TFS server. As a
-            // fallback, compare the source snapshot with the target's latest content.
-            // This prevents already-synchronized branch creation changesets from being
-            // offered as merge candidates.
-            if (await IsChangesetContentCoveredByTargetAsync(
-                    detail,
+                // TFVC's merge dialog determines candidates by applying each source
+                // changeset against the target merge history. Reuse that server verdict
+                // instead of inferring from per-file versions or downloaded content.
+                var exactPlan = await MergeChangesetRangeViaSoapAsync(
                     sourcePath,
                     targetPath,
-                    ct).ConfigureAwait(false))
-            {
-                continue;
+                    changeset.ChangesetId,
+                    changeset.ChangesetId,
+                    dryRun: true,
+                    ct: ct).ConfigureAwait(false);
+                if (exactPlan.Changes.Count == 0)
+                    continue;
             }
 
             candidates.Add(new MergeCandidateInfo
@@ -1408,28 +1343,20 @@ public sealed class TfvcClientService
         var normalizedTarget = NormalizeServerPath(targetPath);
 
         // SOAP path: records real merge history on the server via Repository.asmx.
-        // Also use SOAP for dry-run to get accurate 3-way conflict detection.
+        // A single changeset is deliberately executed as a one-item range.  This keeps the
+        // dry-run and the real check-in on the same PendMerge path, so the conflict list is
+        // exclusively the server's verdict for the selected changeset.  The old single-item
+        // path performed an additional client-side 3-way content heuristic before PendMerge;
+        // on branched files that heuristic could report a file outside the selected changeset.
         if (string.Equals(mergeMode, "soap", StringComparison.OrdinalIgnoreCase))
         {
-            if (dryRun)
-            {
-                // For dry-run, delegate to range-merge SOAP with from=to=changeset
-                return await MergeChangesetRangeViaSoapAsync(
-                    normalizedSource,
-                    normalizedTarget,
-                    sourceChangesetId,
-                    sourceChangesetId,
-                    comment: null,
-                    dryRun: true,
-                    soapOwner: soapOwner,
-                    force: force,
-                    ct: ct).ConfigureAwait(false);
-            }
-            return await MergeChangesetViaSoapAsync(
+            return await MergeChangesetRangeViaSoapAsync(
                 normalizedSource,
                 normalizedTarget,
                 sourceChangesetId,
+                sourceChangesetId,
                 comment,
+                dryRun,
                 soapOwner,
                 resolutions,
                 force,
@@ -1847,7 +1774,9 @@ public sealed class TfvcClientService
                 sourceChangesetId, sourceChangesetId,
                 force,
                 ct).ConfigureAwait(false);
-            var ops = pendResult.Operations.ToList();
+            var ops = pendResult.Operations
+                .Select(operation => WithSelectedSourceChangeset(operation, sourceChangesetId))
+                .ToList();
             var resolvedConflictChanges = new List<MergeExecutionChange>();
 
             // The server's 3-way merge may have pended CONFLICTS (both sides changed the same file).
@@ -2345,6 +2274,31 @@ public sealed class TfvcClientService
             : null;
     }
 
+    /// <summary>
+    /// Replaces an operation's item-version metadata with the changeset range explicitly
+    /// selected for the merge. Repository.asmx may return <c>sver</c>, which is a file version
+    /// from the branch's ancestor rather than the selected source changeset.
+    /// </summary>
+    private static Models.Soap.SoapMergeOperation WithSelectedSourceRange(
+        Models.Soap.SoapMergeOperation operation,
+        int fromChangeset,
+        int toChangeset) =>
+        new()
+        {
+            ItemId = operation.ItemId,
+            SourceServerItem = operation.SourceServerItem,
+            TargetServerItem = operation.TargetServerItem,
+            ChangeType = operation.ChangeType,
+            VersionFrom = fromChangeset,
+            VersionTo = toChangeset,
+            IsPending = operation.IsPending,
+        };
+
+    private static Models.Soap.SoapMergeOperation WithSelectedSourceChangeset(
+        Models.Soap.SoapMergeOperation operation,
+        int sourceChangesetId) =>
+        WithSelectedSourceRange(operation, sourceChangesetId, sourceChangesetId);
+
     private static string MapWorkspaceServerPathToLocalPath(
         string serverPath,
         string mappedServerRoot,
@@ -2446,13 +2400,18 @@ public sealed class TfvcClientService
                 force,
                 ct).ConfigureAwait(false);
 
-            var ops = pendResult.Operations.ToList();
+            var ops = pendResult.Operations
+                .Select(operation => WithSelectedSourceRange(operation, fromChangeset, toChangeset))
+                .ToList();
             var warnings = new List<string>();
-            var plannedChanges = pendResult.Operations.Select(op => new MergeExecutionChange
+            var plannedChanges = ops.Select(op => new MergeExecutionChange
             {
                 SourceServerPath = op.SourceServerItem,
                 TargetServerPath = op.TargetServerItem,
-                SourceChangesetId = op.VersionTo ?? toChangeset,
+                // `sver` identifies the individual item version returned by Merge. The
+                // workbench needs the changeset selected by the user so it can retrieve
+                // the source file and its previous history from the correct branch.
+                SourceChangesetId = toChangeset,
                 SourceChangeType = op.ChangeType,
                 TargetChangeType = op.ChangeType,
                 TargetExists = !op.ChangeType.Contains("Add", StringComparison.OrdinalIgnoreCase),
@@ -2919,12 +2878,17 @@ public sealed class TfvcClientService
                     sourceChangesetId,
                     force,
                     ct).ConfigureAwait(false);
+                var operations = pendResult.Operations
+                    .Select(operation => WithSelectedSourceChangeset(operation, sourceChangesetId))
+                    .ToList();
 
-                plannedChanges.AddRange(pendResult.Operations.Select(op => new MergeExecutionChange
+                plannedChanges.AddRange(operations.Select(op => new MergeExecutionChange
                 {
                     SourceServerPath = op.SourceServerItem,
                     TargetServerPath = op.TargetServerItem,
-                    SourceChangesetId = op.VersionTo ?? sourceChangesetId,
+                    // Keep the preview tied to the selected changeset; `sver` may refer
+                    // to a pre-branch item version that does not exist on sourcePath.
+                    SourceChangesetId = sourceChangesetId,
                     SourceChangeType = op.ChangeType,
                     TargetChangeType = op.ChangeType,
                     TargetExists = !op.ChangeType.Contains("Add", StringComparison.OrdinalIgnoreCase),
@@ -2935,8 +2899,8 @@ public sealed class TfvcClientService
 
                 if (pendResult.Conflicts.Count == 0)
                 {
-                    committedOps.AddRange(pendResult.Operations);
-                    foreach (var operation in pendResult.Operations)
+                    committedOps.AddRange(operations);
+                    foreach (var operation in operations)
                     {
                         TrackExecutionOperation(
                             operation,
@@ -3159,7 +3123,7 @@ public sealed class TfvcClientService
                     return BuildResult(false, null, plannedChanges.Concat(resolvedConflictChanges).ToList());
                 }
 
-                committedOps.AddRange(pendResult.Operations);
+                committedOps.AddRange(operations);
                 committedOps.AddRange(resolvedOps);
             }
 
@@ -3889,6 +3853,25 @@ public sealed class TfvcClientService
                 change.MergeSources?.Any(source =>
                     !string.IsNullOrEmpty(source.ServerItem)
                     && IsSameOrDescendantPath(source.ServerItem, normalizedTarget)) == true);
+    }
+
+    /// <summary>
+    /// Identifies a changeset that contains only TFVC merge operations. Such a changeset was
+    /// brought into the source branch from another branch and must not be proposed as a normal
+    /// source edit when building a reverse merge candidate list.
+    /// </summary>
+    private static bool IsPureMergeChangeset(TfvcChangeset detail, string sourcePath)
+    {
+        var normalizedSource = NormalizeServerPath(sourcePath);
+        var relevantChanges = (detail.Changes ?? Array.Empty<TfvcChange>())
+            .Where(change =>
+                change.Item?.IsFolder != true
+                && !string.IsNullOrEmpty(change.Item?.Path)
+                && IsSameOrDescendantPath(change.Item.Path, normalizedSource))
+            .ToList();
+
+        return relevantChanges.Count > 0
+            && relevantChanges.All(change => change.ChangeType.HasFlag(VersionControlChangeType.Merge));
     }
 
     private async Task<TfsServerItem?> TryGetItemSnapshotAsync(

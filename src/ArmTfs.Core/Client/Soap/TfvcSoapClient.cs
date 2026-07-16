@@ -326,7 +326,9 @@ public sealed class TfvcSoapClient
 
         var doc = await InvokeAsync("Merge", body, ct).ConfigureAwait(false);
 
-        var ops = ParseGetOperations(doc.Descendants().Where(e => e.Name.LocalName == "GetOperation"));
+        var ops = ParseGetOperations(doc.Descendants().Where(e => e.Name.LocalName == "GetOperation"))
+            .Select(operation => NormalizeMergeOperationPaths(operation, sourcePath, targetPath))
+            .ToList();
 
         // The server's 3-way merge may pend CONFLICTS instead of operations when both sides changed
         // the same file. These appear under <conflicts><Conflict .../> (ysitem = target/your side,
@@ -459,10 +461,65 @@ public sealed class TfvcSoapClient
             ChangeType = AttrAny(op, "chg") ?? AttrAny(op, "ct") ?? string.Empty,
             VersionFrom = TryParseInt(AttrAny(op, "vrevto"))
                           ?? TryParseInt(AttrAny(op, "mvfrom")),
-            VersionTo = TryParseInt(AttrAny(op, "sver"))
-                        ?? TryParseInt(AttrAny(op, "mvto")),
+            // `mvto` is the source changeset range of the merge. `sver` is only the
+            // source item's version and can predate the selected changeset.
+            VersionTo = TryParseInt(AttrAny(op, "mvto"))
+                        ?? TryParseInt(AttrAny(op, "sver")),
             IsPending = true,
         }).ToList();
+    }
+
+    /// <summary>
+    /// Normalizes paths returned from a SOAP Merge operation.
+    /// Some TFS versions return <c>/</c> for <c>sitem</c> even though <c>titem</c>
+    /// contains the full target item. Reconstruct the corresponding source item so
+    /// downstream diffs and merge-history records never send a local root to TFVC.
+    /// </summary>
+    private static SoapMergeOperation NormalizeMergeOperationPaths(
+        SoapMergeOperation operation,
+        string sourceRoot,
+        string targetRoot)
+    {
+        var normalizedSourceRoot = NormalizeTfvcPath(sourceRoot);
+        var normalizedTargetRoot = NormalizeTfvcPath(targetRoot);
+        var targetItem = IsTfvcServerPath(operation.TargetServerItem)
+            ? NormalizeTfvcPath(operation.TargetServerItem)
+            : MapMergePath(operation.SourceServerItem, normalizedSourceRoot, normalizedTargetRoot);
+        var sourceItem = IsTfvcServerPath(operation.SourceServerItem)
+            ? NormalizeTfvcPath(operation.SourceServerItem)
+            : MapMergePath(targetItem, normalizedTargetRoot, normalizedSourceRoot);
+
+        return new SoapMergeOperation
+        {
+            ItemId = operation.ItemId,
+            SourceServerItem = sourceItem,
+            TargetServerItem = targetItem,
+            ChangeType = operation.ChangeType,
+            VersionFrom = operation.VersionFrom,
+            VersionTo = operation.VersionTo,
+            IsPending = operation.IsPending,
+        };
+    }
+
+    private static bool IsTfvcServerPath(string? path) =>
+        !string.IsNullOrWhiteSpace(path) && path.StartsWith("$/", StringComparison.Ordinal);
+
+    private static string NormalizeTfvcPath(string path) =>
+        path.Trim().Replace('\\', '/').TrimEnd('/');
+
+    private static string MapMergePath(string? path, string fromRoot, string toRoot)
+    {
+        if (!IsTfvcServerPath(path))
+            return toRoot;
+
+        var normalizedPath = NormalizeTfvcPath(path!);
+        if (string.Equals(normalizedPath, fromRoot, StringComparison.OrdinalIgnoreCase))
+            return toRoot;
+
+        var prefix = fromRoot + "/";
+        return normalizedPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+            ? toRoot + normalizedPath[fromRoot.Length..]
+            : toRoot;
     }
 
     private static IReadOnlyList<SoapMergeConflict> ParseConflicts(IEnumerable<XElement> conflicts, bool unresolvedOnly)
@@ -1578,76 +1635,53 @@ public sealed class TfvcSoapClient
 
     /// <summary>
     /// 通过 SOAP QueryChangesForChangeset 获取指定 changeset 的全部文件变更（含 MergeSources）。
-    /// 支持分页（pageSize=1000），自动获取所有页面。
+    /// 使用服务端的非分页模式（pageSize=0）获取全部变更。
+    /// 某些旧版 TFS 服务在跨过 1000 条变更时会拒绝 <c>lastItem</c> 游标，
+    /// 并返回“项不能为 null 或空”；因此不能依赖客户端分页。
     /// </summary>
     public async Task<IReadOnlyList<SoapChangesetChange>> QueryChangesForChangesetAsync(
         int changesetId,
         CancellationToken ct = default)
     {
-        var allChanges = new List<SoapChangesetChange>();
-        string? lastItem = null;
-        const int pageSize = 1000;
-
-        while (true)
-        {
-            var lastItemEl = lastItem is null
-                ? ""
-                : $"<tns:lastItem>{Esc(lastItem)}</tns:lastItem>";
-
-            var body = $@"    <tns:QueryChangesForChangeset>
+        var body = $@"    <tns:QueryChangesForChangeset>
       <tns:changesetId>{changesetId}</tns:changesetId>
       <tns:generateDownloadUrls>false</tns:generateDownloadUrls>
-      <tns:pageSize>{pageSize}</tns:pageSize>
-      {lastItemEl}
+      <tns:pageSize>0</tns:pageSize>
     </tns:QueryChangesForChangeset>";
 
-            var doc = await InvokeAsync("QueryChangesForChangeset", body, ct).ConfigureAwait(false);
+        var doc = await InvokeAsync("QueryChangesForChangeset", body, ct).ConfigureAwait(false);
+        var changes = new List<SoapChangesetChange>();
 
-            var changeElements = doc.Descendants()
-                .Where(e => e.Name.LocalName == "Change")
-                .ToList();
+        foreach (var changeEl in doc.Descendants().Where(e => e.Name.LocalName == "Change"))
+        {
+            var changeType = AttrAny(changeEl, "type") ?? AttrAny(changeEl, "chg") ?? string.Empty;
 
-            if (changeElements.Count == 0)
-                break;
+            // Parse <Item> child
+            var itemEl = changeEl.Elements().FirstOrDefault(e => e.Name.LocalName == "Item");
+            var serverPath = AttrAny(itemEl, "item") ?? string.Empty;
+            var itemType = AttrAny(itemEl, "type") ?? string.Empty;
+            var isFolder = string.Equals(itemType, "Folder", StringComparison.OrdinalIgnoreCase);
+            var itemCs = TryParseInt(AttrAny(itemEl, "cs")) ?? changesetId;
 
-            foreach (var changeEl in changeElements)
+            // Parse <MergeSources> child
+            var mergeSources = new List<SoapMergeSourceInfo>();
+            var mergeSourcesEl = changeEl.Elements().FirstOrDefault(e => e.Name.LocalName == "MergeSources");
+            if (mergeSourcesEl is not null)
             {
-                var changeType = AttrAny(changeEl, "type") ?? AttrAny(changeEl, "chg") ?? string.Empty;
-
-                // Parse <Item> child
-                var itemEl = changeEl.Elements().FirstOrDefault(e => e.Name.LocalName == "Item");
-                var serverPath = AttrAny(itemEl, "item") ?? string.Empty;
-                var itemType = AttrAny(itemEl, "type") ?? string.Empty;
-                var isFolder = string.Equals(itemType, "Folder", StringComparison.OrdinalIgnoreCase);
-                var itemCs = TryParseInt(AttrAny(itemEl, "cs")) ?? changesetId;
-
-                // Parse <MergeSources> child
-                var mergeSources = new List<SoapMergeSourceInfo>();
-                var mergeSourcesEl = changeEl.Elements().FirstOrDefault(e => e.Name.LocalName == "MergeSources");
-                if (mergeSourcesEl is not null)
+                foreach (var ms in mergeSourcesEl.Elements().Where(e => e.Name.LocalName == "MergeSource"))
                 {
-                    foreach (var ms in mergeSourcesEl.Elements().Where(e => e.Name.LocalName == "MergeSource"))
-                    {
-                        var sid = AttrAny(ms, "sid") ?? AttrAny(ms, "s") ?? string.Empty;
-                        var vf = TryParseInt(AttrAny(ms, "vf"));
-                        var vt = TryParseInt(AttrAny(ms, "vt"));
-                        var isr = string.Equals(AttrAny(ms, "isr"), "true", StringComparison.OrdinalIgnoreCase);
-                        mergeSources.Add(new SoapMergeSourceInfo(sid, vf, vt, isr));
-                    }
+                    var sid = AttrAny(ms, "sid") ?? AttrAny(ms, "s") ?? string.Empty;
+                    var vf = TryParseInt(AttrAny(ms, "vf"));
+                    var vt = TryParseInt(AttrAny(ms, "vt"));
+                    var isr = string.Equals(AttrAny(ms, "isr"), "true", StringComparison.OrdinalIgnoreCase);
+                    mergeSources.Add(new SoapMergeSourceInfo(sid, vf, vt, isr));
                 }
-
-                allChanges.Add(new SoapChangesetChange(serverPath, isFolder, itemCs, changeType, mergeSources));
             }
 
-            // Pagination: if we got a full page, continue from the last item
-            if (changeElements.Count < pageSize)
-                break;
-
-            var lastChange = allChanges[^1];
-            lastItem = lastChange.ServerPath;
+            changes.Add(new SoapChangesetChange(serverPath, isFolder, itemCs, changeType, mergeSources));
         }
 
-        return allChanges;
+        return changes;
     }
 
     /// <summary>

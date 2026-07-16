@@ -113,6 +113,9 @@ public static class ItemsCommand
 
             try
             {
+                if (!path.StartsWith("$/", StringComparison.Ordinal))
+                    throw new ArgumentException("items cat requires a TFVC server file path beginning with '$/'.", nameof(path));
+
                 await using var stream = new MemoryStream();
                 await svc.DownloadFileAsync(path, stream, version).ConfigureAwait(false);
                 var bytes = stream.ToArray();
